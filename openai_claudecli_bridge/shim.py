@@ -338,7 +338,40 @@ def call_claude_streaming(claude_messages, system_prompt, model):
 # native tool_use reliability, verified 6/15 over a fair sample on
 # 2026-08-12). Retrying turns that into a much higher practical success
 # rate at the cost of extra latency/spend only on the failing path.
-TOOL_CALL_MAX_ATTEMPTS = 3
+#
+# Parameters were tuned to match the retry decorator found in an OLD,
+# now-deleted Cline commit (`@withRetry({maxRetries: 4, baseDelay: 2000,
+# maxDelay: 15000})`, src/core/api/providers/claude-code.ts @ 9dea336c/
+# 8a6441fd). Verified against Cline's CURRENT mainline (2026-08-12): that
+# file no longer exists -- Cline now delegates entirely to the third-party
+# `ai-sdk-provider-claude-code` npm package, which has no built-in retry
+# decorator of its own. Checked the official `@anthropic-ai/claude-agent-sdk`
+# too: it has a retry mechanism (SDKAPIRetryMessage) but only for
+# transport/API errors, not "model narrated instead of dispatching a
+# tool" -- no `tool_choice: required`-equivalent is exposed through the
+# harness. Conclusion: no deterministic fix exists anywhere in this
+# ecosystem for this exact failure mode; every implementation that
+# handles it does so with a retry loop. Keeping these old-Cline-derived
+# numbers is a reasonable choice since they were presumably tuned
+# empirically, not because they're a known-current standard. See
+# README.md "Investigated and ruled out" section for the full trail, and
+# the (deliberately kept, unmerged) explore/text-tool-parser branch for
+# the ruled-out alternative.
+#
+# (The `--tools "" --strict-mcp-config` + text-parser combo from
+# cline/cline#10336 is a community workaround for a DIFFERENT, unrelated
+# bug -- Cline's own agentic XML tool vocabulary colliding with Claude
+# Code's native tools when routed through a different provider path -- it
+# is not and never was Cline's Claude Code provider's actual approach.)
+TOOL_CALL_MAX_RETRIES = 4  # matches Cline's maxRetries
+TOOL_CALL_BASE_DELAY_S = 2.0  # matches Cline's baseDelay (ms -> s)
+TOOL_CALL_MAX_DELAY_S = 15.0  # matches Cline's maxDelay (ms -> s)
+
+
+def _backoff_delay_s(attempt_index):
+    """Exponential backoff matching Cline's formula: baseDelay * 2^attempt,
+    capped at maxDelay. attempt_index is 0-based (0 = first retry)."""
+    return min(TOOL_CALL_BASE_DELAY_S * (2 ** attempt_index), TOOL_CALL_MAX_DELAY_S)
 
 
 def call_claude_with_tool_retry(claude_messages, system_prompt, model, tools_requested):
@@ -346,18 +379,24 @@ def call_claude_with_tool_retry(claude_messages, system_prompt, model, tools_req
     documented flakiness: when tools were requested and Claude comes back
     with plain text instead of a tool_use block, that's the known failure
     mode (not a real "no tool needed" answer -- Claude was asked to use a
-    specific tool). Retry up to TOOL_CALL_MAX_ATTEMPTS times; return
-    whatever the last attempt produced (including the failure case) so the
-    caller still gets a valid OpenAI-shaped response either way."""
+    specific tool). Retry up to TOOL_CALL_MAX_RETRIES additional times
+    (matching Cline's semantics: maxRetries is retries AFTER the first
+    attempt, so total attempts = 1 + TOOL_CALL_MAX_RETRIES) with
+    exponential backoff between attempts. Returns whatever the last
+    attempt produced (including the failure case) so the caller still
+    gets a valid OpenAI-shaped response either way."""
     text, tool_calls, usage = None, [], {}
-    for attempt in range(1, TOOL_CALL_MAX_ATTEMPTS + 1):
+    total_attempts = 1 + TOOL_CALL_MAX_RETRIES
+    for attempt in range(total_attempts):
         text, tool_calls, usage = call_claude_streaming(claude_messages, system_prompt, model)
         if tool_calls or not tools_requested:
             # Either we got a real tool_use, or no tools were requested in
             # the first place (plain text is the correct, expected result).
             break
         # tools were requested but no tool_use came back -- the known
-        # flakiness case. Retry unless this was the last attempt.
+        # flakiness case. Retry (with backoff) unless this was the last attempt.
+        if attempt < total_attempts - 1:
+            time.sleep(_backoff_delay_s(attempt))
     return text, tool_calls, usage
 
 

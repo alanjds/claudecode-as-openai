@@ -24,24 +24,57 @@ don't compete for dispatch.
 **Known limitation:** this gets real `tool_use` blocks, but only ~40%
 reliably per single call (Claude sometimes narrates "let me check..."
 instead of dispatching — matches the failure mode in
-[cline/cline#10336](https://github.com/cline/cline/issues/10336)). Current
-mitigation is a bounded retry (`call_claude_with_tool_retry`, up to 3
-attempts) when tools were requested but no `tool_use` came back. Verified
-15/15 in manual testing with retries vs 6/15 without — but this is
-*probabilistic*, not deterministic: expected worst-case success is roughly
-`1 - (1 - p)^3` for per-call success rate `p`, not 100%.
+[cline/cline#10336](https://github.com/cline/cline/issues/10336), a
+community workaround for an unrelated bug in Cline's *own* agentic XML
+tool vocabulary colliding with Claude Code's native tools; it does not
+reflect Cline's actual Claude Code provider). Mitigation is a bounded
+retry with exponential backoff (`call_claude_with_tool_retry`, up to 4
+retries / 5 total attempts, 2s base / 15s cap) when tools were requested
+but no `tool_use` came back. Verified 15/15 in manual testing with retries
+vs 6/15 without -- but this is *probabilistic*, not deterministic:
+expected success asymptotically approaches but never reaches 100%.
 
-## Exploring: Cline's actual approach (deterministic)
+## Investigated and ruled out: a deterministic fix (2026-08-12)
 
-Cline's real production fix for a related bug uses `--tools ""
---strict-mcp-config --mcp-config '{"mcpServers":{}}'` to remove ALL native
-tool dispatch. With zero native tools, Claude reliably falls back to a
-plain-text tool-call convention (`<function_calls>/<invoke>` XML or a raw
-`<tool_call>{"name":...}` JSON blob) instead of `tool_use` blocks — Cline
-ships a text/XML parser for exactly this. This is architecturally
-deterministic (no coin-flip on whether Claude dispatches), at the cost of
-writing and maintaining that parser. See the `explore/text-tool-parser`
-branch for this work.
+Went looking for an architecturally deterministic alternative (no retry
+needed) across three reference implementations. None of them has one --
+this genuinely appears to be an inherent limitation of the Claude Code
+CLI/agent harness, not something this shim is missing:
+
+1. **Old Cline (`cline/cline` commits `9dea336c`/`8a6441fd`,
+   `src/core/api/providers/claude-code.ts`)**: real, but this file is
+   **deleted in current `main`** -- Cline has since migrated off its own
+   spawn-and-parse code entirely. Its historical fix was
+   `@withRetry({maxRetries: 4, baseDelay: 2000, maxDelay: 15000})` around
+   the whole call -- a retry decorator, not a deterministic mechanism.
+   This shim's current retry parameters were tuned to match those
+   numbers, on the theory that Cline's own engineers had already tuned
+   them empirically.
+2. **Current Cline**: delegates entirely to the third-party
+   `ai-sdk-provider-claude-code` npm package
+   (`sdk/packages/llms/src/providers/vendors/community.ts`, dynamic
+   import). Cline itself has no bespoke retry/parsing logic for this path
+   anymore.
+3. **`ai-sdk-provider-claude-code`** (the delegate package, unofficial/
+   community-maintained, wraps `@anthropic-ai/claude-agent-sdk`): no
+   built-in retry-with-backoff for this failure mode. Its own
+   troubleshooting docs show a generic example retry loop for users to
+   write themselves.
+4. **Official `@anthropic-ai/claude-agent-sdk`**: has a first-class retry
+   message (`SDKAPIRetryMessage`), but only for transport/API-level
+   errors (rate limits, connection failures) -- not for "the model chose
+   to narrate instead of dispatching a tool." No `tool_choice: "required"`
+   or equivalent forcing parameter is exposed through the CLI/SDK harness
+   (that's a raw Anthropic Messages API parameter the agent harness
+   doesn't surface to callers).
+
+**Conclusion:** every implementation that touches this problem treats it
+as inherently probabilistic and handles it with a retry loop, because the
+Claude Code harness doesn't expose the underlying `tool_choice` forcing
+knob. The retry wrapper in this shim is the standard approach here, not a
+stopgap. See the (intentionally kept, unmerged) `explore/text-tool-parser`
+branch for the investigation trail and the ruled-out text-parser
+alternative.
 
 ## Tests
 
