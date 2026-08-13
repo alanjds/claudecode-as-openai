@@ -101,3 +101,11 @@ pip install claudecode-as-openai   # once published
 # or, from source:
 pip install .
 ```
+
+## Running
+
+```
+python3 -m claudecode_as_openai [port]        # shorthand, defaults to 8977
+python3 -m claudecode_as_openai.shim [port]   # equivalent, explicit form
+claudecode-as-openai [port]                    # equivalent, via entry point
+```

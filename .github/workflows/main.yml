@@ -30,6 +30,9 @@ jobs:
       - name: Import check
         run: python -c "import claudecode_as_openai; import claudecode_as_openai.shim; print(claudecode_as_openai.__version__)"
       - name: --help smoke test
-        run: python -m claudecode_as_openai.shim --help
+        run: |
+          python -m claudecode_as_openai.shim --help
+          python -m claudecode_as_openai --help
+          claudecode-as-openai --help
       - name: Run offline unit tests (mocked claude subprocess)
         run: python -m unittest tests.test_shim_unit -v
