@@ -9,8 +9,40 @@ can drive a Claude subscription instead of metered API billing.
 Hermes's native `copilot-acp` provider can be pointed at `claude-agent-acp`
 (see the `hermes-agent`/`claude-code-subscription-shim` skills), but that
 path has no session caching (fresh subprocess every turn) and no real
-model-selection parameter. This shim exists to get both: `claude -p
---session-id/--resume` caching and a `--model` flag per request.
+model-selection parameter. This shim exists to get a `--model` flag per
+request working reliably. (Session caching via `--session-id`/`--resume`
+was the original goal too, but is NOT currently implemented -- see
+"Capability audit" below.)
+
+## Capability audit (2026-08-13)
+
+Verified empirically against a live running shim, not just by reading the
+code. Legend: ✅ works as expected, ⚠️ partial/misleading, ❌ not
+implemented / silently ignored.
+
+| Capability | Status | Notes |
+|---|---|---|
+| Model selection (`model` field) | ✅ | `--model <value>` passed straight to `claude -p` per request. Verified `sonnet` -> `claude-sonnet-4-6`, `opus` -> `claude-opus-4-6` both correctly selected, confirmed by asking Claude to self-report its version. |
+| Session/conversation caching | ❌ | **Not implemented.** No `--session-id`/`--resume` anywhere in the code -- every request spawns a brand-new `claude -p` subprocess with zero session continuity at the CLI level. Multi-turn context "works" only because OpenAI clients (correctly) resend the full message history every call, which the shim replays into a fresh Claude Code process each time. Confirmed by measuring `cache_creation_input_tokens`: it grows linearly with conversation length (422 -> 477 -> 1719 across 3 turns) rather than staying flat, meaning the actual conversation content is NOT cached and is reprocessed from scratch on every call. The ~22-23K `cache_read_input_tokens` seen on every request is Anthropic's automatic caching of Claude Code's own static system harness/tool-definitions overhead, not this shim's doing, and not conversation-specific. |
+| Streaming (`stream: true`) | ⚠️ | SSE protocol shape is correct (proper `data:`/`[DONE]` framing, real event-stream headers) but it is **not real token streaming**. `call_claude_with_tool_retry` blocks until the entire Claude Code response is ready, then emits it as a single `content` delta chunk. Verified: a 100-word response arrived as one chunk after a flat 12.3s wait, not incrementally. Fine for correctness, but a real-time "typing" UI gets nothing until the full answer is done. |
+| Tool calling (`tools`/`tool_calls`) | ⚠️ | Works via real Anthropic `tool_use` blocks, but only ~40% reliably per call before the bounded retry (see above); with retry, effectively reliable in practice. |
+| `tool_choice: "required"` / `"none"` / specific-function forcing | ❌ | Silently ignored. Verified: sending `tool_choice: "required"` with an unrelated prompt still returned plain text, no tool call -- the parameter has zero effect. |
+| `temperature`, `top_p`, `max_tokens`, `stop`, `seed`, `logprobs`, `presence_penalty`/`frequency_penalty` | ❌ | None of these are read from the request payload at all (confirmed by inspecting `do_POST`: only `messages`, `tools`, `model`, `stream` are extracted). Silently accepted and silently ignored -- no error, no warning. |
+| `n` (multiple choices) | ❌ | Always returns exactly 1 choice regardless of `n`. Verified `n: 3` still returns `len(choices) == 1`. |
+| `response_format: {"type": "json_object"}` | ❌ | Not enforced. Verified: asking for JSON output with this flag set still returned the JSON wrapped in a ` ```json ` markdown fence, not raw parseable JSON. |
+| Vision / image content blocks | ❌ | Silently dropped. `_flatten_content()` only extracts `type: "text"` blocks from multi-part content; `image_url` blocks are discarded with no error, no warning, no image ever reaching Claude. |
+| Local MCP tool leakage | ⚠️ **notable gap** | `--disallowedTools` only blocks Claude Code's own named built-ins (Bash, Read, Write, etc.). It does **nothing** against MCP servers configured in the invoking user's local `~/.claude` settings -- those remain live and can be dispatched unpredictably. Verified live: asking to "list files using any tool you have" got Claude's own reply "The tools I have are MCP-based," and a separate request returned a real `tool_calls` response for `mcp__cachebro__read_files`, a locally-configured MCP tool never declared in the request's `tools` array. This means the shim's actual tool surface is NOT fully controlled by the API caller -- it depends on whatever MCP servers happen to be configured on the machine running the shim. |
+| Error responses | ❌ | Always HTTP 200, even on failure. An invalid `model` value returns `200 OK` with Claude's plain-text complaint stuffed into `message.content` (not a proper OpenAI-style `4xx` with `{"error": {...}}`). A genuine internal exception returns HTTP 500 with an `{"error": {...}}` body, so that path exists, but expected-but-invalid input (bad model name) doesn't reach it. |
+| Authentication | ❌ | None. Any `Authorization` header is accepted or ignored; anyone who can reach the port can use it. Fine for `127.0.0.1`-only binding (the default), a real gap if ever bound to `0.0.0.0`. |
+| `/v1/models` | ⚠️ | Returns a single hardcoded entry (`DEFAULT_MODEL = "sonnet"`), not the actual list of models the underlying `claude` CLI/subscription supports. |
+
+**Bottom line:** model selection is the one advertised capability that
+fully works as designed. Streaming is protocol-correct but not real
+streaming. Session caching -- the other half of this project's original
+motivation -- was never actually built. Sampling/formatting parameters
+and multi-choice are uniformly no-ops. The MCP tool leakage is worth
+fixing before relying on this for anything where the exact tool surface
+matters (security-sensitive contexts especially).
 
 ## Current approach: native `tool_use` + bounded retry
 
