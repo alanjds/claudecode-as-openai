@@ -38,7 +38,7 @@ Key differences from the old approach, and why they fix the flakiness:
    prompts).
 
 Run:
-    python3 claude_code_shim.py [port]   # default port 8977
+    python3 -m claudecode_as_openai.shim [port]   # default port 8977
 
 Point Hermes at it:
     hermes config set model.provider custom
@@ -518,7 +518,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8977
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        return
+    try:
+        port = int(sys.argv[1]) if len(sys.argv) > 1 else 8977
+    except ValueError:
+        print(f"Invalid port: {sys.argv[1]!r}", file=sys.stderr)
+        sys.exit(2)
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"Claude Code shim (Cline-style native tool-calling) listening on http://127.0.0.1:{port}/v1")
     server.serve_forever()

@@ -1,6 +1,6 @@
 """Reliability test for tool-call dispatch via the shim's HTTP endpoint.
 
-Run this against a live shim instance (`python3 -m openai_claudecli_bridge.shim
+Run this against a live shim instance (`python3 -m claudecode_as_openai.shim
 8977`) to verify the bounded-retry wrapper actually improves real-world
 tool_use success rate. See README.md / SKILL notes for the documented
 baseline: ~40% single-shot native tool_use success without retries

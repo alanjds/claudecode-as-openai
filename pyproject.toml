@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claudecode-as-openai"
+dynamic = ["version"]
+description = "OpenAI-chat-completions-compatible HTTP shim over the local Claude Code CLI, for using a Claude subscription (not metered API billing) from any OpenAI-client-compatible tool."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Alan Justino", email = "alan.justino@yahoo.com.br" }]
+requires-python = ">=3.9"
+dependencies = []
+keywords = ["claude", "claude-code", "openai", "llm", "proxy", "shim", "anthropic"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Homepage = "https://github.com/alanjds/claudecode-as-openai"
+
+[project.scripts]
+claudecode-as-openai = "claudecode_as_openai.shim:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "claudecode_as_openai.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["claudecode_as_openai*"]
+
+[tool.bumpversion]
+current_version = "0.1.0"
+commit = true
+tag = true
+tag_name = "v{new_version}"
+
+[[tool.bumpversion.files]]
+filename = "claudecode_as_openai/__init__.py"

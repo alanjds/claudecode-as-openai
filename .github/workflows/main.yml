@@ -1,0 +1,35 @@
+name: CI
+
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  # tests/test_shim_unit.py mocks the `claude` CLI subprocess (canned
+  # NDJSON fixtures matching real observed output shapes) so parsing,
+  # message-building, and retry/backoff logic run fully offline in CI.
+  #
+  # tests/test_plain_chat.py and tests/test_tool_call_reliability.py are
+  # separate LIVE integration tests -- they need a real `claude` CLI on
+  # PATH, authenticated to an actual Claude subscription, and a running
+  # shim instance. None of that is available in CI; run them locally
+  # (see README.md "Tests" section) before tagging a release.
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 6
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "${{ matrix.python-version }}"
+      - name: Install package
+        run: pip install .
+      - name: Import check
+        run: python -c "import claudecode_as_openai; import claudecode_as_openai.shim; print(claudecode_as_openai.__version__)"
+      - name: --help smoke test
+        run: python -m claudecode_as_openai.shim --help
+      - name: Run offline unit tests (mocked claude subprocess)
+        run: python -m unittest tests.test_shim_unit -v

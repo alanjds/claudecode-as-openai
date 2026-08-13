@@ -1,4 +1,4 @@
-# openai-claudecli-bridge
+# claudecode-as-openai
 
 OpenAI-chat-completions-compatible HTTP shim over the local `claude` CLI
 (Claude Code), so Hermes (or anything else speaking the OpenAI chat API)
@@ -14,7 +14,7 @@ model-selection parameter. This shim exists to get both: `claude -p
 
 ## Current approach: native `tool_use` + bounded retry
 
-`openai_claudecli_bridge/shim.py` calls `claude -p --output-format
+`claudecode_as_openai/shim.py` calls `claude -p --output-format
 stream-json` and parses the real Anthropic `tool_use` content blocks from
 the NDJSON stream (not a hand-rolled text convention). Custom tools are
 described in the system prompt; Claude's own built-in tools (Bash, Read,
@@ -78,8 +78,26 @@ alternative.
 
 ## Tests
 
+Two tiers:
+
 ```
-python3 -m openai_claudecli_bridge.shim 8977 &
+# Fast, offline, CI-safe: mocks the `claude` CLI subprocess with canned
+# NDJSON fixtures matching real observed output shapes. No live claude
+# binary or subscription needed.
+python3 -m unittest tests.test_shim_unit -v
+
+# Live integration tests: need a real `claude` CLI on PATH, authenticated
+# to an actual Claude subscription, and a running shim instance. NOT run
+# in CI. Run these locally before tagging a release.
+python3 -m claudecode_as_openai.shim 8977 &
 python3 tests/test_plain_chat.py
 python3 tests/test_tool_call_reliability.py --attempts 15
+```
+
+## Installation
+
+```
+pip install claudecode-as-openai   # once published
+# or, from source:
+pip install .
 ```
