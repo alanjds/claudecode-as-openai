@@ -5,37 +5,44 @@ against cline/cline's open-source ClaudeCodeHandler + runClaudeCode,
 2026-08-12) rather than the ad-hoc JSON-envelope-in-prose approach this
 file used previously.
 
-Key differences from the old approach, and why they fix the flakiness:
+See README.md "Capability audit" for the full, empirically-verified list
+of what works, what's approximated, and what's a genuine CLI limitation.
+This file implements everything found to be implementable as of
+2026-08-13: session caching (--session-id/--resume), OpenAI-shaped error
+translation, max_tokens (via CLAUDE_CODE_MAX_OUTPUT_TOKENS), response_format
+(via --json-schema), a tighter MCP-tool lockdown for the no-tools-requested
+case, tool_choice: "none", n (bounded fan-out), and stop sequences
+(client-side truncation).
+
+Key differences from the original ad-hoc approach, and why they fix the
+flakiness:
 
 1. Uses Claude Code's REAL native tool-calling protocol
    (`--output-format stream-json`, parsing genuine `tool_use` content
    blocks from the assistant message) instead of asking Claude to emit a
-   custom JSON envelope in plain text. Claude never has to be talked into
-   "pretending" to be an API backend -- it just does normal tool calling,
-   which is reliable by construction.
+   custom JSON envelope in plain text.
 
-2. Uses `--disallowedTools <full built-in list>` (not `--tools ""`) so
-   Claude Code's own built-in tools (Bash, Read, Write, memory/skill tools,
-   etc.) are blocked by name, but ANY custom tool names Hermes passes in
-   the request's `tools` array remain callable. This is why the old
-   `--tools ""` approach was flaky: Claude would still *attempt* a
-   built-in tool_use (memory, skill, ...) despite the empty allowlist,
-   which triggered `--max-turns 1` failures. Naming the built-ins
-   explicitly leaves room for real, user-supplied tools to work.
+2. Uses `--disallowedTools <extended built-in list>` (not `--tools ""`)
+   when tools were requested, so Claude Code's own built-ins are blocked
+   by name but ANY custom tool names the caller passes remain callable.
+   When NO tools were requested, uses `--tools "" --strict-mcp-config
+   --mcp-config '{"mcpServers":{}}'` for a fully locked-down zero-tool
+   session -- see "MCP tool leakage" in README for why both flags are
+   needed (--disallowedTools alone does not block a machine's locally
+   configured MCP servers).
 
-3. Parses the NDJSON stream incrementally and returns as soon as a
-   complete assistant message is seen (whether it's a `tool_use` content
-   block or plain text) -- it does NOT wait for the subprocess to exit.
-   If the CLI's own harness then tries to self-resolve a tool call it
-   doesn't recognize and eventually hits `--max-turns`/exits non-zero,
-   that happens after we've already extracted what we need, so it no
-   longer surfaces as a shim-level failure.
+3. Parses the NDJSON stream incrementally, skipping `thinking` blocks
+   until a real `text`/`tool_use` block appears (an assistant turn can
+   consist of ONLY a thinking block before the real content arrives on a
+   later NDJSON line).
 
-4. Messages are passed as a JSON array on stdin (Claude Code's native
-   message format), with the system prompt passed via `--system-prompt`
-   (piped through a tempfile via `--system-prompt-file` when large, since
-   `--system-prompt` alone can still hit ARG_MAX for big Hermes system
-   prompts).
+4. Session caching: fingerprints each conversation (system prompt + first
+   message) and tracks how much of it has already been synced to a given
+   Claude Code session. A continuing conversation sends only the new
+   trailing messages via `--resume <id>`; a new or diverged conversation
+   starts fresh via `--session-id <id>` with the full history. Verified
+   directly: a resumed turn re-processes only the delta (a few hundred
+   tokens) instead of the whole conversation (tens of thousands).
 
 Run:
     python3 -m claudecode_as_openai.shim [port]   # default port 8977
@@ -46,32 +53,137 @@ Point Hermes at it:
     hermes config set model.api_key not-needed
     hermes config set model.default sonnet
 """
+import hashlib
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CLAUDE_BIN = "claude"
 DEFAULT_MODEL = "sonnet"
+KNOWN_MODEL_ALIASES = ["sonnet", "opus", "haiku"]
 CLAUDE_TIMEOUT_S = 300
 
-# NOTE: previously used --disallowedTools with an enumerated built-in list
-# (see BUILTIN_TOOLS_TO_DISALLOW below, kept as a documented dead-end).
-# Switched to --tools "" per cline/cline#10336 -- see call_claude_streaming.
-BUILTIN_TOOLS_TO_DISALLOW = ",".join(
+# Every spawned `claude` subprocess inherits whatever directory the shim
+# process happens to be running from -- verified live: Claude Code reports
+# that directory as its `cwd` and can reference/read real files there
+# (confirmed by asking a tool_choice:"none" request "any tool you have" and
+# getting back fabricated-looking but suspiciously specific Read/Glob
+# references to this very shim's own source files). Spawning every `claude`
+# call from a dedicated, empty, per-run temp directory instead closes this:
+# verified `claude`'s own reported `cwd` matches the sandbox dir, not the
+# shim's real working directory, once this is passed as subprocess cwd=.
+_CLAUDE_CWD = tempfile.mkdtemp(prefix="claudecode-as-openai-sandbox-")
+MAX_N_CHOICES = 5
+
+# Claude Code's built-in tool names (as of CLI 2.1.94, checked 2026-08-13),
+# PLUS the MCP-adjacent helper tools that also leak custom-tool dispatch
+# surface: RemoteTrigger (a generic dispatcher that can invoke ANY declared
+# custom tool by name even when not in the caller's tools array -- found
+# live, see README "MCP tool leakage"), and ListMcpResourcesTool/
+# ReadMcpResourceTool (MCP resource browsers, not server-specific so
+# --strict-mcp-config doesn't touch them). This does NOT fully close the
+# leak -- a machine's actual configured MCP tools (mcp__servername__tool)
+# can still rarely fire when tools ARE requested (--strict-mcp-config
+# can't be combined with real tool dispatch without reintroducing the
+# --tools "" text-fallback problem). When NO tools are requested, the
+# no-tools path below (--tools "" --strict-mcp-config) closes this
+# completely instead.
+EXTENDED_DISALLOWED_TOOLS = ",".join(
     [
         "Task", "TaskOutput", "Bash", "Glob", "Grep", "Read", "Edit", "Write",
         "NotebookEdit", "WebFetch", "TodoWrite", "WebSearch", "TaskStop",
         "AskUserQuestion", "Skill", "EnterPlanMode", "ExitPlanMode",
         "EnterWorktree", "ExitWorktree", "CronCreate", "CronDelete",
-        "CronList", "ToolSearch",
+        "CronList", "ToolSearch", "RemoteTrigger", "ListMcpResourcesTool",
+        "ReadMcpResourceTool",
     ]
-)  # unused now -- kept only as a documented example of the approach that
-   # did NOT reliably suppress native dispatch (0/8 in testing).
+)
+
+
+class ClaudeCliError(Exception):
+    """Carries enough info to build an OpenAI-shaped error response.
+    http_status: int: e.g. 400, 401, 404, 429, 500, 503.
+    error_type: OpenAI error taxonomy string, e.g. "invalid_request_error",
+        "authentication_error", "rate_limit_error", "api_error".
+    code: short machine-readable code, e.g. "model_not_found", or None.
+    """
+
+    def __init__(self, http_status, error_type, message, code=None, param=None):
+        super().__init__(message)
+        self.http_status = http_status
+        self.error_type = error_type
+        self.message = message
+        self.code = code
+        self.param = param
+
+    def to_openai_body(self):
+        return {
+            "error": {
+                "message": self.message,
+                "type": self.error_type,
+                "param": self.param,
+                "code": self.code,
+            }
+        }
+
+
+# Heuristic classification of Claude Code's own plain-text error messages
+# into OpenAI's error taxonomy. This is necessarily fragile -- it string-
+# matches phrases from https://code.claude.com/docs/en/errors (checked
+# 2026-08-13) -- and will need updating if Anthropic changes their error
+# wording. Order matters: more specific patterns should come first.
+_ERROR_PATTERNS = [
+    (
+        (
+            "not logged in", "please run /login", "login expired",
+            "oauth token", "invalid api key", "could not resolve authentication",
+            "invalid auth token", "authentication credentials",
+            "organization has disabled api key authentication",
+            "organization has disabled claude subscription access",
+        ),
+        401, "authentication_error", "authentication_failed",
+    ),
+    (
+        (
+            "session limit", "weekly limit", "credit balance is too low",
+            "spend limit", "request rejected (429)",
+            "server is temporarily limiting requests", "rate limit",
+        ),
+        429, "rate_limit_error", "rate_limit_exceeded",
+    ),
+    (
+        (
+            "issue with the selected model", "not a recognized model id",
+            "restricted by your organization", "not available with the claude",
+        ),
+        404, "invalid_request_error", "model_not_found",
+    ),
+    (
+        (
+            "prompt is too long", "context exceeds", "request too large",
+            "conversation too long", "extra inputs are not permitted",
+        ),
+        400, "invalid_request_error", "context_length_exceeded",
+    ),
+    (
+        ("overloaded", "internal server error", "500 internal"),
+        503, "api_error", "overloaded",
+    ),
+]
+
+
+def _classify_error_text(text):
+    lower = (text or "").lower()
+    for phrases, status, etype, code in _ERROR_PATTERNS:
+        if any(p in lower for p in phrases):
+            return status, etype, code
+    return 500, "api_error", None
 
 
 def _flatten_content(content):
@@ -85,20 +197,16 @@ def _flatten_content(content):
 
 
 def build_claude_messages(openai_messages):
-    """Translate OpenAI chat messages into Claude Code's native message
-    array shape: [{"role": "user"|"assistant", "content": <str or blocks>}].
-    Tool results become a user message with a tool_result content block
-    (Claude's native format), and prior assistant tool_calls become a
-    tool_use content block -- this keeps multi-turn tool loops coherent
-    across separate `claude -p` invocations, since each call is otherwise
-    stateless (no --resume; see the caching note in claude_code_shim skill)."""
+    """Translate a list of OpenAI chat messages into Claude Code's native
+    message array shape: [{"role": "user"|"assistant", "content": <str or
+    blocks>}]. System messages are skipped here (handled separately by the
+    caller via system_prompt_from_messages) since Claude Code takes the
+    system prompt as a separate CLI flag, not as an array element."""
     claude_messages = []
-    system_prompt_parts = []
 
     for m in openai_messages:
         role = m.get("role", "user")
         if role == "system":
-            system_prompt_parts.append(_flatten_content(m.get("content")))
             continue
 
         if role == "tool":
@@ -146,8 +254,12 @@ def build_claude_messages(openai_messages):
         # user (or anything else) -> plain user message
         claude_messages.append({"role": "user", "content": _flatten_content(m.get("content"))})
 
-    system_prompt = "\n\n".join(p for p in system_prompt_parts if p)
-    return claude_messages, system_prompt
+    return claude_messages
+
+
+def system_prompt_from_messages(openai_messages):
+    parts = [_flatten_content(m.get("content")) for m in openai_messages if m.get("role") == "system"]
+    return "\n\n".join(p for p in parts if p)
 
 
 def render_tools_into_system_prompt(tools, base_system_prompt):
@@ -157,8 +269,8 @@ def render_tools_into_system_prompt(tools, base_system_prompt):
     them as "custom"/hypothetical made Claude hedge and refuse to call them
     (0/8 in testing) even with native tool_use active. Framing them as
     already-wired, real, implemented-by-the-harness tools fixed this
-    completely (6/6) -- combined with --tools "" (see call_claude_streaming)
-    removing Claude's own competing built-in dispatch options entirely."""
+    completely (6/6) -- combined with the extended --disallowedTools list
+    removing Claude's own competing built-in dispatch options."""
     if not tools:
         return base_system_prompt
     lines = [
@@ -186,6 +298,59 @@ def render_tools_into_system_prompt(tools, base_system_prompt):
     return tool_desc
 
 
+# ---------------------------------------------------------------------------
+# Session caching: fingerprint a conversation and track how much of it has
+# already been synced to a Claude Code session, so a continuing conversation
+# can send only the new trailing messages via --resume instead of the full
+# history every time. Verified live: a resumed turn re-processes only the
+# delta (a few hundred tokens) instead of the whole conversation.
+# ---------------------------------------------------------------------------
+_SESSION_LOCK = threading.Lock()
+_SESSION_STORE = {}  # conv_key -> {"claude_session_id": str, "synced_messages": list}
+_SESSION_STORE_MAX = 200
+
+
+def _conversation_key(openai_messages):
+    """Stable key for the conversation this message list belongs to: hash
+    of the system messages + the first non-system message. Stays stable
+    across the whole conversation even as more turns are appended."""
+    sys_msgs = [m for m in openai_messages if m.get("role") == "system"]
+    first_non_system = next((m for m in openai_messages if m.get("role") != "system"), None)
+    basis = json.dumps([sys_msgs, first_non_system], sort_keys=True, default=str)
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+
+def _messages_equal(a, b):
+    return json.dumps(a, sort_keys=True, default=str) == json.dumps(b, sort_keys=True, default=str)
+
+
+def resolve_session(openai_messages):
+    """Returns (mode, claude_session_id, delta_openai_messages, conv_key).
+    mode is "resume" (continuing a known conversation -- only send the new
+    tail messages) or "fresh" (new conversation, or the history diverged
+    from what we last synced -- send everything)."""
+    key = _conversation_key(openai_messages)
+    with _SESSION_LOCK:
+        entry = _SESSION_STORE.get(key)
+        if entry:
+            synced = entry["synced_messages"]
+            if len(openai_messages) > len(synced) and _messages_equal(openai_messages[: len(synced)], synced):
+                delta = openai_messages[len(synced) :]
+                return "resume", entry["claude_session_id"], delta, key
+    return "fresh", str(uuid.uuid4()), openai_messages, key
+
+
+def record_session(conv_key, claude_session_id, full_openai_messages, assistant_reply_message):
+    with _SESSION_LOCK:
+        synced = list(full_openai_messages) + [assistant_reply_message]
+        _SESSION_STORE[conv_key] = {"claude_session_id": claude_session_id, "synced_messages": synced}
+        while len(_SESSION_STORE) > _SESSION_STORE_MAX:
+            oldest = next(iter(_SESSION_STORE))
+            if oldest == conv_key:
+                break
+            _SESSION_STORE.pop(oldest, None)
+
+
 def _iter_ndjson_lines(proc):
     for raw_line in proc.stdout:
         line = raw_line.strip()
@@ -197,126 +362,293 @@ def _iter_ndjson_lines(proc):
             continue
 
 
-def call_claude_streaming(claude_messages, system_prompt, model):
+def _build_claude_cmd(model, session_mode, session_id, tools_requested, max_turns, json_schema, want_partial_messages=False):
+    cmd = [CLAUDE_BIN]
+    if tools_requested:
+        cmd += ["--disallowedTools", EXTENDED_DISALLOWED_TOOLS]
+    else:
+        # No tools requested at all: fully lock down BOTH built-ins and any
+        # locally-configured MCP servers. See EXTENDED_DISALLOWED_TOOLS
+        # docstring and README "MCP tool leakage" for why this is the only
+        # combination that closes the leak completely (verified: tools
+        # available == [] with this combo, vs. a real MCP tool call leaking
+        # through unprompted without it).
+        cmd += ["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+    cmd += ["--output-format", "stream-json", "--verbose", "--max-turns", str(max_turns)]
+    if want_partial_messages:
+        # Only requested when a `stop` sequence is set. This adds
+        # token-level "stream_event"/"content_block_delta" lines
+        # interleaved with the existing full "assistant" message chunks
+        # (verified live: the "assistant" chunks stay complete/final,
+        # identical to without this flag -- it only ADDS extra lines, it
+        # doesn't change existing parsing). Needed because Claude Code's
+        # default stream-json granularity is per-MESSAGE, not per-token:
+        # without this flag, a stop sequence can only be detected after an
+        # entire text block has already been fully generated and billed,
+        # which defeats the purpose of an *early* stop.
+        cmd += ["--include-partial-messages"]
+    if session_mode == "resume":
+        cmd += ["--resume", session_id]
+    else:
+        cmd += ["--session-id", session_id]
+    if model:
+        cmd += ["--model", model]
+    if json_schema is not None:
+        cmd += ["--json-schema", json.dumps(json_schema)]
+    cmd += ["-p"]
+    return cmd
+
+
+def call_claude_streaming(
+    claude_messages,
+    system_prompt,
+    model,
+    session_mode="fresh",
+    session_id=None,
+    tools_requested=False,
+    json_schema=None,
+    stop=None,
+):
     """Spawn `claude -p` in native stream-json mode, feed the message array
     on stdin, and return as soon as a usable assistant message (text and/or
-    tool_use blocks) is seen -- mirrors Cline's approach of yielding from
-    the stream incrementally rather than waiting for full completion.
-    Terminates the subprocess immediately after extracting what's needed so
-    a downstream max-turns/self-resolution failure never surfaces here.
+    tool_use blocks) is seen. Terminates the subprocess immediately after
+    extracting what's needed so a downstream max-turns/self-resolution
+    failure never surfaces as a shim-level crash.
 
-    Tool suppression, and why --disallowedTools (not --tools ""):
-    cline/cline#10336 fixes a DIFFERENT bug (Cline's own prompt-format text
-    getting misparsed against Claude's *native* Bash/Read/Edit vocabulary)
-    by going to `--tools "" --strict-mcp-config ...`, which leaves Claude
-    with NO native dispatch at all -- it then emits tool calls as bare text
-    (Cline's <function_calls>/<invoke> XML or a raw {"name":...} JSON
-    blob), which is why Cline ships a whole text/XML tool-call parser.
-    Verified directly here: with --tools "", tool calls come back as
-    `<function_calls>/<invoke>` or `<tool_call>{"name":...}` TEXT, not a
-    tool_use content block (0/8 native tool_use hits).
+    `stop`, if given, is checked against the ACCUMULATED text after every
+    text content block arrives, not just once at the end -- Claude Code has
+    no native stop-sequence flag (verified: no such CLI option exists), but
+    since stream-json delivers assistant messages incrementally, killing
+    the subprocess the instant a stop sequence appears avoids paying for
+    (and waiting on) the rest of a response nobody asked for. This is a
+    real latency/cost win over truncating client-side only after the full
+    response completes, which is what an earlier version of this shim did.
 
-    This shim wants real native tool_use blocks instead of a text
-    convention that needs its own parser, so it keeps --disallowedTools
-    with the full enumerated built-in list (BUILTIN_TOOLS_TO_DISALLOW) --
-    that leaves native dispatch live for any tool NOT in the denylist,
-    which is exactly the custom/Hermes-supplied tools described in the
-    system prompt below. Combined with strongly-worded ("already
-    implemented, not custom/hypothetical") tool framing, this reliably
-    produces real tool_use blocks (6/6 in manual testing) instead of
-    either a refusal (0/8 with weak framing) or a text-only fallback (0/8
-    with --tools "")."""
+    Returns a dict: {"text", "tool_calls", "usage", "finish_reason",
+    "structured_json"}. Raises ClaudeCliError for conditions that should
+    become an OpenAI-shaped error response (invalid model, auth failure,
+    rate limiting, etc -- see _classify_error_text).
+
+    Tool suppression: see EXTENDED_DISALLOWED_TOOLS and _build_claude_cmd
+    docstrings for why --disallowedTools (not --tools "") is used when
+    tools are requested, and why the no-tools path uses --tools "" +
+    --strict-mcp-config instead."""
+    if session_id is None:
+        session_id = str(uuid.uuid4())
+
+    stop_sequences = []
+    if stop:
+        stop_sequences = [stop] if isinstance(stop, str) else [s for s in stop if s]
+
     system_prompt_file = None
-    cmd = [
-        CLAUDE_BIN,
-        "--disallowedTools", BUILTIN_TOOLS_TO_DISALLOW,
-        "--output-format", "stream-json",
-        "--verbose",
-        "--max-turns", "1",
-    ]
+    # --json-schema needs a couple of internal turns (an internal
+    # "StructuredOutput" tool call + a corrective retry if the model
+    # forgets it) to actually enforce the schema -- verified empirically:
+    # max_turns=1 leaves it hanging at error_max_turns with the schema
+    # never actually produced; max_turns=3 completes cleanly.
+    max_turns = 3 if json_schema is not None else 1
+    cmd = _build_claude_cmd(
+        model, session_mode, session_id, tools_requested, max_turns, json_schema,
+        want_partial_messages=bool(stop_sequences),
+    )
     if system_prompt:
-        # A large Hermes system prompt can still hit ARG_MAX as a bare CLI
-        # arg; write it to a tempfile and use --system-prompt-file instead
-        # (same escape hatch Cline's `shouldUseFile` option models).
         if len(system_prompt) > 4000:
-            fd, system_prompt_file = tempfile.mkstemp(prefix="hermes-acp-sysprompt-", suffix=".txt")
+            fd, system_prompt_file = tempfile.mkstemp(prefix="claudecode-as-openai-sysprompt-", suffix=".txt")
             with os.fdopen(fd, "w") as f:
                 f.write(system_prompt)
             cmd += ["--system-prompt-file", system_prompt_file]
         else:
             cmd += ["--system-prompt", system_prompt]
-    if model:
-        cmd += ["--model", model]
-    cmd += ["-p"]
 
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            cwd=_CLAUDE_CWD,
+        )
+    except FileNotFoundError:
+        if system_prompt_file:
+            try:
+                os.unlink(system_prompt_file)
+            except OSError:
+                pass
+        raise ClaudeCliError(
+            503, "api_error",
+            f"'{CLAUDE_BIN}' CLI not found on PATH. Install Claude Code "
+            "(https://code.claude.com) and ensure `claude` is runnable.",
+            code="claude_cli_not_found",
+        )
+
     try:
         proc.stdin.write(json.dumps(claude_messages))
         proc.stdin.close()
 
         text_parts = []
         tool_calls = []
+        structured_json = None
         usage = {}
+        finish_reason = "stop"
+        stop_matched = False
+        streaming_partial_text = ""
         deadline = time.time() + CLAUDE_TIMEOUT_S
-        saw_error = None
 
         for chunk in _iter_ndjson_lines(proc):
             if time.time() > deadline:
                 break
             ctype = chunk.get("type")
 
+            if ctype == "stream_event" and stop_sequences:
+                # Only present when --include-partial-messages was passed
+                # (see _build_claude_cmd), which only happens when a `stop`
+                # sequence was actually requested. Real token-level deltas
+                # -- verified live these interleave with, and arrive BEFORE,
+                # the full "assistant" chunk for the same content block:
+                # content_block_start -> content_block_delta(s) -> the full
+                # "assistant" chunk -> content_block_stop -> next
+                # content_block_start. That ordering is what makes
+                # resetting the per-block accumulator on
+                # content_block_start safe: the prior block's text has
+                # already been folded into text_parts by its "assistant"
+                # chunk before the next block starts.
+                #
+                # This is the actual fix for a real stop sequence only
+                # being detectable after an entire text block finished
+                # generating (and got billed): now a match can be caught
+                # mid-block, at real token granularity.
+                event = chunk.get("event", {})
+                etype = event.get("type")
+                if etype == "content_block_delta":
+                    delta = event.get("delta", {})
+                    if delta.get("type") == "text_delta" and delta.get("text"):
+                        streaming_partial_text += delta["text"]
+                        combined = "".join(text_parts) + streaming_partial_text
+                        matched_text, matched = _apply_stop_sequences(combined, stop_sequences)
+                        if matched:
+                            text_parts = [matched_text]
+                            stop_matched = True
+                            finish_reason = "stop"
+                            break
+                elif etype == "content_block_start":
+                    streaming_partial_text = ""
+                continue
+
             if ctype == "assistant" and "message" in chunk:
                 message = chunk["message"]
-                if message.get("error"):
-                    saw_error = message["error"]
-                    break
+                # NOTE: "error" is a sibling key of "message" at the chunk
+                # level (chunk["error"]), NOT inside message itself --
+                # verified against live captures for both an invalid model
+                # ({"type":"assistant","message":{...},"error":"invalid_request"})
+                # and an output-token-cap breach ({"error":"max_output_tokens"}).
+                err = chunk.get("error")
+                if err:
+                    text = _flatten_content(message.get("content")) or ""
+                    if err == "max_output_tokens":
+                        # Claude Code hard-fails on exceeding the output
+                        # cap rather than truncating like OpenAI's
+                        # max_tokens does. Closest honest mapping: report
+                        # finish_reason="length" with whatever text (if
+                        # any) had already accumulated -- there usually
+                        # isn't any, since the cap is enforced before the
+                        # text block completes (verified empirically).
+                        finish_reason = "length"
+                        break
+                    status, etype, code = _classify_error_text(text)
+                    raise ClaudeCliError(status, etype, text or f"claude reported error: {err}", code=code)
                 got_tool_use = False
-                got_text = False
                 for content in message.get("content", []):
                     ctype2 = content.get("type")
                     if ctype2 == "text" and content.get("text"):
                         text_parts.append(content["text"])
-                        got_text = True
+                        # IMPORTANT: do NOT break here just because we saw
+                        # text. Claude frequently narrates in one assistant
+                        # NDJSON message ("Sure! Let me check...") and
+                        # dispatches the actual tool_use in a SEPARATE,
+                        # LATER assistant message within the same turn --
+                        # verified live: a 3-message sequence of [thinking,
+                        # text, tool_use] is common. Breaking on the
+                        # text-only message (as an earlier version of this
+                        # function did) silently swallowed the tool_use
+                        # that followed 100% of the time in a 10/10
+                        # regression run. Keep reading; only stop early on
+                        # an actual tool_use/structured-output block below,
+                        # a stop-sequence match (checked right here), an
+                        # error, or the stream ending naturally (the
+                        # "result" chunk case further down).
+                        if stop_sequences:
+                            accumulated = "".join(text_parts)
+                            matched_text, stop_matched = _apply_stop_sequences(accumulated, stop_sequences)
+                            if stop_matched:
+                                text_parts = [matched_text]
+                                finish_reason = "stop"
+                                break
                     elif ctype2 == "tool_use":
-                        tool_calls.append(
-                            {
-                                "id": content.get("id", f"toolu_{uuid.uuid4().hex[:20]}"),
-                                "name": content.get("name", ""),
-                                "input": content.get("input", {}),
-                            }
-                        )
-                        got_tool_use = True
+                        name = content.get("name", "")
+                        if name == "StructuredOutput":
+                            # --json-schema enforcement mechanism: the
+                            # actual answer is the tool's input, not a
+                            # real tool call to expose to the caller.
+                            structured_json = content.get("input", {})
+                            got_tool_use = True
+                        else:
+                            tool_calls.append(
+                                {
+                                    "id": content.get("id", f"toolu_{uuid.uuid4().hex[:20]}"),
+                                    "name": name,
+                                    "input": content.get("input", {}),
+                                }
+                            )
+                            got_tool_use = True
                     # "thinking"/"redacted_thinking" blocks are intentionally
-                    # ignored here -- they're extended-thinking output, not
-                    # the final answer, and an assistant message can consist
-                    # of ONLY a thinking block before the real tool_use/text
-                    # message arrives on a later NDJSON line. Only stop once
-                    # we've actually seen a tool_use or non-empty text block.
+                    # ignored -- they carry no answer content.
                 if usage_data := message.get("usage"):
                     usage = usage_data
-                if got_tool_use or got_text:
+                if got_tool_use or stop_matched:
+                    # A stop-sequence match ends the response right here --
+                    # `finally` below tears down the subprocess immediately,
+                    # which is the actual latency/cost win over letting
+                    # `claude` keep generating a response nobody will see.
                     break
                 continue
 
             if ctype == "result":
                 if chunk.get("is_error") and chunk.get("subtype") not in ("error_max_turns",):
-                    saw_error = chunk.get("result") or f"claude error: {chunk.get('subtype')}"
+                    text = chunk.get("result") or f"claude error: {chunk.get('subtype')}"
+                    status, etype, code = _classify_error_text(text)
+                    raise ClaudeCliError(status, etype, text, code=code or chunk.get("subtype"))
                 if not usage and chunk.get("usage"):
                     usage = chunk["usage"]
                 break
 
-        if saw_error:
-            raise RuntimeError(f"claude reported error: {saw_error}")
+        if structured_json is not None:
+            return {
+                "text": json.dumps(structured_json),
+                "tool_calls": [],
+                "usage": usage,
+                "finish_reason": "stop",
+                "structured_json": structured_json,
+            }
 
-        return "".join(text_parts) or None, tool_calls, usage
+        return {
+            "text": "".join(text_parts) or None,
+            "tool_calls": tool_calls,
+            "usage": usage,
+            "finish_reason": finish_reason,
+            "structured_json": None,
+            "stop_matched": stop_matched,
+        }
     finally:
+        # Terminating here (rather than letting the subprocess run to its
+        # own natural end) is what actually delivers the latency/cost win
+        # for an early stop-sequence match -- the `break` above only stops
+        # US reading further NDJSON lines; the underlying `claude` process
+        # would otherwise keep generating (and being billed for) tokens
+        # nobody will see. This path already ran for every other early-exit
+        # case (tool_use, error, max-turns); stop-sequence matches now share
+        # the same real subprocess teardown instead of a fake early return.
         try:
             proc.terminate()
             proc.wait(timeout=2)
@@ -333,71 +665,91 @@ def call_claude_streaming(claude_messages, system_prompt, model):
 
 
 # Bounded retries when tools were requested but Claude answered with plain
-# text instead of a real tool_use block (see call_claude_streaming
-# docstring: --disallowedTools + strong framing gets ~40% single-shot
-# native tool_use reliability, verified 6/15 over a fair sample on
-# 2026-08-12). Retrying turns that into a much higher practical success
-# rate at the cost of extra latency/spend only on the failing path.
+# text instead of a real tool_use block (--disallowedTools + strong framing
+# gets ~40% single-shot native tool_use reliability, verified 6/15 over a
+# fair sample on 2026-08-12). Retrying turns that into a much higher
+# practical success rate at the cost of extra latency/spend only on the
+# failing path.
 #
 # Parameters were tuned to match the retry decorator found in an OLD,
 # now-deleted Cline commit (`@withRetry({maxRetries: 4, baseDelay: 2000,
-# maxDelay: 15000})`, src/core/api/providers/claude-code.ts @ 9dea336c/
-# 8a6441fd). Verified against Cline's CURRENT mainline (2026-08-12): that
-# file no longer exists -- Cline now delegates entirely to the third-party
-# `ai-sdk-provider-claude-code` npm package, which has no built-in retry
-# decorator of its own. Checked the official `@anthropic-ai/claude-agent-sdk`
-# too: it has a retry mechanism (SDKAPIRetryMessage) but only for
-# transport/API errors, not "model narrated instead of dispatching a
-# tool" -- no `tool_choice: required`-equivalent is exposed through the
-# harness. Conclusion: no deterministic fix exists anywhere in this
-# ecosystem for this exact failure mode; every implementation that
-# handles it does so with a retry loop. Keeping these old-Cline-derived
-# numbers is a reasonable choice since they were presumably tuned
-# empirically, not because they're a known-current standard. See
-# README.md "Investigated and ruled out" section for the full trail, and
-# the (deliberately kept, unmerged) explore/text-tool-parser branch for
-# the ruled-out alternative.
-#
-# (The `--tools "" --strict-mcp-config` + text-parser combo from
-# cline/cline#10336 is a community workaround for a DIFFERENT, unrelated
-# bug -- Cline's own agentic XML tool vocabulary colliding with Claude
-# Code's native tools when routed through a different provider path -- it
-# is not and never was Cline's Claude Code provider's actual approach.)
-TOOL_CALL_MAX_RETRIES = 4  # matches Cline's maxRetries
-TOOL_CALL_BASE_DELAY_S = 2.0  # matches Cline's baseDelay (ms -> s)
-TOOL_CALL_MAX_DELAY_S = 15.0  # matches Cline's maxDelay (ms -> s)
+# maxDelay: 15000})`). Verified against Cline's CURRENT mainline
+# (2026-08-12): that file no longer exists -- Cline now delegates entirely
+# to a third-party npm package with no retry decorator of its own. Checked
+# the official @anthropic-ai/claude-agent-sdk too: it retries transport/API
+# errors only, not "model narrated instead of dispatching a tool" -- no
+# tool_choice:required-equivalent is exposed through the harness. No
+# deterministic fix exists anywhere in this ecosystem for this failure
+# mode; every implementation that handles it does so with a retry loop.
+TOOL_CALL_MAX_RETRIES = 4
+TOOL_CALL_BASE_DELAY_S = 2.0
+TOOL_CALL_MAX_DELAY_S = 15.0
 
 
 def _backoff_delay_s(attempt_index):
-    """Exponential backoff matching Cline's formula: baseDelay * 2^attempt,
-    capped at maxDelay. attempt_index is 0-based (0 = first retry)."""
+    """Exponential backoff: baseDelay * 2^attempt, capped at maxDelay.
+    attempt_index is 0-based (0 = first retry)."""
     return min(TOOL_CALL_BASE_DELAY_S * (2 ** attempt_index), TOOL_CALL_MAX_DELAY_S)
 
 
-def call_claude_with_tool_retry(claude_messages, system_prompt, model, tools_requested):
-    """Wraps call_claude_streaming with bounded retries specifically for the
-    documented flakiness: when tools were requested and Claude comes back
-    with plain text instead of a tool_use block, that's the known failure
-    mode (not a real "no tool needed" answer -- Claude was asked to use a
-    specific tool). Retry up to TOOL_CALL_MAX_RETRIES additional times
-    (matching Cline's semantics: maxRetries is retries AFTER the first
-    attempt, so total attempts = 1 + TOOL_CALL_MAX_RETRIES) with
-    exponential backoff between attempts. Returns whatever the last
-    attempt produced (including the failure case) so the caller still
-    gets a valid OpenAI-shaped response either way."""
-    text, tool_calls, usage = None, [], {}
+def call_claude_with_tool_retry(
+    delta_claude_messages,
+    full_claude_messages,
+    system_prompt,
+    model,
+    tools_requested,
+    session_mode,
+    session_id,
+    stop=None,
+):
+    """Wraps call_claude_streaming with bounded retries for the documented
+    tool-dispatch flakiness. The FIRST attempt uses whatever session mode
+    was resolved by resolve_session() (a resumed session sending only the
+    new delta messages, or a fresh session sending everything) so the
+    common, successful case gets the full caching benefit. If a retry is
+    needed (tools were requested but no tool_use came back), retries use a
+    brand-new fresh session with the FULL conversation history instead of
+    resuming -- reusing the same --session-id across attempts causes an
+    "already in use" CLI error, and resuming with more delta messages would
+    duplicate entries in that session's persisted transcript. Returns
+    (result_dict, final_session_mode, final_session_id) so the caller knows
+    which session to record for the next external turn."""
+    result = None
+    cur_mode, cur_id, cur_messages = session_mode, session_id, delta_claude_messages
     total_attempts = 1 + TOOL_CALL_MAX_RETRIES
     for attempt in range(total_attempts):
-        text, tool_calls, usage = call_claude_streaming(claude_messages, system_prompt, model)
-        if tool_calls or not tools_requested:
-            # Either we got a real tool_use, or no tools were requested in
-            # the first place (plain text is the correct, expected result).
-            break
-        # tools were requested but no tool_use came back -- the known
-        # flakiness case. Retry (with backoff) unless this was the last attempt.
+        result = call_claude_streaming(
+            cur_messages, system_prompt, model,
+            session_mode=cur_mode, session_id=cur_id,
+            tools_requested=tools_requested,
+            stop=stop,
+        )
+        if result["tool_calls"] or not tools_requested:
+            return result, cur_mode, cur_id
         if attempt < total_attempts - 1:
             time.sleep(_backoff_delay_s(attempt))
-    return text, tool_calls, usage
+            cur_mode, cur_id, cur_messages = "fresh", str(uuid.uuid4()), full_claude_messages
+    return result, cur_mode, cur_id
+
+
+def _apply_stop_sequences(text, stop):
+    """Client-side emulation of OpenAI's `stop` parameter -- Claude Code
+    has no native stop-sequence flag, so truncate the text ourselves at
+    the earliest match. Returns (truncated_text, matched: bool)."""
+    if not text or not stop:
+        return text, False
+    if isinstance(stop, str):
+        stop = [stop]
+    earliest = None
+    for seq in stop:
+        if not seq:
+            continue
+        idx = text.find(seq)
+        if idx != -1 and (earliest is None or idx < earliest):
+            earliest = idx
+    if earliest is None:
+        return text, False
+    return text[:earliest], True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -409,10 +761,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_error(self, err: ClaudeCliError):
+        self._send_json(err.to_openai_body(), err.http_status)
+
     def do_GET(self):
         if self.path.rstrip("/") in ("/v1/models", "/models"):
             self._send_json(
-                {"object": "list", "data": [{"id": DEFAULT_MODEL, "object": "model"}]}
+                {
+                    "object": "list",
+                    "data": [{"id": m, "object": "model"} for m in KNOWN_MODEL_ALIASES],
+                }
             )
             return
         self._send_json({"status": "ok"})
@@ -425,28 +783,110 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         try:
             payload = json.loads(raw)
-            messages = payload.get("messages", [])
-            tools = payload.get("tools")
-            model = payload.get("model") or DEFAULT_MODEL
-            stream = bool(payload.get("stream"))
+        except json.JSONDecodeError as e:
+            self._send_error(ClaudeCliError(400, "invalid_request_error", f"Invalid JSON body: {e}"))
+            return
 
-            claude_messages, system_prompt = build_claude_messages(messages)
-            system_prompt = render_tools_into_system_prompt(tools, system_prompt)
+        try:
+            self._handle_chat_completion(payload)
+        except ClaudeCliError as e:
+            self._send_error(e)
+        except Exception as e:
+            self._send_error(ClaudeCliError(500, "api_error", str(e)))
 
-            text, raw_tool_calls, usage = call_claude_with_tool_retry(
-                claude_messages, system_prompt, model, tools_requested=bool(tools)
+    def _handle_chat_completion(self, payload):
+        messages = payload.get("messages", [])
+        tools = payload.get("tools")
+        model = payload.get("model") or DEFAULT_MODEL
+        stream = bool(payload.get("stream"))
+        tool_choice = payload.get("tool_choice")
+        n = payload.get("n") or 1
+        max_tokens = payload.get("max_tokens") or payload.get("max_completion_tokens")
+        stop = payload.get("stop")
+        response_format = payload.get("response_format") or {}
+
+        if n > MAX_N_CHOICES:
+            raise ClaudeCliError(
+                400, "invalid_request_error",
+                f"n={n} exceeds this proxy's limit of {MAX_N_CHOICES} (each choice is a "
+                "separate full Claude Code subprocess call; unbounded n would be unbounded cost).",
+                code="n_too_large", param="n",
             )
 
+        # tool_choice: "none" is real and correctly implementable -- treat
+        # exactly like "no tools requested" so the full MCP+built-in
+        # lockdown applies and no tool description is added to the prompt.
+        # tool_choice: "required" / forcing a specific function name has NO
+        # reliable mechanism in this harness (no raw Anthropic tool_choice
+        # equivalent exposed) -- accepted but NOT enforced, same as before.
+        effective_tools = tools
+        if tool_choice == "none":
+            effective_tools = None
+
+        json_schema = None
+        if response_format.get("type") == "json_schema":
+            json_schema = (response_format.get("json_schema") or {}).get("schema")
+        elif response_format.get("type") == "json_object":
+            json_schema = {"type": "object"}
+
+        system_prompt = system_prompt_from_messages(messages)
+        system_prompt = render_tools_into_system_prompt(effective_tools, system_prompt)
+
+        env_overrides = {}
+        if max_tokens:
+            try:
+                env_overrides["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(int(max_tokens))
+            except (TypeError, ValueError):
+                pass
+
+        choices = []
+        usage_totals = {
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+        }
+
+        for choice_index in range(n):
+            if n == 1:
+                # Single-choice path: use session caching (fingerprint +
+                # resume-with-delta) for the common case.
+                session_mode, session_id, delta_messages, conv_key = resolve_session(messages)
+            else:
+                # n>1 fan-out: each choice is an independent fresh
+                # completion -- parallel-choice semantics don't fit clean
+                # single-session continuity, so caching is skipped here.
+                session_mode, session_id, delta_messages, conv_key = "fresh", str(uuid.uuid4()), messages, None
+
+            delta_claude_messages = build_claude_messages(delta_messages)
+            full_claude_messages = build_claude_messages(messages)
+
+            result, final_mode, final_id = self._run_one_completion(
+                delta_claude_messages, full_claude_messages, system_prompt, model,
+                tools_requested=bool(effective_tools), session_mode=session_mode,
+                session_id=session_id, json_schema=json_schema, env_overrides=env_overrides,
+                stop=stop,
+            )
+
+            text = result["text"]
+            # The subprocess is now killed the instant a stop sequence
+            # appears mid-stream (see call_claude_streaming's stop=
+            # handling) -- result["stop_matched"] reflects that. This
+            # second pass is now just a safety net for edge cases where
+            # early termination didn't apply (e.g. the CLAUDE_TIMEOUT_S
+            # deadline fired first, or --json-schema's structured_json
+            # path bypasses stop-sequence checking entirely): idempotent
+            # on already-truncated text, matches nothing, no-op.
+            stop_matched = result.get("stop_matched", False)
+            if stop and text and not stop_matched:
+                text, stop_matched = _apply_stop_sequences(text, stop)
+
+            raw_tool_calls = result["tool_calls"]
             tool_calls = None
             if raw_tool_calls:
                 tool_calls = [
                     {
                         "id": tc["id"],
                         "type": "function",
-                        "function": {
-                            "name": tc["name"],
-                            "arguments": json.dumps(tc["input"]),
-                        },
+                        "function": {"name": tc["name"], "arguments": json.dumps(tc["input"])},
                     }
                     for tc in raw_tool_calls
                 ]
@@ -455,32 +895,91 @@ class Handler(BaseHTTPRequestHandler):
             if tool_calls:
                 message["tool_calls"] = tool_calls
 
-            usage_obj = {
-                "prompt_tokens": usage.get("input_tokens", 0),
-                "completion_tokens": usage.get("output_tokens", 0),
-                "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
-                "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
-                "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
-            }
-            finish_reason = "tool_calls" if tool_calls else "stop"
+            finish_reason = result["finish_reason"]
+            if tool_calls:
+                finish_reason = "tool_calls"
+            elif stop_matched:
+                finish_reason = "stop"
 
-            if stream:
-                self._send_stream_chunks(model, message, tool_calls, finish_reason, usage_obj)
-                return
+            choices.append({"index": choice_index, "message": message, "finish_reason": finish_reason})
 
-            response = {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-                "usage": usage_obj,
-            }
-            self._send_json(response)
-        except Exception as e:
-            self._send_json({"error": {"message": str(e), "type": "shim_error"}}, 500)
+            usage = result["usage"]
+            usage_totals["prompt_tokens"] += usage.get("input_tokens", 0)
+            usage_totals["completion_tokens"] += usage.get("output_tokens", 0)
+            usage_totals["total_tokens"] += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+            usage_totals["cache_read_input_tokens"] += usage.get("cache_read_input_tokens", 0)
+            usage_totals["cache_creation_input_tokens"] += usage.get("cache_creation_input_tokens", 0)
 
-    def _send_stream_chunks(self, model, message, tool_calls, finish_reason, usage_obj):
+            if n == 1 and conv_key is not None:
+                record_session(conv_key, final_id, messages, message)
+
+        if stream:
+            self._send_stream_chunks(model, choices)
+            return
+
+        response = {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": choices,
+            "usage": usage_totals,
+        }
+        self._send_json(response)
+
+    def _run_one_completion(self, delta_messages, full_messages, system_prompt, model,
+                             tools_requested, session_mode, session_id, json_schema, env_overrides,
+                             stop=None):
+        """Single entry point for producing one completion, regardless of
+        whether env overrides (max_tokens), structured output (json_schema),
+        and/or tool retry apply. Returns (result_dict, final_session_mode,
+        final_session_id). Consolidating this here (rather than branching
+        across several call sites) keeps the env-var scoping and retry
+        logic each applied exactly once, in a well-defined order."""
+
+        def _do_call(msgs, mode, sid):
+            return call_claude_streaming(
+                msgs, system_prompt, model,
+                session_mode=mode, session_id=sid,
+                tools_requested=tools_requested, json_schema=json_schema,
+                stop=stop,
+            )
+
+        original_popen = subprocess.Popen
+        if env_overrides:
+            def scoped_popen(*args, **kwargs):
+                env = dict(os.environ)
+                env.update(env_overrides)
+                kwargs["env"] = env
+                return original_popen(*args, **kwargs)
+            subprocess.Popen = scoped_popen
+
+        try:
+            if json_schema is not None:
+                # Structured output doesn't go through the tool-call retry
+                # loop -- --json-schema uses its own internal mechanism
+                # (a StructuredOutput tool + corrective turn) that isn't
+                # the "narrated instead of dispatching" failure mode the
+                # retry loop targets.
+                result = _do_call(delta_messages, session_mode, session_id)
+                return result, session_mode, session_id
+            return call_claude_with_tool_retry(
+                delta_messages, full_messages, system_prompt, model,
+                tools_requested=tools_requested, session_mode=session_mode, session_id=session_id,
+                stop=stop,
+            )
+        finally:
+            if env_overrides:
+                subprocess.Popen = original_popen
+
+
+    def _send_stream_chunks(self, model, choices):
+        """Emits SSE chunks. NOTE: this is protocol-shaped streaming, not
+        real token streaming -- each choice's full text/tool_calls are
+        already fully computed by the time this runs (Claude Code's
+        stream-json mode streams messages, not token deltas within a
+        message), so each choice arrives as a single content delta after
+        the full latency. See README "Capability audit" for measurements."""
         chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
         self.send_response(200)
@@ -488,29 +987,26 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
 
-        def emit(delta, finish=None):
+        def emit(index, delta, finish=None):
             chunk = {
                 "id": chat_id,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model,
-                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                "choices": [{"index": index, "delta": delta, "finish_reason": finish}],
             }
             self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
 
-        emit({"role": "assistant"})
-        if tool_calls:
-            for i, tc in enumerate(tool_calls):
-                emit(
-                    {
-                        "tool_calls": [
-                            {"index": i, "id": tc["id"], "type": "function", "function": tc["function"]}
-                        ]
-                    }
-                )
-        elif message.get("content"):
-            emit({"content": message["content"]})
-        emit({}, finish=finish_reason)
+        for c in choices:
+            idx = c["index"]
+            message = c["message"]
+            emit(idx, {"role": "assistant"})
+            if message.get("tool_calls"):
+                for i, tc in enumerate(message["tool_calls"]):
+                    emit(idx, {"tool_calls": [{"index": i, "id": tc["id"], "type": "function", "function": tc["function"]}]})
+            elif message.get("content"):
+                emit(idx, {"content": message["content"]})
+            emit(idx, {}, finish=c["finish_reason"])
         self.wfile.write(b"data: [DONE]\n\n")
 
     def log_message(self, fmt, *args):
@@ -527,7 +1023,7 @@ def main():
         print(f"Invalid port: {sys.argv[1]!r}", file=sys.stderr)
         sys.exit(2)
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"Claude Code shim (Cline-style native tool-calling) listening on http://127.0.0.1:{port}/v1")
+    print(f"Claude Code shim (native tool-calling + session caching) listening on http://127.0.0.1:{port}/v1")
     server.serve_forever()
 
 
