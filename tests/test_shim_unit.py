@@ -196,6 +196,23 @@ class TestBuildClaudeCmd(unittest.TestCase):
         cmd = shim._build_claude_cmd("sonnet", "fresh", "sid", tools_requested=False, max_turns=3, json_schema={"type": "object"})
         self.assertIn("--json-schema", cmd)
 
+    def test_setting_sources_always_excluded(self):
+        """--setting-sources "" is always passed, regardless of tools/mode
+        -- this is what actually prevents locally-configured hooks
+        (SessionStart etc) from firing and injecting arbitrary extra
+        context into every completion. Verified live (2026-08-14): a real
+        SessionStart hook fired and injected a marker into model context
+        without this flag; with it, the model confirmed no hook message
+        was present. Does not affect OAuth (reads from a separate
+        credentials file, not settings.json)."""
+        for tools_requested in (True, False):
+            cmd = shim._build_claude_cmd(
+                "sonnet", "fresh", "sid", tools_requested=tools_requested, max_turns=1, json_schema=None
+            )
+            self.assertIn("--setting-sources", cmd)
+            idx = cmd.index("--setting-sources")
+            self.assertEqual(cmd[idx + 1], "")
+
 
 class TestCallClaudeStreaming(unittest.TestCase):
     def _run(self, fake_proc, **kwargs):

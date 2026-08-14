@@ -71,3 +71,13 @@ _Unreleased_
   the real current 10-model list via OAuth alone; falls back correctly to
   the hardcoded list when no credentials are available at all. Results
   cached in-process for 5 minutes.
+* Fixed local hook/settings leakage: every spawned `claude` call now
+  passes `--setting-sources ""`, excluding the invoking user's real
+  `~/.claude/settings.json` (user/project/local scopes) entirely.
+  Verified live: a real `SessionStart` hook previously fired and injected
+  a marker string into model context on a plain call; with this flag, no
+  hook message reaches the model at all. `--bare` mode was considered as
+  a stronger lockdown but ruled out -- it strictly requires
+  `ANTHROPIC_API_KEY` and never reads OAuth/keychain (verified live:
+  fails with "Not logged in" under OAuth-only auth), which would break
+  this shim's entire subscription-based premise.

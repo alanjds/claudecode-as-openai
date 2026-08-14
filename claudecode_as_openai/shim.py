@@ -549,6 +549,29 @@ def _iter_ndjson_lines_pty(master_fd, proc, timeout_s):
 
 def _build_claude_cmd(model, session_mode, session_id, tools_requested, max_turns, json_schema, want_partial_messages=False):
     cmd = [CLAUDE_BIN]
+    # Exclude user/project/local settings.json entirely -- this is what
+    # actually prevents locally-configured SessionStart/other hooks from
+    # firing and injecting arbitrary extra context into every completion,
+    # which a stateless API shim should never be silently subject to.
+    # Verified live (2026-08-14): a real SessionStart hook configured in
+    # ~/.claude/settings.json fired and injected a marker string into
+    # model context on a plain call; with --setting-sources "" set, the
+    # model explicitly confirmed no hook message was present. Verified
+    # this does NOT break anything else that matters to this shim: OAuth
+    # auth is untouched (auth reads from a separate credentials file, not
+    # settings.json), tool_use dispatch still fires correctly, and
+    # --session-id/--resume continuity still works. This was considered
+    # as an alternative to --bare mode, which looked like a stronger
+    # lockdown (also skips CLAUDE.md, plugin sync, LSP, etc) but was
+    # ruled out because --bare strictly requires ANTHROPIC_API_KEY and
+    # never reads OAuth/keychain (confirmed live: --bare fails with "Not
+    # logged in" under pure OAuth auth, works fine with a real API key)
+    # -- unacceptable since this shim's whole premise is riding the
+    # user's Claude subscription, not metered API billing.
+    # policySettings/flagSettings (enterprise-managed, not user-facing)
+    # remain unaffected either way -- getEnabledSettingSources() always
+    # includes those regardless of --setting-sources.
+    cmd += ["--setting-sources", ""]
     if tools_requested:
         cmd += ["--disallowedTools", EXTENDED_DISALLOWED_TOOLS]
     else:

@@ -36,6 +36,7 @@ implemented / silently ignored.
 | Vision / image content blocks | ❌ | Silently dropped. `_flatten_content()` only extracts `type: "text"` blocks from multi-part content; `image_url` blocks are discarded with no error, no warning, no image ever reaching Claude. |
 | Local MCP tool leakage | ✅ **fixed** | `--disallowedTools` alone only blocks Claude Code's own named built-ins (Bash, Read, Write, etc.) -- it does nothing against MCP servers configured in the invoking user's local `~/.claude` settings, which could otherwise be dispatched unpredictably even on a request that declared no tools. Fixed for the no-tools-requested path via `--tools "" --strict-mcp-config --mcp-config '{"mcpServers":{}}'` together (verified: `--tools ""` alone still leaked real MCP tool calls; the combination gets `tools available: []`, fully closed). Note: when tools ARE requested, native `tool_use` dispatch is still used (see "Current approach" below) and this full lockdown does not apply there. |
 | CWD / local file exposure | ✅ **fixed** | Every spawned `claude` subprocess previously inherited the shim's own working directory, and Claude Code is aware of and can reference real files there (confirmed live: a "list files using any tool you have" request surfaced real project file references). Fixed by spawning every `claude` call with `cwd=` pointed at a dedicated, empty, per-run sandbox temp directory instead. |
+| Local hook/settings leakage | ✅ **fixed** | Every spawned `claude` call previously read the invoking user's real `~/.claude/settings.json` (user/project/local scopes), meaning a locally-configured hook (`SessionStart`, etc) could silently execute and inject arbitrary extra text into every completion this shim serves. Verified live (2026-08-14): a real `SessionStart` hook fired and injected a marker string into model context on a plain call. Fixed via `--setting-sources ""` on every invocation, which excludes user/project/local settings.json entirely (enterprise-managed `policySettings`/`flagSettings` remain unaffected either way, by design). Verified live: with this flag, the model explicitly confirmed no hook message was present, while OAuth auth, tool_use dispatch, and session resume all continued to work correctly (auth reads from a separate credentials file, not settings.json). |
 | Error responses | ✅ | Claude Code's real structured error signal (`chunk["error"]`, e.g. `"invalid_request"`, or `result` chunks with `is_error: true`) is now classified and translated into a proper OpenAI-shaped `{"error": {"message", "type", "code"}}` body with a matching HTTP status (400/404/429/500/503 as appropriate) via `ClaudeCliError`/`_classify_error_text`. Verified live: an invalid model now returns HTTP 404 with `code: "model_not_found"`, not a silent `200 OK` with the complaint text stuffed into `content`. Note: for the real-streaming path, an error occurring mid-stream (after the SSE `200` headers are already committed) is surfaced as a final `content` delta plus `finish_reason: "stop"`, not a fresh HTTP error status -- the status line can't be changed once streaming has started. |
 | Authentication | ❌ | None. Any `Authorization` header is accepted or ignored; anyone who can reach the port can use it. Fine for `127.0.0.1`-only binding (the default), a real gap if ever bound to `0.0.0.0`. |
 | `/v1/models` | ✅ **fixed** | Now queries the real, current Anthropic model list from `https://api.anthropic.com/v1/models` (a free metadata call, not a billed completion) instead of returning a hardcoded 3-entry guess. Auth preference order: (1) Claude Code's own OAuth access token from `~/.claude/.credentials.json` -- the same subscription credentials `claude` itself uses day-to-day, so this works without requiring a separate `ANTHROPIC_API_KEY` and keeps the shim's whole "avoid metered billing" premise intact; (2) `ANTHROPIC_API_KEY` from the environment, if OAuth is absent/expired; (3) a hardcoded fallback list (extracted from strings in the compiled `claude` binary) if neither auth method works or the request fails for any reason. Verified live: returns the real current 10-model list (`claude-opus-5`, `claude-sonnet-5`, `claude-sonnet-4-6`, etc.) via OAuth with no `ANTHROPIC_API_KEY` set at all; verified the fallback chain with no credentials present at all correctly returns the hardcoded 3-entry list. Results are cached in-process for 5 minutes to avoid a network round-trip on every poll. |
@@ -75,6 +76,56 @@ If neither works (offline, revoked token, network failure, whatever),
 falls back to a hardcoded list extracted from strings embedded in the
 compiled `claude` binary -- stale by definition, but never worse than
 before this feature existed.
+
+## Hook/settings isolation: `--setting-sources ""`, not `--bare`
+
+Without any lockdown, every spawned `claude` call previously read the
+invoking user's real `~/.claude/settings.json` (user/project/local
+scopes). This matters because settings can configure hooks (e.g.
+`SessionStart`) that execute arbitrary local commands and inject their
+output as extra context into every completion -- verified live
+(2026-08-14): a real `SessionStart` hook fired and injected a marker
+string into model context on a plain call, invisibly to the API caller.
+
+`--bare` mode looked like the obvious fix (it also skips CLAUDE.md
+discovery, plugin sync, LSP, and more), but it was ruled out: `--bare`
+strictly requires `ANTHROPIC_API_KEY` and never reads OAuth or the
+system keychain (confirmed both in the CLI's own `--help` text and by
+inspecting `isAnthropicAuthEnabled()`/`getApiKey()` in a reconstructed
+source reference for an early public version of Claude Code -- see the
+note below on how that reference was used). Verified live: `--bare`
+fails with "Not logged in · Please run /login" under this shim's normal
+OAuth-only setup, and only succeeds once a real `ANTHROPIC_API_KEY` is
+exported. Since this shim's entire premise is riding the user's Claude
+subscription instead of metered API billing, adopting `--bare` would
+silently break every request for exactly the audience this project
+serves.
+
+The actual fix: `--setting-sources ""` on every invocation, which
+excludes user/project/local settings.json entirely (enterprise-managed
+`policySettings`/`flagSettings` remain unaffected by this flag either
+way -- `getEnabledSettingSources()` always includes those regardless).
+Verified live: with this flag, an injected test hook no longer fires at
+all (the model explicitly confirmed no hook message was present in its
+context), while OAuth auth, tool_use dispatch, and `--session-id`/
+`--resume` continuity all continued to work correctly -- auth reads from
+a separate credentials file (`~/.claude/.credentials.json`), not from
+settings.json, so it's untouched by this flag.
+
+Separately: `tool_choice: "required"` / forcing a specific tool has no
+reachable path from `-p`/`--print` mode at all -- not a flag we're
+missing, but a case the CLI's own request-building code hardcodes
+`toolChoice: undefined` for on every regular turn (confirmed via the
+same source reference). This is a genuine, unresolvable CLI limitation
+from the shim's side.
+
+**A note on how these findings were reached:** both were cross-checked
+against a third-party, explicitly "unofficial, research purposes only"
+reconstruction of an early public Claude Code release (TypeScript
+recovered from a published npm package's source map, not Anthropic's
+actual source repository). It was used strictly read-only, to confirm
+or falsify conclusions already reached by black-box CLI probing -- no
+code from that reconstruction was copied into this shim.
 
 ## Real streaming: the PTY trick
 
