@@ -63,13 +63,36 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CLAUDE_BIN = "claude"
 DEFAULT_MODEL = "sonnet"
-KNOWN_MODEL_ALIASES = ["sonnet", "opus", "haiku"]
+KNOWN_MODEL_ALIASES = [
+    # Hardcoded last-resort fallback for /v1/models when neither OAuth nor
+    # an API key is available to query the real Anthropic /v1/models
+    # endpoint (see fetch_model_list()). Extracted from strings embedded
+    # in the compiled `claude` binary (2026-08-14) -- will go stale as new
+    # models ship, which is exactly why the live query is preferred.
+    "sonnet", "opus", "haiku",
+]
 CLAUDE_TIMEOUT_S = 300
+
+# Claude Code's OAuth credentials (subscription auth, NOT an API key) --
+# used to authenticate the real Anthropic /v1/models call in
+# fetch_model_list() so /v1/models can return the actual current model
+# list instead of a hardcoded guess, without requiring the caller to have
+# a separate ANTHROPIC_API_KEY. Verified live: a Bearer token read from
+# this file successfully authenticated a GET to
+# https://api.anthropic.com/v1/models and returned the real, current
+# model list (10 entries, live 2026-08-14) -- this is a free metadata
+# call, not a billed completion, so it doesn't touch subscription usage.
+_CLAUDE_CREDENTIALS_PATH = os.path.expanduser("~/.claude/.credentials.json")
+_MODEL_LIST_CACHE_TTL_S = 300
+_model_list_cache = {"data": None, "fetched_at": 0.0}
+_model_list_cache_lock = threading.Lock()
 
 # Every spawned `claude` subprocess inherits whatever directory the shim
 # process happens to be running from -- verified live: Claude Code reports
@@ -262,6 +285,109 @@ def build_claude_messages(openai_messages):
 def system_prompt_from_messages(openai_messages):
     parts = [_flatten_content(m.get("content")) for m in openai_messages if m.get("role") == "system"]
     return "\n\n".join(p for p in parts if p)
+
+
+def _read_claude_oauth_token():
+    """Read Claude Code's own OAuth access token from its local
+    credentials file (subscription auth, NOT an API key -- this is the
+    same token `claude` itself uses day-to-day). Returns the token string,
+    or None if the file is missing, unreadable, malformed, or the token
+    has already expired (checked against the same `expiresAt` field
+    Claude Code itself uses, so an expired-but-present token doesn't get
+    used to make a doomed request). Never raises -- every failure mode
+    here should fall through to the next auth method in
+    fetch_model_list(), not blow up /v1/models."""
+    try:
+        with open(_CLAUDE_CREDENTIALS_PATH, "r") as f:
+            creds = json.load(f)
+        oauth = creds.get("claudeAiOauth") or {}
+        token = oauth.get("accessToken")
+        expires_at = oauth.get("expiresAt")
+        if not token:
+            return None
+        if expires_at and time.time() * 1000 > expires_at:
+            return None
+        return token
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _fetch_models_from_anthropic_api(auth_header):
+    """GET https://api.anthropic.com/v1/models with the given auth header
+    dict merged into the request. This is a free metadata call (not a
+    billed completion) -- verified live with both an OAuth Bearer token
+    and a real ANTHROPIC_API_KEY, each returning the current real model
+    list (10 entries, live 2026-08-14). Returns the parsed `data` list, or
+    None on any failure (network, auth, non-200, malformed JSON) so the
+    caller can fall through to the next auth method or the hardcoded
+    fallback -- this must never raise up into a /v1/models request."""
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/models",
+        headers={"anthropic-version": "2023-06-01", **auth_header},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status != 200:
+                return None
+            body = json.loads(resp.read())
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, OSError):
+        return None
+    data = body.get("data")
+    if not isinstance(data, list) or not data:
+        return None
+    return data
+
+
+def fetch_model_list():
+    """Returns the real, current Anthropic model list for /v1/models,
+    preferring OAuth (Claude Code's own subscription credentials) over an
+    API key over a hardcoded static fallback, per user direction
+    (2026-08-14): OAuth first because it works without requiring the
+    caller to separately configure ANTHROPIC_API_KEY -- the whole point of
+    this shim is to avoid needing metered API billing, so authenticating
+    this one free metadata call with the OAuth token Claude Code already
+    has (rather than a paid-API-key-only path) keeps that promise intact.
+
+    Order tried:
+    1. Claude Code's own OAuth access token (~/.claude/.credentials.json)
+       -- verified live: works identically to an API key against the real
+       /v1/models endpoint.
+    2. ANTHROPIC_API_KEY from the environment, if OAuth is absent/expired
+       /unreadable.
+    3. KNOWN_MODEL_ALIASES (hardcoded, extracted from the claude binary)
+       if neither auth method is available or the request fails for any
+       reason (network down, revoked token, etc).
+
+    Results are cached in-process for _MODEL_LIST_CACHE_TTL_S to avoid a
+    network round-trip on every single /v1/models poll (some clients poll
+    this endpoint frequently on startup).
+
+    Returns a list of dicts shaped like OpenAI's model list entries:
+    [{"id": ..., "object": "model"}, ...]. Never raises."""
+    with _model_list_cache_lock:
+        cached = _model_list_cache["data"]
+        if cached is not None and (time.time() - _model_list_cache["fetched_at"]) < _MODEL_LIST_CACHE_TTL_S:
+            return cached
+
+    data = None
+    oauth_token = _read_claude_oauth_token()
+    if oauth_token:
+        data = _fetch_models_from_anthropic_api({"Authorization": f"Bearer {oauth_token}"})
+
+    if data is None:
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if api_key:
+            data = _fetch_models_from_anthropic_api({"x-api-key": api_key})
+
+    if data is not None:
+        result = [{"id": m["id"], "object": "model"} for m in data if m.get("id")]
+    else:
+        result = [{"id": m, "object": "model"} for m in KNOWN_MODEL_ALIASES]
+
+    with _model_list_cache_lock:
+        _model_list_cache["data"] = result
+        _model_list_cache["fetched_at"] = time.time()
+    return result
 
 
 def render_tools_into_system_prompt(tools, base_system_prompt):
@@ -938,7 +1064,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(
                 {
                     "object": "list",
-                    "data": [{"id": m, "object": "model"} for m in KNOWN_MODEL_ALIASES],
+                    "data": fetch_model_list(),
                 }
             )
             return

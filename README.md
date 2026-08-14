@@ -38,16 +38,43 @@ implemented / silently ignored.
 | CWD / local file exposure | ✅ **fixed** | Every spawned `claude` subprocess previously inherited the shim's own working directory, and Claude Code is aware of and can reference real files there (confirmed live: a "list files using any tool you have" request surfaced real project file references). Fixed by spawning every `claude` call with `cwd=` pointed at a dedicated, empty, per-run sandbox temp directory instead. |
 | Error responses | ✅ | Claude Code's real structured error signal (`chunk["error"]`, e.g. `"invalid_request"`, or `result` chunks with `is_error: true`) is now classified and translated into a proper OpenAI-shaped `{"error": {"message", "type", "code"}}` body with a matching HTTP status (400/404/429/500/503 as appropriate) via `ClaudeCliError`/`_classify_error_text`. Verified live: an invalid model now returns HTTP 404 with `code: "model_not_found"`, not a silent `200 OK` with the complaint text stuffed into `content`. Note: for the real-streaming path, an error occurring mid-stream (after the SSE `200` headers are already committed) is surfaced as a final `content` delta plus `finish_reason: "stop"`, not a fresh HTTP error status -- the status line can't be changed once streaming has started. |
 | Authentication | ❌ | None. Any `Authorization` header is accepted or ignored; anyone who can reach the port can use it. Fine for `127.0.0.1`-only binding (the default), a real gap if ever bound to `0.0.0.0`. |
-| `/v1/models` | ⚠️ | Returns a single hardcoded entry (`DEFAULT_MODEL = "sonnet"`), not the actual list of models the underlying `claude` CLI/subscription supports. |
+| `/v1/models` | ✅ **fixed** | Now queries the real, current Anthropic model list from `https://api.anthropic.com/v1/models` (a free metadata call, not a billed completion) instead of returning a hardcoded 3-entry guess. Auth preference order: (1) Claude Code's own OAuth access token from `~/.claude/.credentials.json` -- the same subscription credentials `claude` itself uses day-to-day, so this works without requiring a separate `ANTHROPIC_API_KEY` and keeps the shim's whole "avoid metered billing" premise intact; (2) `ANTHROPIC_API_KEY` from the environment, if OAuth is absent/expired; (3) a hardcoded fallback list (extracted from strings in the compiled `claude` binary) if neither auth method works or the request fails for any reason. Verified live: returns the real current 10-model list (`claude-opus-5`, `claude-sonnet-5`, `claude-sonnet-4-6`, etc.) via OAuth with no `ANTHROPIC_API_KEY` set at all; verified the fallback chain with no credentials present at all correctly returns the hardcoded 3-entry list. Results are cached in-process for 5 minutes to avoid a network round-trip on every poll. |
 
 **Bottom line:** model selection, session caching, error translation,
 `max_tokens`, `response_format`, `tool_choice: "none"`, bounded `n`, the
-MCP tool leakage, the CWD file-exposure issue, and now real token-level
-streaming are all implemented and live-verified. The one remaining
-genuine gap is raw sampling parameters (`temperature`/`top_p`/etc), which
-Claude Code doesn't expose anywhere in its CLI -- these are accepted with
-a one-time stderr warning rather than hard-erroring or silently doing
-nothing without telling anyone.
+MCP tool leakage, the CWD file-exposure issue, real token-level
+streaming, and now a real `/v1/models` list are all implemented and
+live-verified. The one remaining genuine gap is raw sampling parameters
+(`temperature`/`top_p`/etc), which Claude Code doesn't expose anywhere in
+its CLI -- these are accepted with a one-time stderr warning rather than
+hard-erroring or silently doing nothing without telling anyone.
+
+## `/v1/models`: querying the real list
+
+Claude Code has no `models list` subcommand, and the invalid-model error
+text doesn't enumerate valid options either -- but the Anthropic SDK
+bundled inside the compiled `claude` binary does have a real
+`GET /v1/models` endpoint (confirmed by inspecting strings/logic in the
+binary itself). This endpoint is a free metadata call, not a billed
+completion.
+
+Two ways to authenticate it, tried in this preference order:
+
+1. **OAuth** (`~/.claude/.credentials.json`, `claudeAiOauth.accessToken`)
+   -- Claude Code's own subscription credentials. Verified live: a Bearer
+   token read from this file authenticates successfully against the real
+   endpoint, expiry is checked against the same `expiresAt` field Claude
+   Code itself uses so an expired token isn't used for a doomed request.
+   Preferred because it requires no extra configuration and keeps the
+   shim's "avoid metered API billing" premise intact even for this
+   metadata call.
+2. **`ANTHROPIC_API_KEY`** from the environment, as a fallback if OAuth
+   is absent, expired, or unreadable.
+
+If neither works (offline, revoked token, network failure, whatever),
+falls back to a hardcoded list extracted from strings embedded in the
+compiled `claude` binary -- stale by definition, but never worse than
+before this feature existed.
 
 ## Real streaming: the PTY trick
 

@@ -16,7 +16,9 @@ Run: python3 -m unittest tests.test_shim_unit -v
      (or: python3 tests/test_shim_unit.py)
 """
 import json
+import os
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -658,6 +660,94 @@ class TestUnsupportedSamplingParamsWarning(unittest.TestCase):
         with patch.object(shim.sys, "stderr") as mock_stderr:
             shim._warn_unsupported_sampling_params({"max_tokens": 100, "stop": ["x"], "stream": True})
         mock_stderr.write.assert_not_called()
+
+
+class TestFetchModelList(unittest.TestCase):
+    """/v1/models should prefer Claude Code's own OAuth credentials over
+    an API key over a hardcoded fallback (user direction, 2026-08-14):
+    OAuth first because the whole point of this shim is avoiding metered
+    API billing, so this one free metadata call should work without
+    requiring the caller to separately configure ANTHROPIC_API_KEY."""
+
+    def setUp(self):
+        shim._model_list_cache["data"] = None
+        shim._model_list_cache["fetched_at"] = 0.0
+
+    def _fake_urlopen_response(self, data):
+        resp = MagicMock()
+        resp.status = 200
+        resp.read.return_value = json.dumps({"data": data}).encode()
+        resp.__enter__.return_value = resp
+        return resp
+
+    def test_prefers_oauth_over_api_key_when_both_available(self):
+        oauth_models = [{"id": "claude-oauth-model"}]
+        api_key_models = [{"id": "claude-apikey-model"}]
+
+        def fake_urlopen(req, timeout=None):
+            auth = req.headers.get("Authorization")
+            if auth and auth.startswith("Bearer"):
+                return self._fake_urlopen_response(oauth_models)
+            return self._fake_urlopen_response(api_key_models)
+
+        with patch.object(shim, "_read_claude_oauth_token", return_value="tok123"), \
+             patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-fake"}), \
+             patch.object(shim.urllib.request, "urlopen", side_effect=fake_urlopen):
+            result = shim.fetch_model_list()
+        self.assertEqual(result, [{"id": "claude-oauth-model", "object": "model"}])
+
+    def test_falls_back_to_api_key_when_oauth_absent(self):
+        with patch.object(shim, "_read_claude_oauth_token", return_value=None), \
+             patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-fake"}), \
+             patch.object(shim.urllib.request, "urlopen",
+                           return_value=self._fake_urlopen_response([{"id": "claude-apikey-model"}])):
+            result = shim.fetch_model_list()
+        self.assertEqual(result, [{"id": "claude-apikey-model", "object": "model"}])
+
+    def test_falls_back_to_hardcoded_list_when_no_auth_available(self):
+        with patch.object(shim, "_read_claude_oauth_token", return_value=None), \
+             patch.dict(os.environ, {}, clear=True):
+            result = shim.fetch_model_list()
+        self.assertEqual(result, [{"id": m, "object": "model"} for m in shim.KNOWN_MODEL_ALIASES])
+
+    def test_falls_back_to_hardcoded_list_when_api_call_fails(self):
+        """Even with a token present, a network/auth failure must fall
+        through to the hardcoded list, never raise up into a /v1/models
+        request."""
+        with patch.object(shim, "_read_claude_oauth_token", return_value="tok123"), \
+             patch.dict(os.environ, {}, clear=True), \
+             patch.object(shim.urllib.request, "urlopen", side_effect=shim.urllib.error.URLError("boom")):
+            result = shim.fetch_model_list()
+        self.assertEqual(result, [{"id": m, "object": "model"} for m in shim.KNOWN_MODEL_ALIASES])
+
+    def test_result_is_cached_within_ttl(self):
+        with patch.object(shim, "_read_claude_oauth_token", return_value="tok123"), \
+             patch.object(shim.urllib.request, "urlopen",
+                           return_value=self._fake_urlopen_response([{"id": "claude-cached-model"}])) as mock_urlopen:
+            first = shim.fetch_model_list()
+            second = shim.fetch_model_list()
+        self.assertEqual(first, second)
+        mock_urlopen.assert_called_once()
+
+    def test_oauth_token_read_returns_none_on_missing_file(self):
+        with patch("builtins.open", side_effect=FileNotFoundError):
+            self.assertIsNone(shim._read_claude_oauth_token())
+
+    def test_oauth_token_read_returns_none_when_expired(self):
+        expired_creds = json.dumps({
+            "claudeAiOauth": {"accessToken": "tok123", "expiresAt": 1}  # far in the past
+        })
+        with patch("builtins.open", MagicMock(return_value=MagicMock(
+                __enter__=MagicMock(return_value=MagicMock(read=lambda: expired_creds)),
+                __exit__=MagicMock(return_value=False)))), \
+             patch.object(shim.json, "load", return_value=json.loads(expired_creds)):
+            self.assertIsNone(shim._read_claude_oauth_token())
+
+    def test_oauth_token_read_returns_token_when_valid(self):
+        valid_creds = {"claudeAiOauth": {"accessToken": "tok123", "expiresAt": (time.time() + 3600) * 1000}}
+        with patch("builtins.open", MagicMock()), \
+             patch.object(shim.json, "load", return_value=valid_creds):
+            self.assertEqual(shim._read_claude_oauth_token(), "tok123")
 
 
 if __name__ == "__main__":

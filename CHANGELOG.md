@@ -62,3 +62,12 @@ _Unreleased_
   `logprobs`, `top_logprobs`, `presence_penalty`, `frequency_penalty`,
   `logit_bias`) -- accepted, not enforced, never hard-errored (since real
   clients routinely send explicit defaults that carry no signal of intent).
+* `/v1/models` now queries the real, current Anthropic model list from
+  `https://api.anthropic.com/v1/models` (a free metadata call) instead of
+  returning a hardcoded 3-entry guess. Prefers Claude Code's own OAuth
+  access token (`~/.claude/.credentials.json`) over `ANTHROPIC_API_KEY`
+  over a hardcoded fallback list, in that order, so the real list is
+  available without requiring a separate API key. Verified live: returns
+  the real current 10-model list via OAuth alone; falls back correctly to
+  the hardcoded list when no credentials are available at all. Results
+  cached in-process for 5 minutes.
