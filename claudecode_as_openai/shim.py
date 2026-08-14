@@ -57,6 +57,7 @@ import hashlib
 import json
 import os
 import pty
+import re
 import select
 import subprocess
 import sys
@@ -391,14 +392,22 @@ def fetch_model_list():
 
 
 def render_tools_into_system_prompt(tools, base_system_prompt):
-    """Custom tools aren't passed via a CLI flag (Claude Code's -p mode has
-    no --tools-schema equivalent for arbitrary JSON-schema tools) -- they're
-    described in the system prompt. Framing matters a lot here: describing
-    them as "custom"/hypothetical made Claude hedge and refuse to call them
-    (0/8 in testing) even with native tool_use active. Framing them as
-    already-wired, real, implemented-by-the-harness tools fixed this
-    completely (6/6) -- combined with the extended --disallowedTools list
-    removing Claude's own competing built-in dispatch options."""
+    """LEGACY fallback path. Superseded by build_mcp_tool_config() (see
+    below) as of 2026-08-14: custom tools are now passed to Claude Code as
+    real MCP tool schemas, not prose. Kept and still wired up as an
+    automatic fallback for edge cases where MCP registration itself can't
+    be used (e.g. a tool name that can't be made into a valid MCP tool
+    name at all) -- see call_claude_streaming's use of this function only
+    when build_mcp_tool_config() returns None.
+
+    Framing matters a lot here: describing tools as "custom"/hypothetical
+    made Claude hedge and refuse to call them (0/8 in testing) even with
+    native tool_use active. Framing them as already-wired, real,
+    implemented-by-the-harness tools fixed this completely (6/6) --
+    combined with the extended --disallowedTools list removing Claude's
+    own competing built-in dispatch options. This path still only reaches
+    ~40% single-shot reliability (see TOOL_CALL_MAX_RETRIES); the MCP path
+    is the real fix."""
     if not tools:
         return base_system_prompt
     lines = [
@@ -424,6 +433,101 @@ def render_tools_into_system_prompt(tools, base_system_prompt):
     if base_system_prompt:
         return base_system_prompt + "\n\n" + tool_desc
     return tool_desc
+
+
+# ---------------------------------------------------------------------------
+# Native MCP tool registration: the real fix for the ~40% single-shot
+# tool-call reliability problem. Verified live (2026-08-14): Claude Code's
+# `-p` mode has no flag to accept arbitrary JSON-schema tool definitions
+# directly, but MCP tool schemas registered via `--mcp-config` ARE passed
+# to the underlying Anthropic API as genuine, ajv-validated `tools`
+# entries -- with `_meta["anthropic/alwaysLoad"] = True` skipping Claude
+# Code's internal "ToolSearch" deferred-loading indirection, this reaches
+# 100% turn-1 dispatch reliability across repeated trials (8/8, then
+# 5/5), vs ~40% for the prose-based fallback above.
+#
+# Transport is stdio, not HTTP/SSE -- deliberately, per explicit user
+# request: this must never bind a TCP port (no port-clash risk, nothing
+# exposed on any network interface). The MCP server is a plain child
+# process of `claude`, wired via stdio pipes only.
+#
+# MCP tool names must match ^[a-zA-Z0-9_-]{1,64}$ (same constraint as
+# OpenAI function names) -- checked defensively since a caller could still
+# send something invalid; falls back to the prose path if so.
+_MCP_TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+_MCP_SERVER_NAME = "shim_tools"
+# Absolute path, not "-m claudecode_as_openai.mcp_tool_server" -- the
+# `claude` subprocess runs with cwd=_CLAUDE_CWD (an empty sandbox temp
+# dir, see _CLAUDE_CWD docstring), which is NOT on sys.path, so `-m`
+# resolution fails there with "No module named 'claudecode_as_openai'"
+# (verified live: reproduced the exact ModuleNotFoundError this way).
+# The absolute file path works from any cwd.
+_MCP_TOOL_SERVER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_tool_server.py")
+
+
+def build_mcp_tool_manifest(tools):
+    """Translate an OpenAI `tools` array into an MCP tool manifest (list of
+    {"name", "description", "inputSchema"}). Returns None if any tool name
+    fails MCP's naming constraint -- callers should fall back to
+    render_tools_into_system_prompt() in that case rather than silently
+    dropping a tool the caller asked for."""
+    if not tools:
+        return None
+    manifest = []
+    for t in tools:
+        fn = t.get("function", t)
+        name = fn.get("name")
+        if not name or not _MCP_TOOL_NAME_RE.match(name):
+            return None
+        manifest.append({
+            "name": name,
+            "description": fn.get("description", "") or "",
+            "inputSchema": fn.get("parameters") or {"type": "object", "properties": {}},
+        })
+    return manifest
+
+
+def build_mcp_tool_config(tools):
+    """Returns a dict {"mcp_config", "manifest_path", "allowed_tools"} for
+    the given OpenAI tools array, or None if tools couldn't be represented
+    as an MCP manifest (see build_mcp_tool_manifest). allowed_tools holds
+    the "mcp__<server>__<name>" forms Claude Code reports tool_use blocks
+    under -- callers must strip this prefix again before handing the name
+    back to an OpenAI client (see strip_mcp_tool_prefix). The manifest is
+    written to a per-call temp file (not inlined into the mcp_config JSON)
+    so the *server command* stays byte-identical across calls -- only the
+    file path changes if the tool set itself changes, which keeps prompt
+    caching intact whenever the actual tool set is stable across a
+    resumed session (see README \"MCP native tool registration\" for the
+    caching mechanics verified live)."""
+    manifest = build_mcp_tool_manifest(tools)
+    if manifest is None:
+        return None
+    fd, manifest_path = tempfile.mkstemp(prefix="claudecode-as-openai-mcp-manifest-", suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(manifest, f, sort_keys=True)
+    mcp_config = {
+        "mcpServers": {
+            _MCP_SERVER_NAME: {
+                "command": sys.executable,
+                "args": [_MCP_TOOL_SERVER_PATH, manifest_path],
+            }
+        }
+    }
+    allowed = [f"mcp__{_MCP_SERVER_NAME}__{t['name']}" for t in manifest]
+    return {"mcp_config": mcp_config, "manifest_path": manifest_path, "allowed_tools": allowed}
+
+
+_MCP_TOOL_PREFIX = f"mcp__{_MCP_SERVER_NAME}__"
+
+
+def strip_mcp_tool_prefix(name):
+    """Reverses the "mcp__<server>__" mangling Claude Code applies to MCP
+    tool names in tool_use blocks, so the name reported back to an OpenAI
+    client matches exactly what the caller originally declared."""
+    if name and name.startswith(_MCP_TOOL_PREFIX):
+        return name[len(_MCP_TOOL_PREFIX):]
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -547,7 +651,7 @@ def _iter_ndjson_lines_pty(master_fd, proc, timeout_s):
                 continue
 
 
-def _build_claude_cmd(model, session_mode, session_id, tools_requested, max_turns, json_schema, want_partial_messages=False):
+def _build_claude_cmd(model, session_mode, session_id, tools_requested, max_turns, json_schema, want_partial_messages=False, mcp_tool_config=None):
     cmd = [CLAUDE_BIN]
     # Exclude user/project/local settings.json entirely -- this is what
     # actually prevents locally-configured SessionStart/other hooks from
@@ -572,7 +676,23 @@ def _build_claude_cmd(model, session_mode, session_id, tools_requested, max_turn
     # remain unaffected either way -- getEnabledSettingSources() always
     # includes those regardless of --setting-sources.
     cmd += ["--setting-sources", ""]
-    if tools_requested:
+    if mcp_tool_config is not None:
+        # Native MCP tool registration path (see build_mcp_tool_config
+        # docstring): --strict-mcp-config restricts MCP servers to ONLY
+        # the one just-built manifest server (closing the same
+        # locally-configured-MCP leak the no-tools path below closes),
+        # --allowedTools further restricts to exactly this session's
+        # declared tool names (nothing else callable even within our own
+        # server), and --disallowedTools still blocks every Claude Code
+        # built-in by name. Verified live (2026-08-14): this combination
+        # exposes ONLY the intended mcp__shim_tools__<name> entries in
+        # the session's tool list -- no built-ins, no other leakage.
+        cmd += [
+            "--disallowedTools", EXTENDED_DISALLOWED_TOOLS,
+            "--strict-mcp-config", "--mcp-config", json.dumps(mcp_tool_config["mcp_config"]),
+            "--allowedTools", ",".join(mcp_tool_config["allowed_tools"]),
+        ]
+    elif tools_requested:
         cmd += ["--disallowedTools", EXTENDED_DISALLOWED_TOOLS]
     else:
         # No tools requested at all: fully lock down BOTH built-ins and any
@@ -617,6 +737,7 @@ def call_claude_streaming(
     session_mode="fresh",
     session_id=None,
     tools_requested=False,
+    tools=None,
     json_schema=None,
     stop=None,
     stream_callback=None,
@@ -646,6 +767,16 @@ def call_claude_streaming(
     would otherwise get streamed to the client before the shim knows that
     attempt needs to be discarded and retried.
 
+    `tools`, if given (the raw OpenAI `tools` array), is registered as a
+    real MCP tool server (see build_mcp_tool_config) instead of being
+    described in prose -- this is the fix for the ~40% single-shot
+    tool-call reliability problem, verified live to reach 100% turn-1
+    dispatch. Falls back to tools_requested's prose-description path
+    automatically (system_prompt is expected to already carry the prose
+    fallback in that case -- see _handle_chat_completion) when the tool
+    set can't be represented as a valid MCP manifest (see
+    build_mcp_tool_manifest).
+
     Returns a dict: {"text", "tool_calls", "usage", "finish_reason",
     "structured_json"}. Raises ClaudeCliError for conditions that should
     become an OpenAI-shaped error response (invalid model, auth failure,
@@ -663,15 +794,24 @@ def call_claude_streaming(
         stop_sequences = [stop] if isinstance(stop, str) else [s for s in stop if s]
 
     system_prompt_file = None
+    mcp_tool_config = build_mcp_tool_config(tools) if tools else None
     # --json-schema needs a couple of internal turns (an internal
     # "StructuredOutput" tool call + a corrective retry if the model
     # forgets it) to actually enforce the schema -- verified empirically:
     # max_turns=1 leaves it hanging at error_max_turns with the schema
-    # never actually produced; max_turns=3 completes cleanly.
-    max_turns = 3 if json_schema is not None else 1
+    # never actually produced; max_turns=3 completes cleanly. Native MCP
+    # tool dispatch (verified live) also needs 2 turns when a tool fires:
+    # turn 1 emits the tool_use (ending that turn), turn 2 is needed for
+    # the follow-up text after the (client-side) tool result -- though
+    # this shim breaks out on tool_use before that matters (see below),
+    # --max-turns 1 alone left error_max_turns on the wire in earlier
+    # testing when a fallback path needed the second turn, so this stays
+    # >= 2 whenever any real tool dispatch is possible.
+    max_turns = 3 if json_schema is not None else (2 if mcp_tool_config else 1)
     cmd = _build_claude_cmd(
         model, session_mode, session_id, tools_requested, max_turns, json_schema,
         want_partial_messages=bool(stop_sequences) or stream_callback is not None,
+        mcp_tool_config=mcp_tool_config,
     )
     if system_prompt:
         if len(system_prompt) > 4000:
@@ -858,7 +998,7 @@ def call_claude_streaming(
                             tool_calls.append(
                                 {
                                     "id": content.get("id", f"toolu_{uuid.uuid4().hex[:20]}"),
-                                    "name": name,
+                                    "name": strip_mcp_tool_prefix(name),
                                     "input": content.get("input", {}),
                                 }
                             )
@@ -928,6 +1068,11 @@ def call_claude_streaming(
                 os.unlink(system_prompt_file)
             except OSError:
                 pass
+        if mcp_tool_config is not None:
+            try:
+                os.unlink(mcp_tool_config["manifest_path"])
+            except OSError:
+                pass
 
 
 # Bounded retries when tools were requested but Claude answered with plain
@@ -966,6 +1111,7 @@ def call_claude_with_tool_retry(
     tools_requested,
     session_mode,
     session_id,
+    tools=None,
     stop=None,
     stream_callback=None,
 ):
@@ -981,6 +1127,15 @@ def call_claude_with_tool_retry(
     duplicate entries in that session's persisted transcript. Returns
     (result_dict, final_session_mode, final_session_id) so the caller knows
     which session to record for the next external turn.
+
+    `tools`, if given, is forwarded to call_claude_streaming for native MCP
+    tool registration (see build_mcp_tool_config) -- this is what actually
+    fixes the ~40% single-shot reliability this retry loop exists to paper
+    over; verified live to reach 100% turn-1 dispatch, so in practice this
+    loop should rarely need more than its first attempt whenever `tools`
+    resolves to a valid MCP manifest. Retries remain as a safety net for
+    the prose-fallback path (tools that can't be represented as MCP tool
+    names) and for any future Claude Code regression.
 
     `stream_callback`, if given, should only ever be passed by the caller
     when tools_requested is False -- with tools in play, a failed
@@ -998,6 +1153,7 @@ def call_claude_with_tool_retry(
             cur_messages, system_prompt, model,
             session_mode=cur_mode, session_id=cur_id,
             tools_requested=tools_requested,
+            tools=tools,
             stop=stop,
             stream_callback=cb,
         )
@@ -1148,7 +1304,18 @@ class Handler(BaseHTTPRequestHandler):
             json_schema = {"type": "object"}
 
         system_prompt = system_prompt_from_messages(messages)
-        system_prompt = render_tools_into_system_prompt(effective_tools, system_prompt)
+        # Native MCP tool registration (see build_mcp_tool_config) is the
+        # real fix for tool-call reliability and is always attempted first
+        # inside call_claude_streaming/_run_one_completion. The prose
+        # fallback below is only actually NEEDED when a tool name can't be
+        # represented as a valid MCP tool name (see
+        # build_mcp_tool_manifest) -- checked here up front so the prompt
+        # doesn't carry redundant tool descriptions on the common path
+        # where MCP registration succeeds (call_claude_streaming would
+        # otherwise silently prefer MCP anyway, but doubling up the prose
+        # description wastes prompt-cache-relevant tokens for no benefit).
+        if effective_tools and build_mcp_tool_manifest(effective_tools) is None:
+            system_prompt = render_tools_into_system_prompt(effective_tools, system_prompt)
 
         env_overrides = {}
         if max_tokens:
@@ -1198,7 +1365,7 @@ class Handler(BaseHTTPRequestHandler):
                 delta_claude_messages, full_claude_messages, system_prompt, model,
                 tools_requested=bool(effective_tools), session_mode=session_mode,
                 session_id=session_id, json_schema=json_schema, env_overrides=env_overrides,
-                stop=stop,
+                tools=effective_tools, stop=stop,
             )
 
             text = result["text"]
@@ -1350,7 +1517,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _run_one_completion(self, delta_messages, full_messages, system_prompt, model,
                              tools_requested, session_mode, session_id, json_schema, env_overrides,
-                             stop=None):
+                             tools=None, stop=None):
         """Single entry point for producing one completion, regardless of
         whether env overrides (max_tokens), structured output (json_schema),
         and/or tool retry apply. Returns (result_dict, final_session_mode,
@@ -1362,7 +1529,7 @@ class Handler(BaseHTTPRequestHandler):
             return call_claude_streaming(
                 msgs, system_prompt, model,
                 session_mode=mode, session_id=sid,
-                tools_requested=tools_requested, json_schema=json_schema,
+                tools_requested=tools_requested, tools=tools, json_schema=json_schema,
                 stop=stop,
             )
 
@@ -1387,7 +1554,7 @@ class Handler(BaseHTTPRequestHandler):
             return call_claude_with_tool_retry(
                 delta_messages, full_messages, system_prompt, model,
                 tools_requested=tools_requested, session_mode=session_mode, session_id=session_id,
-                stop=stop,
+                tools=tools, stop=stop,
             )
         finally:
             if env_overrides:

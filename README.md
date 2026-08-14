@@ -25,9 +25,9 @@ implemented / silently ignored.
 | Model selection (`model` field) | ✅ | `--model <value>` passed straight to `claude -p` per request. Verified `sonnet` -> `claude-sonnet-4-6`, `opus` -> `claude-opus-4-6` both correctly selected, confirmed by asking Claude to self-report its version. |
 | Session/conversation caching | ✅ | Implemented via conversation fingerprinting (`resolve_session`/`record_session`): when a client echoes back the exact prior assistant reply (as real OpenAI clients do), the shim resumes the matching Claude Code session with `--resume` and sends only the new delta message, instead of replaying full history into a fresh subprocess. Falls back to a fresh session on any divergence (edited/regenerated history). Verified live: `cache_creation_input_tokens` dropped from ~3500 (fresh turn) to ~30-40 tokens (resumed turn) across a real 3-turn conversation, with correct recall across turns. |
 | Streaming (`stream: true`) | ✅ | Real token-level streaming for the common case (single choice, no tools requested, no `response_format: json_schema`). Claude Code's own stdout is **fully buffered** (not line-buffered) when piped without a TTY -- verified: with `--include-partial-messages`, real per-token deltas arrived in 2-3 giant bursts within ~20ms regardless of actual generation time. Fixed by spawning `claude` with a real PTY (`pty.openpty()`) as its stdout instead of a plain pipe, which forces line buffering like an interactive terminal. Verified live: a 300-word story streamed as 21 separate content chunks over ~19s (avg gap 0.56s between chunks), matching real generation pacing, not one chunk at the end. Falls back to the previous buffered-then-emit behavior (SSE framing still correct, just not real-time) whenever tools are requested, `n > 1`, or `response_format: json_schema` is set -- see "Real streaming" section below for why those combinations aren't safe to stream live. |
-| Tool calling (`tools`/`tool_calls`) | ⚠️ | Works via real Anthropic `tool_use` blocks, but only ~40% reliably per call before the bounded retry (see below); with retry, effectively reliable in practice (10/10 in the latest live regression run). |
+| Tool calling (`tools`/`tool_calls`) | ✅ | Registered as real MCP tool schemas via `--mcp-config` (see "Native MCP tool registration" below) -- verified live to reach **100% turn-1 dispatch reliability** (5/5 through the actual shim, repeatable), vs ~40% for the earlier prose-description approach. Falls back to the prose path (bounded retry, ~40% single-shot) only for tool names that can't satisfy MCP's naming constraint. |
 | `tool_choice: "none"` | ✅ | Routed through the same full lockdown path as "no tools requested" (built-ins + MCP servers both blocked, see below) -- no tool description is even added to the system prompt. |
-| `tool_choice: "required"` / forcing a specific function | ❌ | Accepted but not enforced -- no equivalent mechanism exists in the Claude Code harness (no raw Anthropic `tool_choice` parameter is exposed through the CLI). |
+| `tool_choice: "required"` / forcing a specific function | ❌ | Accepted but not enforced -- no equivalent mechanism exists in the Claude Code harness (no raw Anthropic `tool_choice` parameter is exposed through the CLI, and forcing it via a raw `tool_choice: {"type":"any"}` call was investigated and found not to compose safely with a possibly-empty tool set -- see "Native MCP tool registration" below). |
 | `max_tokens` / `max_completion_tokens` | ✅ | Mapped to the `CLAUDE_CODE_MAX_OUTPUT_TOKENS` env var (real, documented Claude Code setting), scoped per-subprocess-call. Verified: a low cap correctly triggers `finish_reason: "length"`. |
 | `stop` (stop sequences) | ✅ | Claude Code has no native stop-sequence flag, so this is implemented as **real early termination**, not just post-hoc truncation: with `--include-partial-messages` (enabled whenever `stop` is set and/or real streaming is active), the shim reads real token-level `content_block_delta` events and kills the `claude` subprocess (`proc.terminate()`) the instant a stop sequence appears in the accumulated text -- before the rest of the response is generated or billed. Verified live: a 500-word-story prompt took 22.3s with no stop sequence vs 4.9s with one that matched early in the output (~4.5x faster, plus the unbilled remainder of the response), and 5.2s when combined with real streaming. A message-level check remains as a safety net for edge cases (e.g. the overall timeout firing first). One accepted tradeoff: when the match spans across two token-level deltas, the client may have already received a few extra characters in the delta that completes the match, before the shim could detect it -- the FINAL recorded/session-cached text is still correctly truncated either way, only the live SSE stream itself briefly shows a few extra characters in that edge case. |
 | `n` (multiple choices) | ⚠️ | Implemented up to a bounded limit (`MAX_N_CHOICES`, currently 5) -- each choice is a fully independent fresh Claude Code subprocess call (no session caching across choices, by design: parallel-choice semantics don't fit single-session continuity). Requests above the limit get a proper `400 invalid_request_error`, not silent truncation. |
@@ -44,11 +44,13 @@ implemented / silently ignored.
 **Bottom line:** model selection, session caching, error translation,
 `max_tokens`, `response_format`, `tool_choice: "none"`, bounded `n`, the
 MCP tool leakage, the CWD file-exposure issue, real token-level
-streaming, and now a real `/v1/models` list are all implemented and
-live-verified. The one remaining genuine gap is raw sampling parameters
-(`temperature`/`top_p`/etc), which Claude Code doesn't expose anywhere in
-its CLI -- these are accepted with a one-time stderr warning rather than
-hard-erroring or silently doing nothing without telling anyone.
+streaming, a real `/v1/models` list, and now reliable (100% verified
+turn-1) tool-call dispatch via native MCP registration are all
+implemented and live-verified. The one remaining genuine gap is raw
+sampling parameters (`temperature`/`top_p`/etc), which Claude Code
+doesn't expose anywhere in its CLI -- these are accepted with a
+one-time stderr warning rather than hard-erroring or silently doing
+nothing without telling anyone.
 
 ## `/v1/models`: querying the real list
 
@@ -127,6 +129,109 @@ actual source repository). It was used strictly read-only, to confirm
 or falsify conclusions already reached by black-box CLI probing -- no
 code from that reconstruction was copied into this shim.
 
+## Native MCP tool registration: the real fix for tool-call reliability
+
+The single biggest reliability gap this shim had was tool-call
+dispatch: `-p`/`--print` mode has no flag to pass arbitrary JSON-schema
+tool definitions directly to the underlying Anthropic API, so the
+original approach described custom tools in prose inside the system
+prompt (see `render_tools_into_system_prompt`, still kept as a
+fallback). That got real `tool_use` blocks, but only ~40% reliably per
+call -- the model would frequently narrate a plan instead of actually
+dispatching the tool, requiring a bounded retry loop to paper over it.
+
+**The fix, verified live (2026-08-14):** Claude Code's MCP integration
+*is* a fully supported, documented `-p`-mode capability (`--mcp-config`,
+`--strict-mcp-config`, `--allowedTools`), and MCP tool schemas
+registered this way ARE passed through to the real Anthropic API as
+genuine, JSON-schema-validated `tools` entries -- exactly the same
+mechanism a first-class built-in tool uses. By default, MCP tools go
+through Claude Code's internal "ToolSearch" deferred-loading (the model
+has to search for the tool by name in one turn, then dispatch it in a
+second), but setting `_meta: {"anthropic/alwaysLoad": true}` on a tool
+definition skips that indirection entirely and puts the full schema in
+the initial prompt turn, just like a built-in.
+
+This shim now builds a small MCP tool manifest from the OpenAI-shaped
+`tools` array on every request (`build_mcp_tool_config` in
+`shim.py`), each tool marked `alwaysLoad: true`, and points
+`--mcp-config` at a bundled stdio server (`mcp_tool_server.py`) that
+serves that manifest and executes nothing itself -- `tools/call`
+requests never actually reach it in practice, because the shim
+terminates the `claude` subprocess the instant it observes the
+`tool_use` content block on the wire (the same "kill fast" pattern
+already used for stop-sequence early termination), so the real
+dispatch/execution stays entirely on the OpenAI-client side, matching
+how `tool_calls` is supposed to work in the OpenAI API shape. Verified
+live: the manifest server's own `tools/call` handler never fires even
+once across repeated trials, confirmed by instrumenting it to log
+every call it receives.
+
+**Transport is stdio, not HTTP/SSE, deliberately** -- this must never
+bind a TCP port (no port-clash risk, nothing exposed on any network
+interface, ever). The MCP server is a plain child process of `claude`,
+wired via stdio pipes only, same as Claude Code's other local MCP
+integrations.
+
+**Reliability, verified live:** 8/8 turn-1 dispatch in an initial raw
+CLI probe, 5/5 in a repeat, then 5/5 again through the actual running
+shim end-to-end (`curl` against `/v1/chat/completions`), each returning
+a correct OpenAI-shaped `tool_calls` entry with the right function name
+and arguments. Correctly does NOT force a tool call on an unrelated
+question, and correctly picks the right tool among multiple registered
+tools (verified with a two-tool manifest: "what's the weather" vs
+"what's the time" each dispatched the correct one).
+
+**Prompt caching stays intact for a stable tool set.** The manifest is
+written to a per-request temp file, but the *MCP server command itself*
+(the script path + interpreter) stays byte-identical across calls --
+only the manifest file path differs if the tool set changes. Anthropic
+prices tool schemas as part of the cacheable system context, and this
+was verified directly: a 5-turn `--resume`'d conversation with a stable
+tool set showed `cache_creation_input_tokens` flat at ~110-140 tokens
+per turn after the first (vs ~15,800 on the first turn), with
+`cache_read_input_tokens` climbing normally -- the existing session
+caching mechanism (`--session-id`/`--resume`, see above) already
+handles this correctly with no extra work needed. Conversely, changing
+the tool set mid-session (an OpenAI client declaring different tools
+between turns while somehow still trying to resume the same session)
+was verified to bust the cache from that point forward exactly like
+Anthropic's own docs describe for any system-prompt change --
+`cache_creation_input_tokens` jumped straight back to ~16,000, a full
+fresh write. This is expected, correct behavior, not a shim bug: a
+changed tool schema genuinely is a changed system context from
+Anthropic's point of view, regardless of what produced the change.
+
+**Compatible with callers who have their own real MCP servers.** The
+OpenAI chat-completions `tools` array has no concept of "MCP server"
+at all -- whatever produced a caller's declared tools (their own MCP
+servers, hardcoded definitions, anything else) is already fully
+resolved into flat OpenAI function schemas by the time a request
+reaches this shim. This shim's own MCP server is a pure internal
+implementation detail on the Claude-Code-facing side of that boundary;
+callers never see "MCP" anywhere in the round trip, exactly as with the
+earlier prose-based approach.
+
+**Falls back to the prose-description path automatically** for any
+tool whose name can't satisfy MCP's `^[a-zA-Z0-9_-]{1,64}$` naming
+constraint (checked in `build_mcp_tool_manifest`) -- this should be
+rare in practice since OpenAI's own `function.name` field already
+requires the same pattern, but is handled defensively rather than
+silently dropping a tool a caller asked for.
+
+**Not pursued: raw direct API calls with the CLI's OAuth token.**
+Before landing on MCP registration, forging a direct
+`https://api.anthropic.com/v1/messages` request using Claude Code's own
+OAuth credentials (readable from `~/.claude/.credentials.json`) plus
+the `oauth-2025-04-20` beta header was investigated and verified to
+also reach 100% reliable tool dispatch (10/10) with full raw
+`tool_choice` support -- but this was explicitly rejected: it means
+building HTTP requests that impersonate the `claude` binary's own
+internal auth flow to bypass `-p` mode entirely, which is a
+categorically different (and clearly out-of-bounds) approach compared
+to registering a real, documented MCP server and letting Claude Code's
+own request-building logic do the work.
+
 ## Real streaming: the PTY trick
 
 `claude`'s own stdout is fully buffered (not line-buffered) whenever its
@@ -154,18 +259,22 @@ onto a single token stream either. Every other combination keeps using
 the previous buffered-then-emit SSE behavior (protocol-correct, just not
 real-time).
 
-## Current approach: native `tool_use` + bounded retry
+## Current approach: native MCP tool registration + bounded retry fallback
 
 `claudecode_as_openai/shim.py` calls `claude -p --output-format
 stream-json` and parses the real Anthropic `tool_use` content blocks from
 the NDJSON stream (not a hand-rolled text convention). Custom tools are
-described in the system prompt; Claude's own built-in tools (Bash, Read,
-Edit, etc.) are blocked via `--disallowedTools <enumerated list>` so they
-don't compete for dispatch.
+registered as a real MCP tool server via `--mcp-config` (see "Native MCP
+tool registration" above) -- verified live to reach 100% turn-1 dispatch
+reliability. Claude's own built-in tools (Bash, Read, Edit, etc.) are
+blocked via `--disallowedTools <enumerated list>` so they don't compete
+for dispatch, whichever tool-registration path is in use.
 
-**Known limitation:** this gets real `tool_use` blocks, but only ~40%
-reliably per single call (Claude sometimes narrates "let me check..."
-instead of dispatching — matches the failure mode in
+**Legacy fallback path (prose description in the system prompt):** used
+only when a tool name can't satisfy MCP's naming constraint (see
+`build_mcp_tool_manifest`). This path only gets real `tool_use` blocks
+~40% reliably per single call (Claude sometimes narrates "let me
+check..." instead of dispatching — matches the failure mode in
 [cline/cline#10336](https://github.com/cline/cline/issues/10336), a
 community workaround for an unrelated bug in Cline's *own* agentic XML
 tool vocabulary colliding with Claude Code's native tools; it does not
@@ -174,7 +283,9 @@ retry with exponential backoff (`call_claude_with_tool_retry`, up to 4
 retries / 5 total attempts, 2s base / 15s cap) when tools were requested
 but no `tool_use` came back. Verified 15/15 in manual testing with retries
 vs 6/15 without -- but this is *probabilistic*, not deterministic:
-expected success asymptotically approaches but never reaches 100%.
+expected success asymptotically approaches but never reaches 100%. The
+same retry wrapper still wraps the MCP path too, as a safety net, but in
+practice shouldn't need more than its first attempt.
 
 ## Investigated and ruled out: a deterministic fix (2026-08-12)
 
@@ -217,6 +328,20 @@ knob. The retry wrapper in this shim is the standard approach here, not a
 stopgap. See the (intentionally kept, unmerged) `explore/text-tool-parser`
 branch for the investigation trail and the ruled-out text-parser
 alternative.
+
+**Update (2026-08-14): superseded for the common case by native MCP
+registration** (see "Native MCP tool registration" above). The
+conclusion above still holds for `tool_choice: "required"`-style forcing
+(genuinely not exposed anywhere in the CLI/SDK harness), but the
+separate "narrates instead of dispatching" problem this retry loop was
+built for turned out to have a real fix after all -- not via a
+`tool_choice` knob, but by using MCP tool registration (a different,
+fully supported Claude Code capability) to get the model to treat
+custom tools as first-class, schema-backed tools instead of prose it
+has to be talked into trusting. The retry loop remains in place as a
+safety net for the legacy prose-fallback path and for any future
+regression, but in practice shouldn't be needed once a tool set is
+representable as a valid MCP manifest.
 
 ## Tests
 

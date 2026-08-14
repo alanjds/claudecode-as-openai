@@ -213,6 +213,118 @@ class TestBuildClaudeCmd(unittest.TestCase):
             idx = cmd.index("--setting-sources")
             self.assertEqual(cmd[idx + 1], "")
 
+    def test_mcp_tool_config_overrides_tools_requested_path(self):
+        """When mcp_tool_config is given, the command uses --strict-mcp-config
+        + --allowedTools scoped to the manifest server (not the bare
+        --disallowedTools-only path used for the prose-fallback case), and
+        --disallowedTools is still present to keep built-ins blocked."""
+        tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}]
+        mcp_tool_config = shim.build_mcp_tool_config(tools)
+        self.addCleanup(os.unlink, mcp_tool_config["manifest_path"])
+        cmd = shim._build_claude_cmd(
+            "sonnet", "fresh", "sid", tools_requested=True, max_turns=2, json_schema=None,
+            mcp_tool_config=mcp_tool_config,
+        )
+        self.assertIn("--disallowedTools", cmd)
+        self.assertIn("--strict-mcp-config", cmd)
+        self.assertIn("--allowedTools", cmd)
+        allowed_idx = cmd.index("--allowedTools")
+        self.assertEqual(cmd[allowed_idx + 1], "mcp__shim_tools__get_weather")
+        mcp_config_idx = cmd.index("--mcp-config")
+        mcp_config = json.loads(cmd[mcp_config_idx + 1])
+        self.assertIn("shim_tools", mcp_config["mcpServers"])
+
+
+class TestMcpToolConfig(unittest.TestCase):
+    """The native MCP tool registration path -- the real fix for the ~40%
+    single-shot tool-call reliability problem (verified live 2026-08-14:
+    8/8, then 5/5, then 5/5-through-the-real-shim turn-1 dispatch, vs
+    ~40% for the prose-description fallback)."""
+
+    def test_manifest_translates_openai_tools_shape(self):
+        tools = [{"type": "function", "function": {
+            "name": "get_weather", "description": "get weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+        }}]
+        manifest = shim.build_mcp_tool_manifest(tools)
+        self.assertEqual(manifest, [{
+            "name": "get_weather",
+            "description": "get weather",
+            "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+        }])
+
+    def test_manifest_defaults_missing_description_and_parameters(self):
+        tools = [{"type": "function", "function": {"name": "ping"}}]
+        manifest = shim.build_mcp_tool_manifest(tools)
+        self.assertEqual(manifest[0]["description"], "")
+        self.assertEqual(manifest[0]["inputSchema"], {"type": "object", "properties": {}})
+
+    def test_manifest_returns_none_for_empty_tools(self):
+        self.assertIsNone(shim.build_mcp_tool_manifest([]))
+        self.assertIsNone(shim.build_mcp_tool_manifest(None))
+
+    def test_manifest_returns_none_for_invalid_tool_name(self):
+        """A tool name that can't satisfy MCP's ^[a-zA-Z0-9_-]{1,64}$
+        constraint (e.g. containing a space) must fall back to the prose
+        path -- returning None here is what signals the caller to use
+        render_tools_into_system_prompt() instead."""
+        tools = [{"type": "function", "function": {"name": "get weather", "parameters": {}}}]
+        self.assertIsNone(shim.build_mcp_tool_manifest(tools))
+
+    def test_config_writes_manifest_file_and_builds_mcp_config(self):
+        tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}]
+        cfg = shim.build_mcp_tool_config(tools)
+        self.addCleanup(os.unlink, cfg["manifest_path"])
+        self.assertTrue(os.path.exists(cfg["manifest_path"]))
+        with open(cfg["manifest_path"]) as f:
+            written = json.load(f)
+        self.assertEqual(written, [{"name": "get_weather", "description": "", "inputSchema": {"type": "object", "properties": {}}}])
+        self.assertEqual(cfg["allowed_tools"], ["mcp__shim_tools__get_weather"])
+        server = cfg["mcp_config"]["mcpServers"]["shim_tools"]
+        self.assertEqual(server["args"][-1], cfg["manifest_path"])
+
+    def test_config_returns_none_when_manifest_build_fails(self):
+        tools = [{"type": "function", "function": {"name": "bad name", "parameters": {}}}]
+        self.assertIsNone(shim.build_mcp_tool_config(tools))
+
+    def test_mcp_server_command_is_stdio_not_tcp(self):
+        """Explicit requirement: this must never bind a TCP port. The
+        mcpServers entry only ever specifies a "command"/"args" pair (a
+        child process wired via stdio), never a "url"/"port"/transport
+        field of any kind."""
+        tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}]
+        cfg = shim.build_mcp_tool_config(tools)
+        self.addCleanup(os.unlink, cfg["manifest_path"])
+        server = cfg["mcp_config"]["mcpServers"]["shim_tools"]
+        self.assertIn("command", server)
+        self.assertIn("args", server)
+        self.assertNotIn("url", server)
+        self.assertNotIn("port", server)
+
+    def test_manifest_path_is_only_thing_that_varies_across_calls(self):
+        """Same tool set built twice produces the identical mcp_config
+        SERVER COMMAND (just a different manifest file path) -- this is
+        what keeps Anthropic's prompt cache viable across a resumed
+        session for a stable tool set (verified live: cache_creation
+        stays flat across --resume'd turns, only busting when the actual
+        tool set changes -- see README "MCP native tool registration")."""
+        tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}]
+        cfg1 = shim.build_mcp_tool_config(tools)
+        cfg2 = shim.build_mcp_tool_config(tools)
+        self.addCleanup(os.unlink, cfg1["manifest_path"])
+        self.addCleanup(os.unlink, cfg2["manifest_path"])
+        server1 = cfg1["mcp_config"]["mcpServers"]["shim_tools"]
+        server2 = cfg2["mcp_config"]["mcpServers"]["shim_tools"]
+        self.assertEqual(server1["command"], server2["command"])
+        self.assertEqual(server1["args"][0], server2["args"][0])  # server script path
+        self.assertNotEqual(server1["args"][1], server2["args"][1])  # manifest path differs
+
+    def test_strip_mcp_tool_prefix(self):
+        self.assertEqual(shim.strip_mcp_tool_prefix("mcp__shim_tools__get_weather"), "get_weather")
+        self.assertEqual(shim.strip_mcp_tool_prefix("get_weather"), "get_weather")
+        self.assertEqual(shim.strip_mcp_tool_prefix(""), "")
+        self.assertIsNone(shim.strip_mcp_tool_prefix(None))
+
 
 class TestCallClaudeStreaming(unittest.TestCase):
     def _run(self, fake_proc, **kwargs):

@@ -81,3 +81,26 @@ _Unreleased_
   `ANTHROPIC_API_KEY` and never reads OAuth/keychain (verified live:
   fails with "Not logged in" under OAuth-only auth), which would break
   this shim's entire subscription-based premise.
+* **Tool-call reliability fix: native MCP tool registration.** Custom
+  tools declared in a request's `tools` array are now registered as a
+  real MCP tool server (`claudecode_as_openai/mcp_tool_server.py`, a
+  stdio-only child process, never a TCP listener) via `--mcp-config`,
+  with each tool marked `_meta: {"anthropic/alwaysLoad": true}` to skip
+  Claude Code's ToolSearch deferred-loading and get the full JSON
+  schema into the initial prompt turn. This replaces the old
+  prose-description-in-the-system-prompt approach for any tool whose
+  name satisfies MCP's `^[a-zA-Z0-9_-]{1,64}$` naming pattern (the
+  prose path remains as an automatic fallback for names that don't).
+  Verified live through the actual running shim: 5/5 repeatable turn-1
+  tool dispatches with correct OpenAI-shaped `tool_calls` output
+  (previously ~40% single-shot reliability with the prose approach).
+  Session/prompt caching verified to stay intact for a stable tool set
+  across `--resume`'d turns (`cache_creation_input_tokens` flat at
+  ~110-140 tokens after the first turn, vs ~15,800 on the first);
+  changing the tool set mid-session correctly busts the cache, same as
+  any other system-context change would. Also investigated and
+  explicitly rejected: forging direct
+  `https://api.anthropic.com/v1/messages` calls with the CLI's own
+  OAuth token (100% reliable but bypasses `-p` mode entirely, ruled
+  out as out-of-bounds for this project). See README.md's "Native MCP
+  tool registration" section for the full writeup.
