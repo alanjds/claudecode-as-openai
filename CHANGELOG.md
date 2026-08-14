@@ -48,3 +48,17 @@ _Unreleased_
   events and kills the subprocess the instant a stop sequence appears,
   cutting both latency and cost on early stops (verified ~4.5x faster on
   a long-generation test case).
+* Real token-level streaming for `stream: true`: fixed by spawning
+  `claude` with a real PTY (`pty.openpty()`) instead of a plain pipe --
+  Claude Code's own stdout is fully buffered (not line-buffered) without
+  a terminal attached, which previously meant `--include-partial-messages`
+  events arrived in 2-3 giant bursts regardless of actual generation time.
+  Verified live: a 300-word story now streams as 21 separate chunks over
+  ~19s instead of one chunk at the end. Only active for the safe case
+  (single choice, no tools requested, no `response_format: json_schema`);
+  every other combination keeps the previous buffered-then-emit behavior.
+* One-time-per-parameter-name stderr warning for sampling parameters that
+  have no Claude Code equivalent (`temperature`, `top_p`, `seed`,
+  `logprobs`, `top_logprobs`, `presence_penalty`, `frequency_penalty`,
+  `logit_bias`) -- accepted, not enforced, never hard-errored (since real
+  clients routinely send explicit defaults that carry no signal of intent).

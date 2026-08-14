@@ -56,6 +56,8 @@ Point Hermes at it:
 import hashlib
 import json
 import os
+import pty
+import select
 import subprocess
 import sys
 import tempfile
@@ -362,6 +364,63 @@ def _iter_ndjson_lines(proc):
             continue
 
 
+def _iter_ndjson_lines_pty(master_fd, proc, timeout_s):
+    """Same contract as _iter_ndjson_lines, but reads from a PTY master fd
+    instead of a plain subprocess.PIPE.
+
+    Why this exists: `claude`'s own stdout is FULLY BUFFERED (not just
+    line-buffered) when its stdout is a plain pipe with no TTY attached --
+    verified live: with --include-partial-messages, real per-token
+    content_block_delta events all arrive in 2-3 giant bursts within the
+    same ~20ms window regardless of the actual generation taking many
+    seconds, because glibc's stdio only flushes on a full buffer or
+    process exit when stdout isn't a terminal. Attaching a real PTY as
+    `claude`'s stdout makes it use LINE buffering like an interactive
+    terminal session -- verified live: the same request then delivers
+    dozens of individual deltas spread realistically across the full
+    generation time (e.g. 21 deltas over ~22s of a 300-word story,
+    roughly one every 0.5-0.7s, matching genuine token-generation pacing).
+    This is the only way to get real client-facing streaming out of this
+    CLI; there is no flag to force unbuffered/line-buffered stdout."""
+    deadline = time.time() + timeout_s
+    buf = b""
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return
+        try:
+            ready, _, _ = select.select([master_fd], [], [], min(remaining, 1.0))
+        except (OSError, ValueError):
+            return
+        if not ready:
+            if proc.poll() is not None:
+                # Process exited and nothing left to read.
+                try:
+                    ready2, _, _ = select.select([master_fd], [], [], 0)
+                except (OSError, ValueError):
+                    ready2 = []
+                if not ready2:
+                    return
+            continue
+        try:
+            chunk = os.read(master_fd, 65536)
+        except OSError:
+            # EIO is the normal "slave side closed" signal on Linux PTYs.
+            return
+        if not chunk:
+            return
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+
 def _build_claude_cmd(model, session_mode, session_id, tools_requested, max_turns, json_schema, want_partial_messages=False):
     cmd = [CLAUDE_BIN]
     if tools_requested:
@@ -376,16 +435,19 @@ def _build_claude_cmd(model, session_mode, session_id, tools_requested, max_turn
         cmd += ["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
     cmd += ["--output-format", "stream-json", "--verbose", "--max-turns", str(max_turns)]
     if want_partial_messages:
-        # Only requested when a `stop` sequence is set. This adds
-        # token-level "stream_event"/"content_block_delta" lines
+        # Requested when a `stop` sequence is set (for early termination)
+        # and/or when real token-level client streaming is active. This
+        # adds token-level "stream_event"/"content_block_delta" lines
         # interleaved with the existing full "assistant" message chunks
         # (verified live: the "assistant" chunks stay complete/final,
         # identical to without this flag -- it only ADDS extra lines, it
         # doesn't change existing parsing). Needed because Claude Code's
         # default stream-json granularity is per-MESSAGE, not per-token:
         # without this flag, a stop sequence can only be detected after an
-        # entire text block has already been fully generated and billed,
-        # which defeats the purpose of an *early* stop.
+        # entire text block has already been fully generated and billed
+        # (defeating the purpose of an early stop), and a client asking
+        # for `stream: true` would get one giant content delta instead of
+        # a real typing effect.
         cmd += ["--include-partial-messages"]
     if session_mode == "resume":
         cmd += ["--resume", session_id]
@@ -408,6 +470,7 @@ def call_claude_streaming(
     tools_requested=False,
     json_schema=None,
     stop=None,
+    stream_callback=None,
 ):
     """Spawn `claude -p` in native stream-json mode, feed the message array
     on stdin, and return as soon as a usable assistant message (text and/or
@@ -423,6 +486,16 @@ def call_claude_streaming(
     (and waiting on) the rest of a response nobody asked for. This is a
     real latency/cost win over truncating client-side only after the full
     response completes, which is what an earlier version of this shim did.
+
+    `stream_callback`, if given, is called with each real token-level text
+    chunk (str) as it arrives via --include-partial-messages
+    content_block_delta events -- this is what delivers genuine real-time
+    streaming to an OpenAI client instead of one giant chunk after full
+    generation. Only wired up by the caller for the single-choice,
+    no-tools-requested, no-json_schema path (see _handle_chat_completion):
+    with tool retry in play, an earlier failed attempt's narration text
+    would otherwise get streamed to the client before the shim knows that
+    attempt needs to be discarded and retried.
 
     Returns a dict: {"text", "tool_calls", "usage", "finish_reason",
     "structured_json"}. Raises ClaudeCliError for conditions that should
@@ -449,7 +522,7 @@ def call_claude_streaming(
     max_turns = 3 if json_schema is not None else 1
     cmd = _build_claude_cmd(
         model, session_mode, session_id, tools_requested, max_turns, json_schema,
-        want_partial_messages=bool(stop_sequences),
+        want_partial_messages=bool(stop_sequences) or stream_callback is not None,
     )
     if system_prompt:
         if len(system_prompt) > 4000:
@@ -461,15 +534,32 @@ def call_claude_streaming(
             cmd += ["--system-prompt", system_prompt]
 
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            cwd=_CLAUDE_CWD,
-        )
+        use_pty = stream_callback is not None
+        pty_master_fd = None
+        if use_pty:
+            # See _iter_ndjson_lines_pty docstring: a plain pipe leaves
+            # `claude`'s stdout fully buffered (bursty, not real-time), so
+            # real client-facing streaming needs a PTY attached as stdout
+            # to force line buffering.
+            pty_master_fd, pty_slave_fd = pty.openpty()
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=pty_slave_fd,
+                stderr=subprocess.PIPE,
+                cwd=_CLAUDE_CWD,
+            )
+            os.close(pty_slave_fd)
+        else:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                cwd=_CLAUDE_CWD,
+            )
     except FileNotFoundError:
         if system_prompt_file:
             try:
@@ -484,7 +574,10 @@ def call_claude_streaming(
         )
 
     try:
-        proc.stdin.write(json.dumps(claude_messages))
+        if use_pty:
+            proc.stdin.write(json.dumps(claude_messages).encode())
+        else:
+            proc.stdin.write(json.dumps(claude_messages))
         proc.stdin.close()
 
         text_parts = []
@@ -496,42 +589,61 @@ def call_claude_streaming(
         streaming_partial_text = ""
         deadline = time.time() + CLAUDE_TIMEOUT_S
 
-        for chunk in _iter_ndjson_lines(proc):
+        chunk_source = (
+            _iter_ndjson_lines_pty(pty_master_fd, proc, CLAUDE_TIMEOUT_S)
+            if use_pty else _iter_ndjson_lines(proc)
+        )
+        for chunk in chunk_source:
             if time.time() > deadline:
                 break
             ctype = chunk.get("type")
 
-            if ctype == "stream_event" and stop_sequences:
+            if ctype == "stream_event" and (stop_sequences or stream_callback):
                 # Only present when --include-partial-messages was passed
-                # (see _build_claude_cmd), which only happens when a `stop`
-                # sequence was actually requested. Real token-level deltas
-                # -- verified live these interleave with, and arrive BEFORE,
-                # the full "assistant" chunk for the same content block:
-                # content_block_start -> content_block_delta(s) -> the full
-                # "assistant" chunk -> content_block_stop -> next
-                # content_block_start. That ordering is what makes
-                # resetting the per-block accumulator on
-                # content_block_start safe: the prior block's text has
-                # already been folded into text_parts by its "assistant"
-                # chunk before the next block starts.
+                # (see _build_claude_cmd), which happens when a `stop`
+                # sequence is set and/or a stream_callback was provided.
+                # Real token-level deltas -- verified live these interleave
+                # with, and arrive BEFORE, the full "assistant" chunk for
+                # the same content block: content_block_start ->
+                # content_block_delta(s) -> the full "assistant" chunk ->
+                # content_block_stop -> next content_block_start. That
+                # ordering is what makes resetting the per-block
+                # accumulator on content_block_start safe: the prior
+                # block's text has already been folded into text_parts by
+                # its "assistant" chunk before the next block starts.
                 #
                 # This is the actual fix for a real stop sequence only
                 # being detectable after an entire text block finished
                 # generating (and got billed): now a match can be caught
-                # mid-block, at real token granularity.
+                # mid-block, at real token granularity. It's also what
+                # delivers real client-facing streaming when
+                # stream_callback is set: each text_delta is forwarded to
+                # the caller immediately, as it's generated, instead of
+                # being held until the whole response completes.
                 event = chunk.get("event", {})
                 etype = event.get("type")
                 if etype == "content_block_delta":
                     delta = event.get("delta", {})
                     if delta.get("type") == "text_delta" and delta.get("text"):
-                        streaming_partial_text += delta["text"]
-                        combined = "".join(text_parts) + streaming_partial_text
-                        matched_text, matched = _apply_stop_sequences(combined, stop_sequences)
-                        if matched:
-                            text_parts = [matched_text]
-                            stop_matched = True
-                            finish_reason = "stop"
-                            break
+                        new_text = delta["text"]
+                        streaming_partial_text += new_text
+                        if stop_sequences:
+                            combined = "".join(text_parts) + streaming_partial_text
+                            matched_text, matched = _apply_stop_sequences(combined, stop_sequences)
+                            if matched:
+                                # Truncate what we forward to the client too
+                                # -- stream only the portion up to the stop
+                                # match, never the text past it.
+                                already_streamed_len = len(combined) - len(new_text)
+                                visible_new_text = matched_text[already_streamed_len:]
+                                if stream_callback and visible_new_text:
+                                    stream_callback(visible_new_text)
+                                text_parts = [matched_text]
+                                stop_matched = True
+                                finish_reason = "stop"
+                                break
+                        if stream_callback:
+                            stream_callback(new_text)
                 elif etype == "content_block_start":
                     streaming_partial_text = ""
                 continue
@@ -657,6 +769,11 @@ def call_claude_streaming(
                 proc.kill()
             except Exception:
                 pass
+        if use_pty and pty_master_fd is not None:
+            try:
+                os.close(pty_master_fd)
+            except OSError:
+                pass
         if system_prompt_file:
             try:
                 os.unlink(system_prompt_file)
@@ -701,6 +818,7 @@ def call_claude_with_tool_retry(
     session_mode,
     session_id,
     stop=None,
+    stream_callback=None,
 ):
     """Wraps call_claude_streaming with bounded retries for the documented
     tool-dispatch flakiness. The FIRST attempt uses whatever session mode
@@ -713,16 +831,26 @@ def call_claude_with_tool_retry(
     "already in use" CLI error, and resuming with more delta messages would
     duplicate entries in that session's persisted transcript. Returns
     (result_dict, final_session_mode, final_session_id) so the caller knows
-    which session to record for the next external turn."""
+    which session to record for the next external turn.
+
+    `stream_callback`, if given, should only ever be passed by the caller
+    when tools_requested is False -- with tools in play, a failed
+    attempt's narration text must NOT reach the client before the shim
+    knows to discard it and retry (see call_claude_streaming's own
+    docstring). Enforced here defensively too: the callback is only ever
+    forwarded to call_claude_streaming when tools_requested is False,
+    regardless of what the caller passed in."""
     result = None
     cur_mode, cur_id, cur_messages = session_mode, session_id, delta_claude_messages
     total_attempts = 1 + TOOL_CALL_MAX_RETRIES
     for attempt in range(total_attempts):
+        cb = stream_callback if not tools_requested else None
         result = call_claude_streaming(
             cur_messages, system_prompt, model,
             session_mode=cur_mode, session_id=cur_id,
             tools_requested=tools_requested,
             stop=stop,
+            stream_callback=cb,
         )
         if result["tool_calls"] or not tools_requested:
             return result, cur_mode, cur_id
@@ -730,6 +858,47 @@ def call_claude_with_tool_retry(
             time.sleep(_backoff_delay_s(attempt))
             cur_mode, cur_id, cur_messages = "fresh", str(uuid.uuid4()), full_claude_messages
     return result, cur_mode, cur_id
+
+
+# Sampling/formatting parameters that have NO equivalent anywhere in the
+# Claude Code CLI (checked `claude --help` and the official env-vars
+# docs, 2026-08-13): no flag, no env var, nothing. The closest available
+# knob is `--effort <low|medium|high|max>`, which controls REASONING
+# EFFORT (how much internal deliberation the model does), a genuinely
+# different axis from output randomness/diversity -- not a substitute for
+# temperature or top_p, so it is intentionally NOT auto-mapped here.
+#
+# These are silently accepted (never hard-errored) because real OpenAI
+# clients routinely send explicit defaults on every request (e.g.
+# `temperature: 1.0`, which IS the OpenAI default and carries no signal
+# that the caller actually wants non-default sampling behavior) -- hard
+# erroring on presence-of-key rather than meaningfully-different-value
+# would break compatibility with a huge fraction of well-behaved clients
+# for zero practical benefit. A stderr warning (not a client-visible
+# error) is emitted once per parameter name observed, so operators running
+# this shim can tell that a request asked for something it can't honor,
+# without breaking the request.
+_UNSUPPORTED_SAMPLING_PARAMS = (
+    "temperature", "top_p", "seed", "logprobs", "top_logprobs",
+    "presence_penalty", "frequency_penalty", "logit_bias",
+)
+_warned_sampling_params = set()
+
+
+def _warn_unsupported_sampling_params(payload):
+    """Emit a one-time-per-parameter-name stderr warning when a request
+    includes a sampling parameter Claude Code has no way to honor. Does
+    NOT reject the request -- see the module-level comment above
+    _UNSUPPORTED_SAMPLING_PARAMS for why a hard error would be wrong
+    here."""
+    for name in _UNSUPPORTED_SAMPLING_PARAMS:
+        if name in payload and payload[name] is not None and name not in _warned_sampling_params:
+            _warned_sampling_params.add(name)
+            sys.stderr.write(
+                f"claudecode-as-openai: warning: '{name}' was requested but Claude "
+                f"Code has no equivalent (no CLI flag, no env var) -- ignored, not "
+                f"applied. See README \"Capability audit\".\n"
+            )
 
 
 def _apply_stop_sequences(text, stop):
@@ -839,6 +1008,23 @@ class Handler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 pass
 
+        _warn_unsupported_sampling_params(payload)
+
+        # Real token-level streaming is only safe for the single-choice,
+        # no-tools-requested, no-json_schema path: with tool retry in
+        # play, a failed attempt's narration text must not reach the
+        # client before the shim knows to discard it and retry, and
+        # --json-schema's multi-turn corrective mechanism doesn't map
+        # cleanly onto a single token stream either. Every other
+        # combination falls back to the existing buffered-then-emit
+        # behavior (SSE framing is still correct, just not real-time).
+        can_stream_live = stream and n == 1 and not effective_tools and json_schema is None
+        if can_stream_live:
+            self._handle_streaming_completion(
+                messages, model, system_prompt, max_tokens, env_overrides, stop,
+            )
+            return
+
         choices = []
         usage_totals = {
             "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
@@ -926,6 +1112,92 @@ class Handler(BaseHTTPRequestHandler):
             "usage": usage_totals,
         }
         self._send_json(response)
+
+    def _handle_streaming_completion(self, messages, model, system_prompt, max_tokens, env_overrides, stop):
+        """Real token-level SSE streaming for the safe case (single choice,
+        no tools requested, no json_schema -- see the can_stream_live
+        gate in _handle_chat_completion). Sends SSE headers immediately,
+        then forwards each real text_delta from
+        call_claude_streaming(stream_callback=...) to the client as it
+        arrives, instead of buffering the full response first. Falls back
+        to the same session-caching/resume logic as the buffered path."""
+        session_mode, session_id, delta_messages, conv_key = resolve_session(messages)
+        delta_claude_messages = build_claude_messages(delta_messages)
+
+        chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+
+        role_sent = False
+
+        def emit(delta, finish=None):
+            chunk = {
+                "id": chat_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            }
+            try:
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def on_text_delta(text_piece):
+            nonlocal role_sent
+            if not role_sent:
+                emit({"role": "assistant", "content": text_piece})
+                role_sent = True
+            else:
+                emit({"content": text_piece})
+
+        original_popen = subprocess.Popen
+        if env_overrides:
+            def scoped_popen(*args, **kwargs):
+                env = dict(os.environ)
+                env.update(env_overrides)
+                kwargs["env"] = env
+                return original_popen(*args, **kwargs)
+            subprocess.Popen = scoped_popen
+
+        try:
+            result = call_claude_streaming(
+                delta_claude_messages, system_prompt, model,
+                session_mode=session_mode, session_id=session_id,
+                tools_requested=False, stop=stop,
+                stream_callback=on_text_delta,
+            )
+        except ClaudeCliError as e:
+            # Headers are already sent by this point (SSE has to commit to
+            # a 200 before any content is known) -- an OpenAI SSE client
+            # expects an error surfaced as a final chunk, not a fresh HTTP
+            # error status, since the status line is long gone.
+            emit({"content": f"\n\n[error: {e.message}]"}, finish="stop")
+            self.wfile.write(b"data: [DONE]\n\n")
+            return
+        finally:
+            if env_overrides:
+                subprocess.Popen = original_popen
+
+        if not role_sent:
+            # No text ever arrived (e.g. immediate stop-sequence match on
+            # an empty prefix, or a same-turn error): still send the role
+            # delta so the client sees a well-formed message shape.
+            emit({"role": "assistant"})
+
+        finish_reason = result["finish_reason"]
+        if result.get("stop_matched"):
+            finish_reason = "stop"
+        emit({}, finish=finish_reason)
+        self.wfile.write(b"data: [DONE]\n\n")
+
+        if conv_key is not None:
+            message = {"role": "assistant", "content": result["text"]}
+            record_session(conv_key, session_id, messages, message)
 
     def _run_one_completion(self, delta_messages, full_messages, system_prompt, model,
                              tools_requested, session_mode, session_id, json_schema, env_overrides,

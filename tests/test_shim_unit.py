@@ -30,6 +30,17 @@ def _ndjson_lines(*dicts):
     return [json.dumps(d) + "\n" for d in dicts]
 
 
+def _parse_ndjson_lines(raw_lines):
+    for raw_line in raw_lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            yield json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+
 class FakeProcess:
     """Stand-in for subprocess.Popen(...) that replays canned NDJSON lines
     on .stdout, matching the real claude CLI's behaviour closely enough
@@ -186,7 +197,20 @@ class TestBuildClaudeCmd(unittest.TestCase):
 
 class TestCallClaudeStreaming(unittest.TestCase):
     def _run(self, fake_proc, **kwargs):
-        with patch.object(shim.subprocess, "Popen", return_value=fake_proc):
+        # call_claude_streaming opens a REAL PTY (via pty.openpty()) and
+        # reads from its real fd whenever stream_callback is set (see
+        # _iter_ndjson_lines_pty's docstring for why: claude's own stdout
+        # is fully buffered on a plain pipe, so real client streaming
+        # needs a real terminal attached). FakeProcess never actually
+        # writes anything to that fd, so exercising that path here would
+        # hang the test waiting on a fd nothing feeds. Redirect
+        # _iter_ndjson_lines_pty to replay the same canned `lines` the
+        # mocked Popen would have produced via a plain pipe, so PTY-path
+        # tests get identical NDJSON content without touching a real fd.
+        with patch.object(shim.subprocess, "Popen", return_value=fake_proc), \
+             patch.object(shim.pty, "openpty", return_value=(-1, -1)), \
+             patch.object(shim.os, "close", lambda fd: None), \
+             patch.object(shim, "_iter_ndjson_lines_pty", lambda master_fd, proc, timeout_s: iter(_parse_ndjson_lines(fake_proc.stdout))):
             return shim.call_claude_streaming([{"role": "user", "content": "hi"}], "", "sonnet", **kwargs)
 
     def test_immediate_text_message(self):
@@ -342,6 +366,62 @@ class TestCallClaudeStreaming(unittest.TestCase):
         # must NOT show up -- confirms we genuinely broke out early.
         self.assertNotIn("output_tokens", result["usage"])
 
+    def test_stream_callback_receives_real_time_text_deltas(self):
+        """stream_callback should be invoked with each real token-level
+        text_delta AS IT ARRIVES (from --include-partial-messages
+        content_block_delta events), not just once at the end with the
+        full accumulated text. This is what genuine client-facing
+        streaming depends on."""
+        lines = _ndjson_lines(
+            {"type": "system", "subtype": "init"},
+            {"type": "stream_event", "event": {"type": "content_block_start", "index": 0}},
+            {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                                                 "delta": {"type": "text_delta", "text": "Hello"}}},
+            {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                                                 "delta": {"type": "text_delta", "text": ", world"}}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "Hello, world"}],
+                                               "usage": {"input_tokens": 1, "output_tokens": 2}}},
+            {"type": "result", "subtype": "success"},
+        )
+        received = []
+        result = self._run(FakeProcess(lines), stream_callback=received.append)
+        self.assertEqual(received, ["Hello", ", world"])
+        self.assertEqual(result["text"], "Hello, world")
+
+    def test_stream_callback_truncated_at_stop_sequence(self):
+        """When both stream_callback and stop are set, the callback only
+        gets a shorter-than-already-sent view for the delta where the
+        match actually completes -- but text already streamed in an
+        EARLIER delta cannot be retroactively un-sent (an inherent
+        limitation of real-time streaming: you can't take back tokens
+        already delivered to the client). Here the stop sequence
+        "STOPHERE" spans two deltas ("abc STOP" + "HERE def"), so the
+        first delta streams in full before the match is even detectable;
+        only the second delta's contribution is suppressed. The FINAL
+        buffered `result["text"]` is still correctly truncated to "abc "
+        -- only the live SSE stream itself briefly showed a few extra
+        characters before the stop was recognized, which is the accepted
+        real-time-streaming/stop-sequence tradeoff (documented in
+        README)."""
+        lines = _ndjson_lines(
+            {"type": "system", "subtype": "init"},
+            {"type": "stream_event", "event": {"type": "content_block_start", "index": 0}},
+            {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                                                 "delta": {"type": "text_delta", "text": "abc STOP"}}},
+            {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                                                 "delta": {"type": "text_delta", "text": "HERE def"}}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "abc STOPHERE def"}], "usage": {}}},
+            {"type": "result", "subtype": "success"},
+        )
+        received = []
+        result = self._run(FakeProcess(lines), stop=["STOPHERE"], stream_callback=received.append)
+        # The first delta ("abc STOP") streamed before the match was
+        # detectable; the second delta ("HERE def") was fully suppressed
+        # since the match already completed by then.
+        self.assertEqual("".join(received), "abc STOP")
+        # But the final returned/recorded text IS correctly truncated.
+        self.assertEqual(result["text"], "abc ")
+        self.assertTrue(result["stop_matched"])
 
     def test_structured_output_tool_call_extracted_as_json(self):
         """--json-schema enforcement mechanism: StructuredOutput tool_use
@@ -544,6 +624,40 @@ class TestToolRetryWrapper(unittest.TestCase):
         self.assertEqual(shim._backoff_delay_s(2), 8.0)
         self.assertEqual(shim._backoff_delay_s(3), 15.0)  # capped
         self.assertEqual(shim._backoff_delay_s(10), 15.0)  # stays capped
+
+
+class TestUnsupportedSamplingParamsWarning(unittest.TestCase):
+    """temperature/top_p/etc have no equivalent anywhere in the Claude
+    Code CLI (verified via `claude --help` and the official env-vars
+    docs, 2026-08-13). These must never hard-error (real clients routinely
+    send explicit defaults like temperature: 1.0 on every request, which
+    carries no signal the caller wants non-default behavior) -- only a
+    one-time-per-name stderr warning, request otherwise unaffected."""
+
+    def setUp(self):
+        shim._warned_sampling_params.clear()
+
+    def test_warns_once_per_parameter_name(self):
+        with patch.object(shim.sys, "stderr") as mock_stderr:
+            shim._warn_unsupported_sampling_params({"temperature": 0.7})
+            shim._warn_unsupported_sampling_params({"temperature": 0.9})  # same name again
+        self.assertEqual(mock_stderr.write.call_count, 1)
+        self.assertIn("temperature", mock_stderr.write.call_args[0][0])
+
+    def test_does_not_warn_for_absent_or_null_params(self):
+        with patch.object(shim.sys, "stderr") as mock_stderr:
+            shim._warn_unsupported_sampling_params({"temperature": None, "model": "sonnet"})
+        mock_stderr.write.assert_not_called()
+
+    def test_warns_for_each_distinct_unsupported_param(self):
+        with patch.object(shim.sys, "stderr") as mock_stderr:
+            shim._warn_unsupported_sampling_params({"temperature": 0.5, "top_p": 0.9, "seed": 42})
+        self.assertEqual(mock_stderr.write.call_count, 3)
+
+    def test_supported_params_never_warn(self):
+        with patch.object(shim.sys, "stderr") as mock_stderr:
+            shim._warn_unsupported_sampling_params({"max_tokens": 100, "stop": ["x"], "stream": True})
+        mock_stderr.write.assert_not_called()
 
 
 if __name__ == "__main__":
