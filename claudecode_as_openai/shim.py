@@ -81,6 +81,82 @@ KNOWN_MODEL_ALIASES = [
 ]
 CLAUDE_TIMEOUT_S = 300
 
+# OpenRouter model-slug compatibility (2026-08-14). OpenRouter
+# (https://openrouter.ai) is a widely-used OpenAI-compatible proxy in
+# front of many providers, and its Anthropic model naming convention
+# (`anthropic/claude-sonnet-4.5`, `~anthropic/claude-sonnet-latest`,
+# etc -- see https://openrouter.ai/~anthropic/claude-sonnet-latest) is
+# what a lot of existing OpenAI-shaped tooling already expects to send
+# as the `model` field. Claude Code's own `--model` flag uses a
+# different convention (`claude-sonnet-4-5`, bare `sonnet`/`opus`/
+# `haiku` aliases that resolve to "latest") -- verified live via `claude
+# --model <x> -p` with a "state your exact model version" probe prompt
+# for each transform below. normalize_model_name() translates the
+# former into the latter so a client pointed at this shim with an
+# OpenRouter-style model string just works, without the caller needing
+# to know Claude Code's own naming scheme.
+_OPENROUTER_LATEST_ALIAS_RE = re.compile(r"^claude-(sonnet|opus|haiku)-latest$")
+_OPENROUTER_VERSION_RE = re.compile(r"^claude-(sonnet|opus|haiku)-(\d+)\.(\d+)$")
+_OPENROUTER_FAST_SUFFIX_RE = re.compile(r"^(claude-(?:sonnet|opus|haiku)-[\d.]+)-fast$")
+_warned_fast_models = set()
+
+
+def normalize_model_name(model):
+    """Translate an OpenRouter-style Anthropic model slug into the
+    equivalent Claude Code `--model` value. Verified live against the
+    real `claude` CLI for each transform:
+
+    - `~anthropic/claude-sonnet-latest`, `anthropic/claude-sonnet-latest`,
+      `claude-sonnet-latest` -> `sonnet` (bare alias; Claude Code itself
+      resolves this to whatever is currently "latest", verified live to
+      return `claude-sonnet-4-6` at time of testing). Same for
+      opus/haiku.
+    - `anthropic/claude-sonnet-4.5`, `claude-sonnet-4.5` ->
+      `claude-sonnet-4-5` (dot-to-dash in the version number; verified
+      live -- Claude Code's own `--model` flag rejects the dotted form
+      outright with "may not exist or you may not have access to it",
+      but accepts the dashed form and echoes back the exact model it
+      picked).
+    - A `-fast` suffix (OpenRouter's Fast-mode variant naming, e.g.
+      `anthropic/claude-opus-4.8-fast`) is stripped with a one-time
+      stderr warning -- Claude Code's `-p` mode has no reachable
+      fast-mode equivalent to route to, so this degrades to the normal
+      (non-fast) model rather than erroring the whole request.
+    - Anything else (already-native Claude Code model strings, bare
+      `sonnet`/`opus`/`haiku`, full dated IDs like
+      `claude-sonnet-4-5-20250929`) passes through unchanged.
+    """
+    if not model:
+        return model
+    normalized = model.strip()
+    if normalized.startswith("~"):
+        normalized = normalized[1:]
+    if normalized.startswith("anthropic/"):
+        normalized = normalized[len("anthropic/"):]
+
+    latest_match = _OPENROUTER_LATEST_ALIAS_RE.match(normalized)
+    if latest_match:
+        return latest_match.group(1)
+
+    fast_match = _OPENROUTER_FAST_SUFFIX_RE.match(normalized)
+    if fast_match:
+        if model not in _warned_fast_models:
+            _warned_fast_models.add(model)
+            sys.stderr.write(
+                f"claudecode-as-openai: warning: model '{model}' requests OpenRouter's "
+                f"Fast-mode variant, which has no -p-mode equivalent in Claude Code -- "
+                f"falling back to the normal-speed model.\n"
+            )
+        normalized = fast_match.group(1)
+
+    version_match = _OPENROUTER_VERSION_RE.match(normalized)
+    if version_match:
+        family, major, minor = version_match.groups()
+        return f"claude-{family}-{major}-{minor}"
+
+    return normalized
+
+
 # Claude Code's OAuth credentials (subscription auth, NOT an API key) --
 # used to authenticate the real Anthropic /v1/models call in
 # fetch_model_list() so /v1/models can return the actual current model
@@ -1271,7 +1347,7 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_chat_completion(self, payload):
         messages = payload.get("messages", [])
         tools = payload.get("tools")
-        model = payload.get("model") or DEFAULT_MODEL
+        model = normalize_model_name(payload.get("model") or DEFAULT_MODEL)
         stream = bool(payload.get("stream"))
         tool_choice = payload.get("tool_choice")
         n = payload.get("n") or 1

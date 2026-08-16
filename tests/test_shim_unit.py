@@ -879,5 +879,51 @@ class TestFetchModelList(unittest.TestCase):
             self.assertEqual(shim._read_claude_oauth_token(), "tok123")
 
 
+class TestNormalizeModelName(unittest.TestCase):
+    """OpenRouter (https://openrouter.ai) model-slug compatibility --
+    translates its Anthropic naming convention into Claude Code's own
+    `--model` convention. Expected values below were confirmed live
+    against the real `claude` CLI (2026-08-14): each transformed name
+    was passed to `claude --model <x> -p` with a "state your exact
+    model version" probe and the CLI accepted it / echoed back the
+    matching real model id."""
+
+    def test_tilde_and_anthropic_prefix_latest_alias(self):
+        for prefix_form in (
+            "~anthropic/claude-sonnet-latest",
+            "anthropic/claude-sonnet-latest",
+            "claude-sonnet-latest",
+        ):
+            self.assertEqual(shim.normalize_model_name(prefix_form), "sonnet")
+        self.assertEqual(shim.normalize_model_name("anthropic/claude-opus-latest"), "opus")
+        self.assertEqual(shim.normalize_model_name("anthropic/claude-haiku-latest"), "haiku")
+
+    def test_dotted_version_becomes_dashed(self):
+        self.assertEqual(shim.normalize_model_name("anthropic/claude-sonnet-4.5"), "claude-sonnet-4-5")
+        self.assertEqual(shim.normalize_model_name("claude-sonnet-4.5"), "claude-sonnet-4-5")
+        self.assertEqual(shim.normalize_model_name("anthropic/claude-opus-4.8"), "claude-opus-4-8")
+
+    def test_fast_suffix_stripped_before_dot_conversion(self):
+        shim._warned_fast_models.clear()
+        self.assertEqual(shim.normalize_model_name("anthropic/claude-opus-4.8-fast"), "claude-opus-4-8")
+
+    def test_fast_suffix_warns_once_per_model_string(self):
+        shim._warned_fast_models.clear()
+        with patch.object(shim.sys.stderr, "write") as mock_write:
+            shim.normalize_model_name("anthropic/claude-opus-4.8-fast")
+            shim.normalize_model_name("anthropic/claude-opus-4.8-fast")
+        self.assertEqual(mock_write.call_count, 1)
+
+    def test_already_native_names_pass_through_unchanged(self):
+        self.assertEqual(shim.normalize_model_name("claude-sonnet-4-5-20250929"), "claude-sonnet-4-5-20250929")
+        self.assertEqual(shim.normalize_model_name("sonnet"), "sonnet")
+        self.assertEqual(shim.normalize_model_name("opus"), "opus")
+        self.assertEqual(shim.normalize_model_name("gpt-4"), "gpt-4")
+
+    def test_falsy_input_passes_through(self):
+        self.assertIsNone(shim.normalize_model_name(None))
+        self.assertEqual(shim.normalize_model_name(""), "")
+
+
 if __name__ == "__main__":
     unittest.main()

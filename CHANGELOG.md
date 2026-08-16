@@ -104,3 +104,20 @@ _Unreleased_
   OAuth token (100% reliable but bypasses `-p` mode entirely, ruled
   out as out-of-bounds for this project). See README.md's "Native MCP
   tool registration" section for the full writeup.
+* OpenRouter (https://openrouter.ai) model-name compatibility:
+  `normalize_model_name()` translates OpenRouter's Anthropic model slug
+  convention (e.g. `anthropic/claude-sonnet-4.5`,
+  `~anthropic/claude-sonnet-latest`) into Claude Code's own `--model`
+  convention before every invocation, so clients already configured for
+  OpenRouter-style model names work unchanged against this shim. Handles
+  the `~`/`anthropic/` prefix stripping, `-latest` bare-alias mapping
+  (`claude-sonnet-latest` -> `sonnet`), dot-to-dash version conversion
+  (`4.5` -> `4-5`, since Claude Code's `--model` flag rejects the dotted
+  form outright), and OpenRouter's `-fast` Fast-mode suffix (stripped
+  with a one-time stderr warning, since `-p` mode has no reachable
+  fast-mode equivalent). Already-native Claude Code model strings and
+  anything unrecognized pass through unchanged. Verified live through
+  the actual running shim: 7/7 OpenRouter-style model names resolved
+  correctly via `curl` against `/v1/chat/completions`, each confirmed by
+  asking the model to self-report its exact version string. Added 6 new
+  unit tests. Full suite now 73 tests (was 67), all passing.

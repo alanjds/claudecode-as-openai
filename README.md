@@ -22,7 +22,7 @@ implemented / silently ignored.
 
 | Capability | Status | Notes |
 |---|---|---|
-| Model selection (`model` field) | ✅ | `--model <value>` passed straight to `claude -p` per request. Verified `sonnet` -> `claude-sonnet-4-6`, `opus` -> `claude-opus-4-6` both correctly selected, confirmed by asking Claude to self-report its version. |
+| Model selection (`model` field) | ✅ | `--model <value>` passed straight to `claude -p` per request, after translating OpenRouter-style Anthropic model slugs (`anthropic/claude-sonnet-4.5`, `~anthropic/claude-sonnet-latest`, etc -- see "OpenRouter model-name compatibility" below) into Claude Code's own naming convention. Verified `sonnet` -> `claude-sonnet-4-6`, `opus` -> `claude-opus-4-6` both correctly selected, confirmed by asking Claude to self-report its version. |
 | Session/conversation caching | ✅ | Implemented via conversation fingerprinting (`resolve_session`/`record_session`): when a client echoes back the exact prior assistant reply (as real OpenAI clients do), the shim resumes the matching Claude Code session with `--resume` and sends only the new delta message, instead of replaying full history into a fresh subprocess. Falls back to a fresh session on any divergence (edited/regenerated history). Verified live: `cache_creation_input_tokens` dropped from ~3500 (fresh turn) to ~30-40 tokens (resumed turn) across a real 3-turn conversation, with correct recall across turns. |
 | Streaming (`stream: true`) | ✅ | Real token-level streaming for the common case (single choice, no tools requested, no `response_format: json_schema`). Claude Code's own stdout is **fully buffered** (not line-buffered) when piped without a TTY -- verified: with `--include-partial-messages`, real per-token deltas arrived in 2-3 giant bursts within ~20ms regardless of actual generation time. Fixed by spawning `claude` with a real PTY (`pty.openpty()`) as its stdout instead of a plain pipe, which forces line buffering like an interactive terminal. Verified live: a 300-word story streamed as 21 separate content chunks over ~19s (avg gap 0.56s between chunks), matching real generation pacing, not one chunk at the end. Falls back to the previous buffered-then-emit behavior (SSE framing still correct, just not real-time) whenever tools are requested, `n > 1`, or `response_format: json_schema` is set -- see "Real streaming" section below for why those combinations aren't safe to stream live. |
 | Tool calling (`tools`/`tool_calls`) | ✅ | Registered as real MCP tool schemas via `--mcp-config` (see "Native MCP tool registration" below) -- verified live to reach **100% turn-1 dispatch reliability** (5/5 through the actual shim, repeatable), vs ~40% for the earlier prose-description approach. Falls back to the prose path (bounded retry, ~40% single-shot) only for tool names that can't satisfy MCP's naming constraint. |
@@ -78,6 +78,47 @@ If neither works (offline, revoked token, network failure, whatever),
 falls back to a hardcoded list extracted from strings embedded in the
 compiled `claude` binary -- stale by definition, but never worse than
 before this feature existed.
+
+## OpenRouter model-name compatibility
+
+OpenRouter (https://openrouter.ai) is a widely-used OpenAI-compatible
+proxy in front of many providers, and a lot of existing OpenAI-shaped
+tooling already sends its Anthropic model naming convention in the
+`model` field -- e.g. `anthropic/claude-sonnet-4.5`,
+`~anthropic/claude-sonnet-latest` (see
+https://openrouter.ai/~anthropic/claude-sonnet-latest for the reference
+naming scheme). Claude Code's own `--model` flag uses a different
+convention (dashed version numbers, `claude-sonnet-4-5`, plus bare
+`sonnet`/`opus`/`haiku` aliases that resolve to whatever is currently
+"latest").
+
+`normalize_model_name()` translates the former into the latter before
+every `claude -p --model <value>` invocation, so a client already
+configured for OpenRouter-style model names works against this shim
+without any changes on the caller's side. Each transform below was
+verified live against the real `claude` CLI (`claude --model <x> -p`
+with a "state your exact model version" probe prompt, 2026-08-14):
+
+| Input | Normalized to | Result |
+|---|---|---|
+| `~anthropic/claude-sonnet-latest` | `sonnet` | resolved live to `claude-sonnet-4-6` |
+| `anthropic/claude-opus-latest` | `opus` | resolved live to `claude-opus-4-6` |
+| `anthropic/claude-haiku-latest` | `haiku` | (bare alias, resolves to Claude Code's current "latest" haiku) |
+| `anthropic/claude-sonnet-4.5` | `claude-sonnet-4-5` | dot-to-dash; the dotted form is rejected outright by `--model` ("may not exist or you may not have access to it"), confirmed live |
+| `anthropic/claude-opus-4.8-fast` | `claude-opus-4-8` | OpenRouter's Fast-mode suffix is stripped (no `-p`-mode equivalent exists to route to), with a one-time stderr warning |
+| `claude-sonnet-4-5-20250929` (already-native) | unchanged | passed straight through |
+
+The `~` prefix (OpenRouter's "auto-routed to latest" marker) and the
+`anthropic/` provider prefix are both stripped unconditionally before
+matching, so `~anthropic/claude-sonnet-latest`,
+`anthropic/claude-sonnet-latest`, and `claude-sonnet-latest` are all
+equivalent inputs. Anything that doesn't match a recognized OpenRouter
+pattern (bare Claude Code aliases, full dated model IDs, or any other
+model string entirely, e.g. an OpenAI or other-provider `model` value a
+caller might send by mistake) passes through completely unchanged --
+this is a compatibility translation layer, not a validator, and errors
+on an unrecognized model are left to Claude Code's own real error
+response (see "Error responses" above).
 
 ## Hook/settings isolation: `--setting-sources ""`, not `--bare`
 
