@@ -160,3 +160,20 @@ _Unreleased_
 * Added 14 new unit tests covering `resolve_reasoning_effort`,
   `build_reasoning_details`, and `_build_openai_usage`. Full suite now
   87 tests (was 73), all passing.
+* Cleanup pass: extracted 4 shared helpers to remove duplicated logic
+  (`_scoped_env_overrides`, `_build_sse_chunk`, `_gen_tool_id`,
+  `_parse_ndjson_line`) and trimmed narrated-investigation comment/
+  docstring bloat throughout `shim.py` (1877 -> 1701 lines) down to the
+  load-bearing "what + why" behind each non-obvious choice. No behavior
+  change; all 87 tests pass and the running shim was live-verified after
+  each step.
+* Startup-latency: every spawned `claude` subprocess now gets
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (see `_BASE_ENV_OVERRIDES`
+  in shim.py), bundling `DISABLE_AUTOUPDATER`/`DISABLE_TELEMETRY`/
+  `DISABLE_ERROR_REPORTING`/`DISABLE_FEEDBACK_COMMAND`. Since this shim
+  spawns a fresh `claude -p` process per request, skipping the
+  autoupdater's version-check network call and telemetry/error-reporting
+  init on every single call is a real per-request latency win. Trade-off:
+  `claude` will never self-update while running under this shim -- the
+  operator is expected to run `claude update` manually on their own
+  schedule. See README.md "Startup-latency" section.

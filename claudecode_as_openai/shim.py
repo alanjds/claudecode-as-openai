@@ -190,6 +190,17 @@ _model_list_cache_lock = threading.Lock()
 _CLAUDE_CWD = tempfile.mkdtemp(prefix="claudecode-as-openai-sandbox-")
 MAX_N_CHOICES = 5
 
+# Applied to every spawned `claude` subprocess (see _scoped_env_overrides).
+# CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC bundles DISABLE_AUTOUPDATER,
+# DISABLE_TELEMETRY, DISABLE_ERROR_REPORTING, and DISABLE_FEEDBACK_COMMAND
+# into one flag. Since this shim spawns a fresh `claude -p` process per
+# request, the startup work those four disable (autoupdater version
+# check, telemetry, error reporting, feedback prompts) is otherwise paid
+# on every single call -- disabling it is a real per-request latency win.
+# This also means `claude` will never self-update here; the user updates
+# it manually on their own schedule instead.
+_BASE_ENV_OVERRIDES = {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
+
 # Claude Code's built-in tool names, PLUS the MCP-adjacent helper tools
 # that also leak custom-tool dispatch surface: RemoteTrigger (a generic
 # dispatcher that can invoke ANY declared custom tool by name), and
@@ -1418,7 +1429,7 @@ class Handler(BaseHTTPRequestHandler):
         if effective_tools and build_mcp_tool_manifest(effective_tools) is None:
             system_prompt = render_tools_into_system_prompt(effective_tools, system_prompt)
 
-        env_overrides = {}
+        env_overrides = dict(_BASE_ENV_OVERRIDES)
         if max_tokens:
             try:
                 env_overrides["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(int(max_tokens))

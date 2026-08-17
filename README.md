@@ -205,6 +205,27 @@ includes any thinking-block tokens, undifferentiated), so there is no
 honest number to report there. Making one up would be exactly the kind
 of unmeasured-estimate-presented-as-fact this project avoids.
 
+## Startup-latency: `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`
+
+This shim spawns a fresh `claude -p` process per request, so any fixed
+per-process startup cost is paid on every single call. Every spawned
+`claude` process now gets `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
+set (see `_BASE_ENV_OVERRIDES`), which bundles four opt-outs into one
+flag: `DISABLE_AUTOUPDATER`, `DISABLE_TELEMETRY`, `DISABLE_ERROR_REPORTING`,
+and `DISABLE_FEEDBACK_COMMAND`. Skipping the autoupdater's version-check
+network call and telemetry/error-reporting init is a real per-request
+latency win for a process that's about to be torn down anyway.
+
+Trade-off, by design: `DISABLE_AUTOUPDATER` means `claude` will never
+self-update while running under this shim -- no background version
+checks, no silent upgrades. That's intentional here: the operator updates
+`claude` manually (e.g. `claude update`) on their own schedule instead of
+having it happen invisibly mid-request. If you'd rather keep
+auto-updates and only silence telemetry, drop
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` from `_BASE_ENV_OVERRIDES` and
+set `DISABLE_TELEMETRY`/`DISABLE_ERROR_REPORTING`/`DISABLE_FEEDBACK_COMMAND`
+individually instead.
+
 ## Hook/settings isolation: `--setting-sources ""`, not `--bare`
 
 Without any lockdown, every spawned `claude` call previously read the
