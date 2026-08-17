@@ -1,48 +1,16 @@
 #!/usr/bin/env python3
-"""OpenAI-chat-completions-compatible shim over the local Claude Code CLI,
-built the way Cline's "Claude Code" provider actually does it (verified
-against cline/cline's open-source ClaudeCodeHandler + runClaudeCode,
-2026-08-12) rather than the ad-hoc JSON-envelope-in-prose approach this
-file used previously.
+"""OpenAI-chat-completions-compatible shim over the local Claude Code CLI.
+
+Translates OpenAI's `/v1/chat/completions` API onto `claude -p` (Claude
+Code's non-interactive mode): native tool-calling via MCP tool
+registration, session caching via --session-id/--resume, OpenAI-shaped
+error translation, response_format via --json-schema, OpenRouter model-
+name and reasoning-effort compatibility, and stop-sequence emulation.
 
 See README.md "Capability audit" for the full, empirically-verified list
-of what works, what's approximated, and what's a genuine CLI limitation.
-This file implements everything found to be implementable as of
-2026-08-13: session caching (--session-id/--resume), OpenAI-shaped error
-translation, max_tokens (via CLAUDE_CODE_MAX_OUTPUT_TOKENS), response_format
-(via --json-schema), a tighter MCP-tool lockdown for the no-tools-requested
-case, tool_choice: "none", n (bounded fan-out), and stop sequences
-(client-side truncation).
-
-Key differences from the original ad-hoc approach, and why they fix the
-flakiness:
-
-1. Uses Claude Code's REAL native tool-calling protocol
-   (`--output-format stream-json`, parsing genuine `tool_use` content
-   blocks from the assistant message) instead of asking Claude to emit a
-   custom JSON envelope in plain text.
-
-2. Uses `--disallowedTools <extended built-in list>` (not `--tools ""`)
-   when tools were requested, so Claude Code's own built-ins are blocked
-   by name but ANY custom tool names the caller passes remain callable.
-   When NO tools were requested, uses `--tools "" --strict-mcp-config
-   --mcp-config '{"mcpServers":{}}'` for a fully locked-down zero-tool
-   session -- see "MCP tool leakage" in README for why both flags are
-   needed (--disallowedTools alone does not block a machine's locally
-   configured MCP servers).
-
-3. Parses the NDJSON stream incrementally, skipping `thinking` blocks
-   until a real `text`/`tool_use` block appears (an assistant turn can
-   consist of ONLY a thinking block before the real content arrives on a
-   later NDJSON line).
-
-4. Session caching: fingerprints each conversation (system prompt + first
-   message) and tracks how much of it has already been synced to a given
-   Claude Code session. A continuing conversation sends only the new
-   trailing messages via `--resume <id>`; a new or diverged conversation
-   starts fresh via `--session-id <id>` with the full history. Verified
-   directly: a resumed turn re-processes only the delta (a few hundred
-   tokens) instead of the whole conversation (tens of thousands).
+of what works, what's approximated, and what's a genuine CLI limitation,
+and CHANGELOG.md for the investigation trail behind each design choice
+referenced in comments below.
 
 Run:
     python3 -m claudecode_as_openai.shim [port]   # default port 8977
@@ -67,6 +35,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CLAUDE_BIN = "claude"
@@ -81,20 +50,12 @@ KNOWN_MODEL_ALIASES = [
 ]
 CLAUDE_TIMEOUT_S = 300
 
-# OpenRouter model-slug compatibility (2026-08-14). OpenRouter
-# (https://openrouter.ai) is a widely-used OpenAI-compatible proxy in
-# front of many providers, and its Anthropic model naming convention
-# (`anthropic/claude-sonnet-4.5`, `~anthropic/claude-sonnet-latest`,
-# etc -- see https://openrouter.ai/~anthropic/claude-sonnet-latest) is
-# what a lot of existing OpenAI-shaped tooling already expects to send
-# as the `model` field. Claude Code's own `--model` flag uses a
-# different convention (`claude-sonnet-4-5`, bare `sonnet`/`opus`/
-# `haiku` aliases that resolve to "latest") -- verified live via `claude
-# --model <x> -p` with a "state your exact model version" probe prompt
-# for each transform below. normalize_model_name() translates the
-# former into the latter so a client pointed at this shim with an
-# OpenRouter-style model string just works, without the caller needing
-# to know Claude Code's own naming scheme.
+# OpenRouter model-slug compatibility (see CHANGELOG). Translates
+# OpenRouter's Anthropic model naming convention
+# (`anthropic/claude-sonnet-4.5`, `~anthropic/claude-sonnet-latest`) into
+# Claude Code's own `--model` convention (`claude-sonnet-4-5`, bare
+# `sonnet`/`opus`/`haiku` aliases) so a client pointed at this shim with
+# an OpenRouter-style model string just works.
 _OPENROUTER_LATEST_ALIAS_RE = re.compile(r"^claude-(sonnet|opus|haiku)-latest$")
 _OPENROUTER_VERSION_RE = re.compile(r"^claude-(sonnet|opus|haiku)-(\d+)\.(\d+)$")
 _OPENROUTER_FAST_SUFFIX_RE = re.compile(r"^(claude-(?:sonnet|opus|haiku)-[\d.]+)-fast$")
@@ -103,28 +64,20 @@ _warned_fast_models = set()
 
 def normalize_model_name(model):
     """Translate an OpenRouter-style Anthropic model slug into the
-    equivalent Claude Code `--model` value. Verified live against the
-    real `claude` CLI for each transform:
+    equivalent Claude Code `--model` value. See CHANGELOG for the live
+    verification behind each transform:
 
     - `~anthropic/claude-sonnet-latest`, `anthropic/claude-sonnet-latest`,
-      `claude-sonnet-latest` -> `sonnet` (bare alias; Claude Code itself
-      resolves this to whatever is currently "latest", verified live to
-      return `claude-sonnet-4-6` at time of testing). Same for
-      opus/haiku.
+      `claude-sonnet-latest` -> `sonnet` (bare alias; same for opus/haiku).
     - `anthropic/claude-sonnet-4.5`, `claude-sonnet-4.5` ->
-      `claude-sonnet-4-5` (dot-to-dash in the version number; verified
-      live -- Claude Code's own `--model` flag rejects the dotted form
-      outright with "may not exist or you may not have access to it",
-      but accepts the dashed form and echoes back the exact model it
-      picked).
-    - A `-fast` suffix (OpenRouter's Fast-mode variant naming, e.g.
-      `anthropic/claude-opus-4.8-fast`) is stripped with a one-time
-      stderr warning -- Claude Code's `-p` mode has no reachable
-      fast-mode equivalent to route to, so this degrades to the normal
-      (non-fast) model rather than erroring the whole request.
+      `claude-sonnet-4-5` (dot-to-dash; Claude Code's `--model` flag
+      rejects the dotted form outright).
+    - A `-fast` suffix (OpenRouter's Fast-mode variant naming) is
+      stripped with a one-time stderr warning -- Claude Code's `-p` mode
+      has no reachable fast-mode equivalent, so this degrades to the
+      normal (non-fast) model rather than erroring the whole request.
     - Anything else (already-native Claude Code model strings, bare
-      `sonnet`/`opus`/`haiku`, full dated IDs like
-      `claude-sonnet-4-5-20250929`) passes through unchanged.
+      aliases, full dated IDs) passes through unchanged.
     """
     if not model:
         return model
@@ -157,21 +110,12 @@ def normalize_model_name(model):
     return normalized
 
 
-# OpenRouter reasoning-tokens compatibility (2026-08-14). OpenRouter's
-# `reasoning` request parameter (https://openrouter.ai/docs/guides/best-
-# practices/reasoning-tokens) is how OpenAI-shaped clients ask a model to
-# think step-by-step and get that thinking back. Claude Code's own
-# equivalent is `--effort <low|medium|high|max>` -- verified live (via a
-# stream-json capture with a math prompt) that setting `--effort` genuinely
-# produces real `thinking` content blocks (with a `signature` field) ahead
-# of the final `text` block, not just a cosmetic flag.
-#
-# `--effort` only accepts exactly low/medium/high/max (verified live:
-# "none", "minimal", and "xhigh" are all rejected outright with "argument
-# ... is invalid. It must be one of: low, medium, high, max") -- so
-# OpenRouter's wider effort vocabulary is clamped down to the nearest
-# accepted value rather than passed through and erroring the whole
-# request.
+# OpenRouter reasoning-tokens compatibility (see CHANGELOG). Maps
+# OpenRouter's `reasoning` request parameter onto Claude Code's
+# `--effort <low|medium|high|max>` flag, which genuinely produces real
+# `thinking` content blocks. `--effort` only accepts exactly those four
+# values, so OpenRouter's wider vocabulary is clamped to the nearest one
+# rather than passed through and erroring the whole request.
 _REASONING_EFFORT_MAP = {
     "none": None,        # reasoning explicitly disabled -- no --effort flag at all
     "minimal": "low",
@@ -187,21 +131,18 @@ def resolve_reasoning_effort(payload):
     """Extract Claude Code's `--effort` value (or None for "no reasoning
     requested") from an OpenAI/OpenRouter-shaped request payload.
 
-    Supports both of OpenRouter's real request shapes for this
+    Supports OpenRouter's real request shapes
     (https://openrouter.ai/docs/guides/best-practices/reasoning-tokens):
-    - `{"reasoning": {"effort": "high"}}` -- effort string, clamped via
-      _REASONING_EFFORT_MAP.
-    - `{"reasoning": {"max_tokens": N}}` -- Anthropic-style token budget;
-      approximated to an effort level using OpenRouter's own documented
-      percentage bands (each effort level's stated % of some overall
-      token budget), since Claude Code's -p mode has no raw token-budget
-      equivalent to pass through directly.
-    - `{"reasoning": {"enabled": true}}` alone (no effort/max_tokens) ->
-      "medium", matching OpenRouter's own documented default.
+    - `{"reasoning": {"effort": "high"}}` -- clamped via _REASONING_EFFORT_MAP.
+    - `{"reasoning": {"max_tokens": N}}` -- approximated to an effort
+      level using OpenRouter's documented percentage bands, since Claude
+      Code has no raw token-budget equivalent.
+    - `{"reasoning": {"enabled": true}}` alone -> "medium" (OpenRouter's
+      own documented default).
     - `{"reasoning": {"exclude": true}}` -- accepted but NOT enforced:
-      Claude Code has no mechanism to reason internally while witholding
-      the thinking blocks from the transcript, so this shim's reasoning
-      is always returned when requested (see build_reasoning_details()).
+      Claude Code has no way to reason internally while withholding the
+      thinking block, so this shim's reasoning is always returned when
+      requested (see build_reasoning_details()).
 
     Returns None when no `reasoning` key is present, or when
     `reasoning.effort` is explicitly "none".
@@ -216,13 +157,10 @@ def resolve_reasoning_effort(payload):
         return _REASONING_EFFORT_MAP.get(str(effort).lower(), "medium")
     max_tokens = reasoning.get("max_tokens")
     if isinstance(max_tokens, (int, float)) and max_tokens > 0:
-        # OpenRouter's own documented effort/token-budget percentage
-        # bands (see reasoning-tokens docs): low ~20%, medium ~50%,
-        # high ~80%, max ~95% of an overall budget. Without a concrete
-        # overall budget to divide by, treat the raw token count itself
-        # against the same band thresholds as a reasonable proxy --
-        # this is a best-effort approximation, not an exact mapping,
-        # since Claude Code has no raw reasoning-token-budget flag.
+        # OpenRouter's documented effort/token-budget percentage bands:
+        # low ~20%, medium ~50%, high ~80%, max ~95%. Without a concrete
+        # overall budget, treat the raw token count against the same
+        # thresholds as a best-effort proxy.
         if max_tokens >= 8000:
             return "max"
         if max_tokens >= 4000:
@@ -237,43 +175,29 @@ def resolve_reasoning_effort(payload):
 
 # Claude Code's OAuth credentials (subscription auth, NOT an API key) --
 # used to authenticate the real Anthropic /v1/models call in
-# fetch_model_list() so /v1/models can return the actual current model
-# list instead of a hardcoded guess, without requiring the caller to have
-# a separate ANTHROPIC_API_KEY. Verified live: a Bearer token read from
-# this file successfully authenticated a GET to
-# https://api.anthropic.com/v1/models and returned the real, current
-# model list (10 entries, live 2026-08-14) -- this is a free metadata
-# call, not a billed completion, so it doesn't touch subscription usage.
+# fetch_model_list() so it can return the actual current model list
+# without requiring a separate ANTHROPIC_API_KEY. This is a free
+# metadata call, not a billed completion.
 _CLAUDE_CREDENTIALS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 _MODEL_LIST_CACHE_TTL_S = 300
 _model_list_cache = {"data": None, "fetched_at": 0.0}
 _model_list_cache_lock = threading.Lock()
 
 # Every spawned `claude` subprocess inherits whatever directory the shim
-# process happens to be running from -- verified live: Claude Code reports
-# that directory as its `cwd` and can reference/read real files there
-# (confirmed by asking a tool_choice:"none" request "any tool you have" and
-# getting back fabricated-looking but suspiciously specific Read/Glob
-# references to this very shim's own source files). Spawning every `claude`
-# call from a dedicated, empty, per-run temp directory instead closes this:
-# verified `claude`'s own reported `cwd` matches the sandbox dir, not the
-# shim's real working directory, once this is passed as subprocess cwd=.
+# process happens to be running from, and Claude Code can read real
+# files there. Spawning every `claude` call from a dedicated, empty,
+# per-run temp directory closes this off.
 _CLAUDE_CWD = tempfile.mkdtemp(prefix="claudecode-as-openai-sandbox-")
 MAX_N_CHOICES = 5
 
-# Claude Code's built-in tool names (as of CLI 2.1.94, checked 2026-08-13),
-# PLUS the MCP-adjacent helper tools that also leak custom-tool dispatch
-# surface: RemoteTrigger (a generic dispatcher that can invoke ANY declared
-# custom tool by name even when not in the caller's tools array -- found
-# live, see README "MCP tool leakage"), and ListMcpResourcesTool/
-# ReadMcpResourceTool (MCP resource browsers, not server-specific so
-# --strict-mcp-config doesn't touch them). This does NOT fully close the
-# leak -- a machine's actual configured MCP tools (mcp__servername__tool)
-# can still rarely fire when tools ARE requested (--strict-mcp-config
-# can't be combined with real tool dispatch without reintroducing the
-# --tools "" text-fallback problem). When NO tools are requested, the
-# no-tools path below (--tools "" --strict-mcp-config) closes this
-# completely instead.
+# Claude Code's built-in tool names, PLUS the MCP-adjacent helper tools
+# that also leak custom-tool dispatch surface: RemoteTrigger (a generic
+# dispatcher that can invoke ANY declared custom tool by name), and
+# ListMcpResourcesTool/ReadMcpResourceTool (MCP resource browsers, not
+# server-specific so --strict-mcp-config doesn't touch them). This does
+# NOT fully close the leak when tools ARE requested -- see README "MCP
+# tool leakage". When NO tools are requested, the no-tools path below
+# (--tools "" --strict-mcp-config) closes this completely instead.
 EXTENDED_DISALLOWED_TOOLS = ",".join(
     [
         "Task", "TaskOutput", "Bash", "Glob", "Grep", "Read", "Edit", "Write",
@@ -366,6 +290,10 @@ def _classify_error_text(text):
     return 500, "api_error", None
 
 
+def _gen_tool_id():
+    return f"toolu_{uuid.uuid4().hex[:20]}"
+
+
 def _flatten_content(content):
     if isinstance(content, list):
         parts = []
@@ -421,7 +349,7 @@ def build_claude_messages(openai_messages):
                 content_blocks.append(
                     {
                         "type": "tool_use",
-                        "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:20]}"),
+                        "id": tc.get("id", _gen_tool_id()),
                         "name": fn.get("name", ""),
                         "input": args,
                     }
@@ -444,14 +372,10 @@ def system_prompt_from_messages(openai_messages):
 
 def _read_claude_oauth_token():
     """Read Claude Code's own OAuth access token from its local
-    credentials file (subscription auth, NOT an API key -- this is the
-    same token `claude` itself uses day-to-day). Returns the token string,
-    or None if the file is missing, unreadable, malformed, or the token
-    has already expired (checked against the same `expiresAt` field
-    Claude Code itself uses, so an expired-but-present token doesn't get
-    used to make a doomed request). Never raises -- every failure mode
-    here should fall through to the next auth method in
-    fetch_model_list(), not blow up /v1/models."""
+    credentials file (subscription auth, NOT an API key). Returns the
+    token string, or None if missing, unreadable, malformed, or expired.
+    Never raises -- every failure mode falls through to the next auth
+    method in fetch_model_list()."""
     try:
         with open(_CLAUDE_CREDENTIALS_PATH, "r") as f:
             creds = json.load(f)
@@ -469,13 +393,9 @@ def _read_claude_oauth_token():
 
 def _fetch_models_from_anthropic_api(auth_header):
     """GET https://api.anthropic.com/v1/models with the given auth header
-    dict merged into the request. This is a free metadata call (not a
-    billed completion) -- verified live with both an OAuth Bearer token
-    and a real ANTHROPIC_API_KEY, each returning the current real model
-    list (10 entries, live 2026-08-14). Returns the parsed `data` list, or
-    None on any failure (network, auth, non-200, malformed JSON) so the
-    caller can fall through to the next auth method or the hardcoded
-    fallback -- this must never raise up into a /v1/models request."""
+    merged in. Free metadata call, not a billed completion. Returns the
+    parsed `data` list, or None on any failure so the caller can fall
+    through to the next auth method or the hardcoded fallback."""
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/models",
         headers={"anthropic-version": "2023-06-01", **auth_header},
@@ -494,30 +414,11 @@ def _fetch_models_from_anthropic_api(auth_header):
 
 
 def fetch_model_list():
-    """Returns the real, current Anthropic model list for /v1/models,
-    preferring OAuth (Claude Code's own subscription credentials) over an
-    API key over a hardcoded static fallback, per user direction
-    (2026-08-14): OAuth first because it works without requiring the
-    caller to separately configure ANTHROPIC_API_KEY -- the whole point of
-    this shim is to avoid needing metered API billing, so authenticating
-    this one free metadata call with the OAuth token Claude Code already
-    has (rather than a paid-API-key-only path) keeps that promise intact.
-
-    Order tried:
-    1. Claude Code's own OAuth access token (~/.claude/.credentials.json)
-       -- verified live: works identically to an API key against the real
-       /v1/models endpoint.
-    2. ANTHROPIC_API_KEY from the environment, if OAuth is absent/expired
-       /unreadable.
-    3. KNOWN_MODEL_ALIASES (hardcoded, extracted from the claude binary)
-       if neither auth method is available or the request fails for any
-       reason (network down, revoked token, etc).
-
-    Results are cached in-process for _MODEL_LIST_CACHE_TTL_S to avoid a
-    network round-trip on every single /v1/models poll (some clients poll
-    this endpoint frequently on startup).
-
-    Returns a list of dicts shaped like OpenAI's model list entries:
+    """Returns the real, current Anthropic model list for /v1/models.
+    Order tried: (1) Claude Code's own OAuth token, so callers don't need
+    a separate ANTHROPIC_API_KEY; (2) ANTHROPIC_API_KEY from the
+    environment; (3) KNOWN_MODEL_ALIASES hardcoded fallback. Results are
+    cached in-process for _MODEL_LIST_CACHE_TTL_S. Returns
     [{"id": ..., "object": "model"}, ...]. Never raises."""
     with _model_list_cache_lock:
         cached = _model_list_cache["data"]
@@ -546,22 +447,15 @@ def fetch_model_list():
 
 
 def render_tools_into_system_prompt(tools, base_system_prompt):
-    """LEGACY fallback path. Superseded by build_mcp_tool_config() (see
-    below) as of 2026-08-14: custom tools are now passed to Claude Code as
-    real MCP tool schemas, not prose. Kept and still wired up as an
-    automatic fallback for edge cases where MCP registration itself can't
-    be used (e.g. a tool name that can't be made into a valid MCP tool
-    name at all) -- see call_claude_streaming's use of this function only
-    when build_mcp_tool_config() returns None.
-
-    Framing matters a lot here: describing tools as "custom"/hypothetical
-    made Claude hedge and refuse to call them (0/8 in testing) even with
-    native tool_use active. Framing them as already-wired, real,
-    implemented-by-the-harness tools fixed this completely (6/6) --
-    combined with the extended --disallowedTools list removing Claude's
-    own competing built-in dispatch options. This path still only reaches
-    ~40% single-shot reliability (see TOOL_CALL_MAX_RETRIES); the MCP path
-    is the real fix."""
+    """LEGACY prose-based tool-description fallback, superseded by
+    build_mcp_tool_config() (real MCP tool schemas). Kept as an automatic
+    fallback for tool names that can't be represented as a valid MCP
+    tool name -- see call_claude_streaming's use of this function only
+    when build_mcp_tool_config() returns None. Framing tools as
+    already-wired, real, harness-implemented tools (not "custom"/
+    hypothetical) is what makes Claude actually call them instead of
+    hedging; this path still only reaches ~40% single-shot reliability
+    (see TOOL_CALL_MAX_RETRIES) -- the MCP path is the real fix."""
     if not tools:
         return base_system_prompt
     lines = [
@@ -591,7 +485,7 @@ def render_tools_into_system_prompt(tools, base_system_prompt):
 
 # ---------------------------------------------------------------------------
 # Native MCP tool registration: the real fix for the ~40% single-shot
-# tool-call reliability problem. Verified live (2026-08-14): Claude Code's
+# tool-call reliability problem. Verified live: Claude Code's
 # `-p` mode has no flag to accept arbitrary JSON-schema tool definitions
 # directly, but MCP tool schemas registered via `--mcp-config` ARE passed
 # to the underlying Anthropic API as genuine, ajv-validated `tools`
@@ -737,15 +631,25 @@ def record_session(conv_key, claude_session_id, full_openai_messages, assistant_
             _SESSION_STORE.pop(oldest, None)
 
 
+def _parse_ndjson_line(line):
+    """Shared tail logic for both NDJSON readers below: strip, skip blank,
+    parse JSON, skip silently on a decode error (a malformed/partial line
+    is not fatal -- just not a usable chunk). Returns the parsed dict, or
+    None if the line should be skipped."""
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+
 def _iter_ndjson_lines(proc):
     for raw_line in proc.stdout:
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            yield json.loads(line)
-        except json.JSONDecodeError:
-            continue
+        parsed = _parse_ndjson_line(raw_line)
+        if parsed is not None:
+            yield parsed
 
 
 def _iter_ndjson_lines_pty(master_fd, proc, timeout_s):
@@ -795,52 +699,29 @@ def _iter_ndjson_lines_pty(master_fd, proc, timeout_s):
             return
         buf += chunk
         while b"\n" in buf:
-            line, buf = buf.split(b"\n", 1)
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                continue
+            raw_line, buf = buf.split(b"\n", 1)
+            parsed = _parse_ndjson_line(raw_line.decode("utf-8", errors="replace"))
+            if parsed is not None:
+                yield parsed
 
 
 def _build_claude_cmd(model, session_mode, session_id, tools_requested, max_turns, json_schema, want_partial_messages=False, mcp_tool_config=None, effort=None):
     cmd = [CLAUDE_BIN]
-    # Exclude user/project/local settings.json entirely -- this is what
-    # actually prevents locally-configured SessionStart/other hooks from
-    # firing and injecting arbitrary extra context into every completion,
-    # which a stateless API shim should never be silently subject to.
-    # Verified live (2026-08-14): a real SessionStart hook configured in
-    # ~/.claude/settings.json fired and injected a marker string into
-    # model context on a plain call; with --setting-sources "" set, the
-    # model explicitly confirmed no hook message was present. Verified
-    # this does NOT break anything else that matters to this shim: OAuth
-    # auth is untouched (auth reads from a separate credentials file, not
-    # settings.json), tool_use dispatch still fires correctly, and
-    # --session-id/--resume continuity still works. This was considered
-    # as an alternative to --bare mode, which looked like a stronger
-    # lockdown (also skips CLAUDE.md, plugin sync, LSP, etc) but was
-    # ruled out because --bare strictly requires ANTHROPIC_API_KEY and
-    # never reads OAuth/keychain (confirmed live: --bare fails with "Not
-    # logged in" under pure OAuth auth, works fine with a real API key)
-    # -- unacceptable since this shim's whole premise is riding the
-    # user's Claude subscription, not metered API billing.
-    # policySettings/flagSettings (enterprise-managed, not user-facing)
-    # remain unaffected either way -- getEnabledSettingSources() always
-    # includes those regardless of --setting-sources.
+    # Excludes user/project/local settings.json entirely, preventing
+    # locally-configured SessionStart/other hooks from injecting extra
+    # context into every completion -- a stateless API shim should never
+    # be silently subject to that. Not --bare: --bare strictly requires
+    # ANTHROPIC_API_KEY and never reads OAuth, which would break this
+    # shim's whole premise of riding the user's Claude subscription.
     cmd += ["--setting-sources", ""]
     if mcp_tool_config is not None:
-        # Native MCP tool registration path (see build_mcp_tool_config
-        # docstring): --strict-mcp-config restricts MCP servers to ONLY
-        # the one just-built manifest server (closing the same
-        # locally-configured-MCP leak the no-tools path below closes),
-        # --allowedTools further restricts to exactly this session's
-        # declared tool names (nothing else callable even within our own
-        # server), and --disallowedTools still blocks every Claude Code
-        # built-in by name. Verified live (2026-08-14): this combination
-        # exposes ONLY the intended mcp__shim_tools__<name> entries in
-        # the session's tool list -- no built-ins, no other leakage.
+        # Native MCP tool registration path (see build_mcp_tool_config):
+        # --strict-mcp-config restricts MCP servers to ONLY the
+        # just-built manifest server, --allowedTools further restricts
+        # to exactly this session's declared tool names, and
+        # --disallowedTools blocks every Claude Code built-in by name.
+        # This combination exposes ONLY the intended
+        # mcp__shim_tools__<name> entries -- no built-ins, no leakage.
         cmd += [
             "--disallowedTools", EXTENDED_DISALLOWED_TOOLS,
             "--strict-mcp-config", "--mcp-config", json.dumps(mcp_tool_config["mcp_config"]),
@@ -849,28 +730,19 @@ def _build_claude_cmd(model, session_mode, session_id, tools_requested, max_turn
     elif tools_requested:
         cmd += ["--disallowedTools", EXTENDED_DISALLOWED_TOOLS]
     else:
-        # No tools requested at all: fully lock down BOTH built-ins and any
-        # locally-configured MCP servers. See EXTENDED_DISALLOWED_TOOLS
-        # docstring and README "MCP tool leakage" for why this is the only
-        # combination that closes the leak completely (verified: tools
-        # available == [] with this combo, vs. a real MCP tool call leaking
-        # through unprompted without it).
+        # No tools requested: fully lock down BOTH built-ins and any
+        # locally-configured MCP servers (see EXTENDED_DISALLOWED_TOOLS
+        # and README "MCP tool leakage").
         cmd += ["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
     cmd += ["--output-format", "stream-json", "--verbose", "--max-turns", str(max_turns)]
     if want_partial_messages:
-        # Requested when a `stop` sequence is set (for early termination)
-        # and/or when real token-level client streaming is active. This
-        # adds token-level "stream_event"/"content_block_delta" lines
-        # interleaved with the existing full "assistant" message chunks
-        # (verified live: the "assistant" chunks stay complete/final,
-        # identical to without this flag -- it only ADDS extra lines, it
-        # doesn't change existing parsing). Needed because Claude Code's
-        # default stream-json granularity is per-MESSAGE, not per-token:
-        # without this flag, a stop sequence can only be detected after an
-        # entire text block has already been fully generated and billed
-        # (defeating the purpose of an early stop), and a client asking
-        # for `stream: true` would get one giant content delta instead of
-        # a real typing effect.
+        # Adds token-level "stream_event"/"content_block_delta" lines
+        # interleaved with the existing full "assistant" message chunks.
+        # Needed because Claude Code's default stream-json granularity is
+        # per-message, not per-token: without this, a stop sequence can
+        # only be detected after an entire text block has already been
+        # generated and billed, and `stream: true` would only deliver one
+        # giant content delta instead of a real typing effect.
         cmd += ["--include-partial-messages"]
     if session_mode == "resume":
         cmd += ["--resume", session_id]
@@ -905,44 +777,34 @@ def call_claude_streaming(
     extracting what's needed so a downstream max-turns/self-resolution
     failure never surfaces as a shim-level crash.
 
-    `stop`, if given, is checked against the ACCUMULATED text after every
-    text content block arrives, not just once at the end -- Claude Code has
-    no native stop-sequence flag (verified: no such CLI option exists), but
-    since stream-json delivers assistant messages incrementally, killing
-    the subprocess the instant a stop sequence appears avoids paying for
-    (and waiting on) the rest of a response nobody asked for. This is a
-    real latency/cost win over truncating client-side only after the full
-    response completes, which is what an earlier version of this shim did.
+    `stop`, if given, is checked against the accumulated text after every
+    text content block arrives (Claude Code has no native stop-sequence
+    flag) -- killing the subprocess the instant a match appears avoids
+    paying for and waiting on the rest of an unwanted response.
 
     `stream_callback`, if given, is called with each real token-level text
-    chunk (str) as it arrives via --include-partial-messages
-    content_block_delta events -- this is what delivers genuine real-time
-    streaming to an OpenAI client instead of one giant chunk after full
-    generation. Only wired up by the caller for the single-choice,
-    no-tools-requested, no-json_schema path (see _handle_chat_completion):
-    with tool retry in play, an earlier failed attempt's narration text
-    would otherwise get streamed to the client before the shim knows that
-    attempt needs to be discarded and retried.
+    chunk as it arrives via --include-partial-messages content_block_delta
+    events -- this delivers genuine real-time streaming to an OpenAI
+    client. Only wired up for the single-choice, no-tools, no-json_schema
+    path (see _handle_chat_completion): with tool retry in play, a failed
+    attempt's narration text must not reach the client before the shim
+    knows to discard it and retry.
 
-    `tools`, if given (the raw OpenAI `tools` array), is registered as a
-    real MCP tool server (see build_mcp_tool_config) instead of being
-    described in prose -- this is the fix for the ~40% single-shot
-    tool-call reliability problem, verified live to reach 100% turn-1
-    dispatch. Falls back to tools_requested's prose-description path
-    automatically (system_prompt is expected to already carry the prose
-    fallback in that case -- see _handle_chat_completion) when the tool
-    set can't be represented as a valid MCP manifest (see
-    build_mcp_tool_manifest).
+    `tools`, if given, is registered as a real MCP tool server (see
+    build_mcp_tool_config) instead of being described in prose -- the fix
+    for the ~40% single-shot tool-call reliability problem, reaching 100%
+    turn-1 dispatch. Falls back to tools_requested's prose-description
+    path (system_prompt already carries it -- see _handle_chat_completion)
+    when the tool set can't be represented as a valid MCP manifest.
 
     Returns a dict: {"text", "tool_calls", "usage", "finish_reason",
     "structured_json"}. Raises ClaudeCliError for conditions that should
-    become an OpenAI-shaped error response (invalid model, auth failure,
-    rate limiting, etc -- see _classify_error_text).
+    become an OpenAI-shaped error response -- see _classify_error_text.
 
-    Tool suppression: see EXTENDED_DISALLOWED_TOOLS and _build_claude_cmd
-    docstrings for why --disallowedTools (not --tools "") is used when
-    tools are requested, and why the no-tools path uses --tools "" +
-    --strict-mcp-config instead."""
+    See EXTENDED_DISALLOWED_TOOLS and _build_claude_cmd for why
+    --disallowedTools (not --tools "") is used when tools are requested,
+    and why the no-tools path uses --tools "" + --strict-mcp-config
+    instead."""
     if session_id is None:
         session_id = str(uuid.uuid4())
 
@@ -954,16 +816,11 @@ def call_claude_streaming(
     mcp_tool_config = build_mcp_tool_config(tools) if tools else None
     # --json-schema needs a couple of internal turns (an internal
     # "StructuredOutput" tool call + a corrective retry if the model
-    # forgets it) to actually enforce the schema -- verified empirically:
-    # max_turns=1 leaves it hanging at error_max_turns with the schema
-    # never actually produced; max_turns=3 completes cleanly. Native MCP
-    # tool dispatch (verified live) also needs 2 turns when a tool fires:
-    # turn 1 emits the tool_use (ending that turn), turn 2 is needed for
-    # the follow-up text after the (client-side) tool result -- though
-    # this shim breaks out on tool_use before that matters (see below),
-    # --max-turns 1 alone left error_max_turns on the wire in earlier
-    # testing when a fallback path needed the second turn, so this stays
-    # >= 2 whenever any real tool dispatch is possible.
+    # forgets it) to actually enforce the schema -- max_turns=1 leaves it
+    # hanging at error_max_turns. Native MCP tool dispatch also needs 2
+    # turns when a tool fires (though this shim breaks out on tool_use
+    # before that matters -- see below), so max_turns stays >= 2 whenever
+    # any real tool dispatch is possible.
     max_turns = 3 if json_schema is not None else (2 if mcp_tool_config else 1)
     cmd = _build_claude_cmd(
         model, session_mode, session_id, tools_requested, max_turns, json_schema,
@@ -1047,27 +904,17 @@ def call_claude_streaming(
             ctype = chunk.get("type")
 
             if ctype == "stream_event" and (stop_sequences or stream_callback):
-                # Only present when --include-partial-messages was passed
-                # (see _build_claude_cmd), which happens when a `stop`
-                # sequence is set and/or a stream_callback was provided.
-                # Real token-level deltas -- verified live these interleave
+                # Real token-level deltas, only present when
+                # --include-partial-messages was passed. These interleave
                 # with, and arrive BEFORE, the full "assistant" chunk for
                 # the same content block: content_block_start ->
                 # content_block_delta(s) -> the full "assistant" chunk ->
                 # content_block_stop -> next content_block_start. That
                 # ordering is what makes resetting the per-block
-                # accumulator on content_block_start safe: the prior
-                # block's text has already been folded into text_parts by
-                # its "assistant" chunk before the next block starts.
-                #
-                # This is the actual fix for a real stop sequence only
-                # being detectable after an entire text block finished
-                # generating (and got billed): now a match can be caught
-                # mid-block, at real token granularity. It's also what
-                # delivers real client-facing streaming when
-                # stream_callback is set: each text_delta is forwarded to
-                # the caller immediately, as it's generated, instead of
-                # being held until the whole response completes.
+                # accumulator on content_block_start safe. This lets a
+                # stop sequence be caught mid-block instead of only after
+                # a full text block finishes, and is what delivers real
+                # client-facing streaming when stream_callback is set.
                 event = chunk.get("event", {})
                 etype = event.get("type")
                 if etype == "content_block_delta":
@@ -1140,19 +987,15 @@ def call_claude_streaming(
                         text_parts.append(content["text"])
                         # IMPORTANT: do NOT break here just because we saw
                         # text. Claude frequently narrates in one assistant
-                        # NDJSON message ("Sure! Let me check...") and
-                        # dispatches the actual tool_use in a SEPARATE,
-                        # LATER assistant message within the same turn --
-                        # verified live: a 3-message sequence of [thinking,
-                        # text, tool_use] is common. Breaking on the
-                        # text-only message (as an earlier version of this
-                        # function did) silently swallowed the tool_use
-                        # that followed 100% of the time in a 10/10
-                        # regression run. Keep reading; only stop early on
-                        # an actual tool_use/structured-output block below,
-                        # a stop-sequence match (checked right here), an
-                        # error, or the stream ending naturally (the
-                        # "result" chunk case further down).
+                        # NDJSON message and dispatches the actual tool_use
+                        # in a SEPARATE, later assistant message within the
+                        # same turn ([thinking, text, tool_use] is common).
+                        # Breaking on the text-only message silently
+                        # swallows the tool_use that follows. Keep reading;
+                        # only stop early on an actual tool_use/structured-
+                        # output block, a stop-sequence match, an error, or
+                        # the stream ending naturally (the "result" chunk
+                        # case further down).
                         if stop_sequences:
                             accumulated = "".join(text_parts)
                             matched_text, stop_matched = _apply_stop_sequences(accumulated, stop_sequences)
@@ -1171,7 +1014,7 @@ def call_claude_streaming(
                         else:
                             tool_calls.append(
                                 {
-                                    "id": content.get("id", f"toolu_{uuid.uuid4().hex[:20]}"),
+                                    "id": content.get("id", _gen_tool_id()),
                                     "name": strip_mcp_tool_prefix(name),
                                     "input": content.get("input", {}),
                                 }
@@ -1310,22 +1153,14 @@ def _build_openai_usage(usage_totals):
 
 
 # Bounded retries when tools were requested but Claude answered with plain
-# text instead of a real tool_use block (--disallowedTools + strong framing
-# gets ~40% single-shot native tool_use reliability, verified 6/15 over a
-# fair sample on 2026-08-12). Retrying turns that into a much higher
-# practical success rate at the cost of extra latency/spend only on the
-# failing path.
-#
-# Parameters were tuned to match the retry decorator found in an OLD,
-# now-deleted Cline commit (`@withRetry({maxRetries: 4, baseDelay: 2000,
-# maxDelay: 15000})`). Verified against Cline's CURRENT mainline
-# (2026-08-12): that file no longer exists -- Cline now delegates entirely
-# to a third-party npm package with no retry decorator of its own. Checked
-# the official @anthropic-ai/claude-agent-sdk too: it retries transport/API
-# errors only, not "model narrated instead of dispatching a tool" -- no
-# tool_choice:required-equivalent is exposed through the harness. No
-# deterministic fix exists anywhere in this ecosystem for this failure
-# mode; every implementation that handles it does so with a retry loop.
+# text instead of a real tool_use block (~40% single-shot native tool_use
+# reliability with --disallowedTools + strong framing). Retrying turns
+# that into a much higher practical success rate at the cost of extra
+# latency/spend only on the failing path. No deterministic fix exists for
+# this failure mode anywhere in the Claude Code ecosystem (checked
+# @anthropic-ai/claude-agent-sdk: retries transport/API errors only, no
+# tool_choice:required-equivalent); every implementation handles it with
+# a retry loop.
 TOOL_CALL_MAX_RETRIES = 4
 TOOL_CALL_BASE_DELAY_S = 2.0
 TOOL_CALL_MAX_DELAY_S = 15.0
@@ -1401,26 +1236,19 @@ def call_claude_with_tool_retry(
     return result, cur_mode, cur_id
 
 
-# Sampling/formatting parameters that have NO equivalent anywhere in the
-# Claude Code CLI (checked `claude --help` and the official env-vars
-# docs, 2026-08-13): no flag, no env var, nothing. `--effort
-# <low|medium|high|max>` (Claude Code's reasoning-effort knob) IS now
-# mapped, but only from OpenRouter's `reasoning` parameter (see
-# resolve_reasoning_effort) -- a genuinely different axis (how much
-# internal deliberation the model does) from output randomness/
-# diversity, so it is NOT treated as a substitute for temperature/top_p
-# below.
+# Sampling/formatting parameters with no equivalent anywhere in the
+# Claude Code CLI: no flag, no env var. `--effort <low|medium|high|max>`
+# (reasoning-effort) IS mapped, but only from OpenRouter's `reasoning`
+# parameter (see resolve_reasoning_effort) -- a different axis (internal
+# deliberation) from output randomness/diversity, so it's not treated as
+# a substitute for temperature/top_p below.
 #
 # These are silently accepted (never hard-errored) because real OpenAI
 # clients routinely send explicit defaults on every request (e.g.
-# `temperature: 1.0`, which IS the OpenAI default and carries no signal
-# that the caller actually wants non-default sampling behavior) -- hard
-# erroring on presence-of-key rather than meaningfully-different-value
-# would break compatibility with a huge fraction of well-behaved clients
-# for zero practical benefit. A stderr warning (not a client-visible
-# error) is emitted once per parameter name observed, so operators running
-# this shim can tell that a request asked for something it can't honor,
-# without breaking the request.
+# `temperature: 1.0`, the OpenAI default itself, carries no signal the
+# caller wants non-default behavior) -- hard-erroring on presence-of-key
+# would break compatibility with well-behaved clients for no benefit. A
+# one-time stderr warning per parameter name is emitted instead.
 _UNSUPPORTED_SAMPLING_PARAMS = (
     "temperature", "top_p", "seed", "logprobs", "top_logprobs",
     "presence_penalty", "frequency_penalty", "logit_bias",
@@ -1462,6 +1290,44 @@ def _apply_stop_sequences(text, stop):
     if earliest is None:
         return text, False
     return text[:earliest], True
+
+
+def _build_sse_chunk(chat_id, created, model, index, delta, finish=None):
+    """Shared shape for an OpenAI `chat.completion.chunk` SSE event, used
+    by both the real-token streaming path and the buffered-then-emit
+    streaming path."""
+    return {
+        "id": chat_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": index, "delta": delta, "finish_reason": finish}],
+    }
+
+
+@contextmanager
+def _scoped_env_overrides(env_overrides):
+    """Temporarily patches subprocess.Popen so any process it spawns
+    while this context is active inherits `env_overrides` merged into
+    the current environment. Used to scope CLAUDE_CODE_MAX_OUTPUT_TOKENS
+    (from `max_tokens`) to a single completion's subprocess call without
+    mutating the shim's own process-wide environment."""
+    if not env_overrides:
+        yield
+        return
+    original_popen = subprocess.Popen
+
+    def scoped_popen(*args, **kwargs):
+        env = dict(os.environ)
+        env.update(env_overrides)
+        kwargs["env"] = env
+        return original_popen(*args, **kwargs)
+
+    subprocess.Popen = scoped_popen
+    try:
+        yield
+    finally:
+        subprocess.Popen = original_popen
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1543,16 +1409,12 @@ class Handler(BaseHTTPRequestHandler):
             json_schema = {"type": "object"}
 
         system_prompt = system_prompt_from_messages(messages)
-        # Native MCP tool registration (see build_mcp_tool_config) is the
-        # real fix for tool-call reliability and is always attempted first
-        # inside call_claude_streaming/_run_one_completion. The prose
-        # fallback below is only actually NEEDED when a tool name can't be
-        # represented as a valid MCP tool name (see
-        # build_mcp_tool_manifest) -- checked here up front so the prompt
-        # doesn't carry redundant tool descriptions on the common path
-        # where MCP registration succeeds (call_claude_streaming would
-        # otherwise silently prefer MCP anyway, but doubling up the prose
-        # description wastes prompt-cache-relevant tokens for no benefit).
+        # Native MCP tool registration is the real fix for tool-call
+        # reliability and is always attempted first inside
+        # call_claude_streaming/_run_one_completion. The prose fallback
+        # below is only needed when a tool name can't be represented as a
+        # valid MCP tool name -- checked here up front so the prompt
+        # doesn't carry redundant tool descriptions on the common path.
         if effective_tools and build_mcp_tool_manifest(effective_tools) is None:
             system_prompt = render_tools_into_system_prompt(effective_tools, system_prompt)
 
@@ -1566,16 +1428,14 @@ class Handler(BaseHTTPRequestHandler):
         _warn_unsupported_sampling_params(payload)
 
         # Real token-level streaming is only safe for the single-choice,
-        # no-tools-requested, no-json_schema, no-reasoning path: with tool
-        # retry in play, a failed attempt's narration text must not reach
-        # the client before the shim knows to discard it and retry,
-        # --json-schema's multi-turn corrective mechanism doesn't map
-        # cleanly onto a single token stream either, and reasoning
-        # (--effort) requires capturing the `thinking` block BEFORE the
-        # `text` block starts (see build_reasoning_details), which
-        # _handle_streaming_completion's stream_callback (text_delta only)
-        # has no hook for. Every other combination falls back to the
-        # existing buffered-then-emit behavior (SSE framing is still
+        # no-tools, no-json_schema, no-reasoning path: with tool retry in
+        # play, a failed attempt's narration text must not reach the
+        # client early; --json-schema's multi-turn corrective mechanism
+        # doesn't map onto a single token stream; and reasoning requires
+        # capturing the `thinking` block before `text` starts (see
+        # build_reasoning_details), which the buffered path's
+        # text_delta-only stream_callback has no hook for. Everything
+        # else falls back to buffered-then-emit (SSE framing still
         # correct, just not real-time).
         can_stream_live = stream and n == 1 and not effective_tools and json_schema is None and effort is None
         if can_stream_live:
@@ -1707,13 +1567,7 @@ class Handler(BaseHTTPRequestHandler):
         role_sent = False
 
         def emit(delta, finish=None):
-            chunk = {
-                "id": chat_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
-            }
+            chunk = _build_sse_chunk(chat_id, created, model, 0, delta, finish)
             try:
                 self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
                 self.wfile.flush()
@@ -1728,22 +1582,14 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 emit({"content": text_piece})
 
-        original_popen = subprocess.Popen
-        if env_overrides:
-            def scoped_popen(*args, **kwargs):
-                env = dict(os.environ)
-                env.update(env_overrides)
-                kwargs["env"] = env
-                return original_popen(*args, **kwargs)
-            subprocess.Popen = scoped_popen
-
         try:
-            result = call_claude_streaming(
-                delta_claude_messages, system_prompt, model,
-                session_mode=session_mode, session_id=session_id,
-                tools_requested=False, stop=stop,
-                stream_callback=on_text_delta,
-            )
+            with _scoped_env_overrides(env_overrides):
+                result = call_claude_streaming(
+                    delta_claude_messages, system_prompt, model,
+                    session_mode=session_mode, session_id=session_id,
+                    tools_requested=False, stop=stop,
+                    stream_callback=on_text_delta,
+                )
         except ClaudeCliError as e:
             # Headers are already sent by this point (SSE has to commit to
             # a 200 before any content is known) -- an OpenAI SSE client
@@ -1752,9 +1598,6 @@ class Handler(BaseHTTPRequestHandler):
             emit({"content": f"\n\n[error: {e.message}]"}, finish="stop")
             self.wfile.write(b"data: [DONE]\n\n")
             return
-        finally:
-            if env_overrides:
-                subprocess.Popen = original_popen
 
         if not role_sent:
             # No text ever arrived (e.g. immediate stop-sequence match on
@@ -1790,16 +1633,7 @@ class Handler(BaseHTTPRequestHandler):
                 stop=stop, effort=effort,
             )
 
-        original_popen = subprocess.Popen
-        if env_overrides:
-            def scoped_popen(*args, **kwargs):
-                env = dict(os.environ)
-                env.update(env_overrides)
-                kwargs["env"] = env
-                return original_popen(*args, **kwargs)
-            subprocess.Popen = scoped_popen
-
-        try:
+        with _scoped_env_overrides(env_overrides):
             if json_schema is not None:
                 # Structured output doesn't go through the tool-call retry
                 # loop -- --json-schema uses its own internal mechanism
@@ -1813,9 +1647,6 @@ class Handler(BaseHTTPRequestHandler):
                 tools_requested=tools_requested, session_mode=session_mode, session_id=session_id,
                 tools=tools, stop=stop, effort=effort,
             )
-        finally:
-            if env_overrides:
-                subprocess.Popen = original_popen
 
 
     def _send_stream_chunks(self, model, choices):
@@ -1833,13 +1664,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
         def emit(index, delta, finish=None):
-            chunk = {
-                "id": chat_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{"index": index, "delta": delta, "finish_reason": finish}],
-            }
+            chunk = _build_sse_chunk(chat_id, created, model, index, delta, finish)
             self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
 
         for c in choices:
