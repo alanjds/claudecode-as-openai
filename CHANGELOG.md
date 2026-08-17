@@ -121,3 +121,42 @@ _Unreleased_
   correctly via `curl` against `/v1/chat/completions`, each confirmed by
   asking the model to self-report its exact version string. Added 6 new
   unit tests. Full suite now 73 tests (was 67), all passing.
+* OpenRouter (https://openrouter.ai) reasoning-tokens compatibility:
+  `resolve_reasoning_effort()` maps OpenRouter's `reasoning` request
+  parameter (`{"effort": "high"}`, `{"max_tokens": N}`, or
+  `{"enabled": true}`) onto Claude Code's own `--effort
+  <low|medium|high|max>` flag, clamping OpenRouter's wider effort
+  vocabulary (`none`/`minimal`/`xhigh`) to the nearest accepted value
+  since `--effort` only accepts exactly those four levels (verified
+  live: anything else is rejected outright). Verified live via a
+  stream-json capture that `--effort` genuinely produces real
+  `thinking` content blocks (with a cryptographic `signature` field)
+  ahead of the final `text` block, not a cosmetic no-op -- these are
+  now captured (previously silently discarded) and surfaced back as
+  both of OpenRouter's supported response shapes:
+  `message.reasoning` (plaintext) and `message.reasoning_details`
+  (structured array, `type: "reasoning.text"`,
+  `format: "anthropic-claude-v1"`, signature preserved). Verified live
+  end-to-end through the actual running shim: a real request with
+  `reasoning: {"effort": "high"}` returned genuine thinking content in
+  both fields with a real signature attached; a plain request with no
+  `reasoning` key carried neither field. Live token-level SSE streaming
+  is skipped whenever `reasoning` is set (falls back to the existing
+  buffered path) since the streaming callback only hooks `text_delta`
+  events and correctly ordering `thinking` before `text` needs a second
+  callback path not currently wired up.
+* OpenAI-shaped nested usage details: `_build_openai_usage()` adds
+  `usage.prompt_tokens_details.cached_tokens` (OpenAI's actual
+  documented shape) alongside the existing flat
+  `cache_read_input_tokens`/`cache_creation_input_tokens` custom keys
+  (kept for backward compatibility), so clients/dashboards that
+  specifically parse OpenAI's standard nested usage structure get real
+  numbers instead of ignoring a field they don't recognize.
+  `completion_tokens_details.reasoning_tokens` is intentionally NOT
+  added -- Claude Code's usage payload has no separate reasoning-token
+  count (verified live: `output_tokens` already includes any
+  thinking-block tokens, undifferentiated), so there's no honest number
+  to report there.
+* Added 14 new unit tests covering `resolve_reasoning_effort`,
+  `build_reasoning_details`, and `_build_openai_usage`. Full suite now
+  87 tests (was 73), all passing.

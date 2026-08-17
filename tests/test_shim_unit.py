@@ -925,5 +925,97 @@ class TestNormalizeModelName(unittest.TestCase):
         self.assertEqual(shim.normalize_model_name(""), "")
 
 
+class TestResolveReasoningEffort(unittest.TestCase):
+    """OpenRouter (https://openrouter.ai) `reasoning` parameter
+    compatibility -- translates it into Claude Code's own `--effort
+    <low|medium|high|max>` flag. --effort's accepted vocabulary (verified
+    live, 2026-08-16: `claude --effort <x> -p` rejects anything other
+    than low/medium/high/max outright) is narrower than OpenRouter's, so
+    values outside that set get clamped to the nearest accepted level."""
+
+    def test_no_reasoning_key_returns_none(self):
+        self.assertIsNone(shim.resolve_reasoning_effort({"model": "sonnet"}))
+
+    def test_effort_none_disables_reasoning(self):
+        self.assertIsNone(shim.resolve_reasoning_effort({"reasoning": {"effort": "none"}}))
+
+    def test_effort_values_map_correctly(self):
+        self.assertEqual(shim.resolve_reasoning_effort({"reasoning": {"effort": "low"}}), "low")
+        self.assertEqual(shim.resolve_reasoning_effort({"reasoning": {"effort": "medium"}}), "medium")
+        self.assertEqual(shim.resolve_reasoning_effort({"reasoning": {"effort": "high"}}), "high")
+        self.assertEqual(shim.resolve_reasoning_effort({"reasoning": {"effort": "max"}}), "max")
+
+    def test_effort_minimal_and_xhigh_clamp_to_nearest(self):
+        self.assertEqual(shim.resolve_reasoning_effort({"reasoning": {"effort": "minimal"}}), "low")
+        self.assertEqual(shim.resolve_reasoning_effort({"reasoning": {"effort": "xhigh"}}), "max")
+
+    def test_max_tokens_bands_map_to_effort(self):
+        self.assertEqual(shim.resolve_reasoning_effort({"reasoning": {"max_tokens": 500}}), "low")
+        self.assertEqual(shim.resolve_reasoning_effort({"reasoning": {"max_tokens": 2000}}), "medium")
+        self.assertEqual(shim.resolve_reasoning_effort({"reasoning": {"max_tokens": 5000}}), "high")
+        self.assertEqual(shim.resolve_reasoning_effort({"reasoning": {"max_tokens": 10000}}), "max")
+
+    def test_enabled_true_alone_maps_to_medium(self):
+        self.assertEqual(shim.resolve_reasoning_effort({"reasoning": {"enabled": True}}), "medium")
+
+    def test_enabled_false_disables_reasoning(self):
+        self.assertIsNone(shim.resolve_reasoning_effort({"reasoning": {"enabled": False}}))
+
+    def test_non_dict_reasoning_returns_none(self):
+        self.assertIsNone(shim.resolve_reasoning_effort({"reasoning": "high"}))
+        self.assertIsNone(shim.resolve_reasoning_effort({}))
+
+
+class TestBuildReasoningDetails(unittest.TestCase):
+    """OpenRouter's `reasoning_details` array shape
+    (https://openrouter.ai/docs/guides/best-practices/reasoning-tokens),
+    built from a captured Claude `thinking` block."""
+
+    def test_none_reasoning_text_returns_none(self):
+        self.assertIsNone(shim.build_reasoning_details(None, None))
+        self.assertIsNone(shim.build_reasoning_details("", None))
+
+    def test_builds_reasoning_text_detail(self):
+        details = shim.build_reasoning_details("step 1...", "sig-abc")
+        self.assertEqual(len(details), 1)
+        self.assertEqual(details[0]["type"], "reasoning.text")
+        self.assertEqual(details[0]["text"], "step 1...")
+        self.assertEqual(details[0]["signature"], "sig-abc")
+        self.assertEqual(details[0]["format"], "anthropic-claude-v1")
+
+    def test_signature_can_be_none(self):
+        details = shim.build_reasoning_details("step 1...", None)
+        self.assertIsNone(details[0]["signature"])
+
+
+class TestBuildOpenaiUsage(unittest.TestCase):
+    """OpenAI's nested usage.prompt_tokens_details.cached_tokens shape
+    (https://platform.openai.com/docs/api-reference/chat/object), built
+    alongside this shim's existing flat custom usage keys."""
+
+    def test_adds_nested_prompt_tokens_details(self):
+        usage = shim._build_openai_usage({
+            "prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150,
+            "cache_read_input_tokens": 40, "cache_creation_input_tokens": 10,
+        })
+        self.assertEqual(usage["prompt_tokens_details"], {"cached_tokens": 40})
+
+    def test_flat_custom_keys_preserved(self):
+        usage = shim._build_openai_usage({
+            "prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150,
+            "cache_read_input_tokens": 40, "cache_creation_input_tokens": 10,
+        })
+        self.assertEqual(usage["cache_read_input_tokens"], 40)
+        self.assertEqual(usage["cache_creation_input_tokens"], 10)
+        self.assertEqual(usage["prompt_tokens"], 100)
+
+    def test_zero_cache_read_still_present(self):
+        usage = shim._build_openai_usage({
+            "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+        })
+        self.assertEqual(usage["prompt_tokens_details"], {"cached_tokens": 0})
+
+
 if __name__ == "__main__":
     unittest.main()

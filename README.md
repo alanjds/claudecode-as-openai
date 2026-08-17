@@ -32,7 +32,9 @@ implemented / silently ignored.
 | `stop` (stop sequences) | ✅ | Claude Code has no native stop-sequence flag, so this is implemented as **real early termination**, not just post-hoc truncation: with `--include-partial-messages` (enabled whenever `stop` is set and/or real streaming is active), the shim reads real token-level `content_block_delta` events and kills the `claude` subprocess (`proc.terminate()`) the instant a stop sequence appears in the accumulated text -- before the rest of the response is generated or billed. Verified live: a 500-word-story prompt took 22.3s with no stop sequence vs 4.9s with one that matched early in the output (~4.5x faster, plus the unbilled remainder of the response), and 5.2s when combined with real streaming. A message-level check remains as a safety net for edge cases (e.g. the overall timeout firing first). One accepted tradeoff: when the match spans across two token-level deltas, the client may have already received a few extra characters in the delta that completes the match, before the shim could detect it -- the FINAL recorded/session-cached text is still correctly truncated either way, only the live SSE stream itself briefly shows a few extra characters in that edge case. |
 | `n` (multiple choices) | ⚠️ | Implemented up to a bounded limit (`MAX_N_CHOICES`, currently 5) -- each choice is a fully independent fresh Claude Code subprocess call (no session caching across choices, by design: parallel-choice semantics don't fit single-session continuity). Requests above the limit get a proper `400 invalid_request_error`, not silent truncation. |
 | `response_format: {"type": "json_object"}` / `{"type": "json_schema", ...}` | ✅ | Mapped to `--json-schema` (a real Claude Code flag). `json_object` maps to an open `{"type": "object"}` schema; `json_schema` passes the caller's schema through directly. Requires `--max-turns 3` internally (Claude Code's own corrective retry mechanism via an internal `StructuredOutput` tool) -- verified empirically that `max_turns 1` leaves it hanging at `error_max_turns` with the schema never actually produced. Verified live: returns genuinely valid, parseable JSON, not markdown-fenced. |
-| `temperature`, `top_p`, `seed`, `logprobs`, `presence_penalty`/`frequency_penalty`, `logit_bias` | ⚠️ | Genuine CLI limitation, not a shim gap -- no equivalent flags exist anywhere in Claude Code (checked `claude --help` and the official env-vars docs). The closest available knob is `--effort <low|medium|high|max>` (reasoning effort, not sampling temperature -- a different axis, not currently wired up, since it isn't a real substitute). These are silently **accepted** (never hard-errored -- real OpenAI clients routinely send explicit defaults like `temperature: 1.0` on every request, which carries no signal the caller actually wants non-default behavior, so erroring on presence would break compatibility for no benefit) but a one-time-per-parameter-name warning is written to the shim's own stderr (`claudecode-as-openai: warning: '<param>' was requested but Claude Code has no equivalent...`) so an operator running the shim can tell a request asked for something it can't honor. |
+| `temperature`, `top_p`, `seed`, `logprobs`, `presence_penalty`/`frequency_penalty`, `logit_bias` | ⚠️ | Genuine CLI limitation, not a shim gap -- no equivalent flags exist anywhere in Claude Code (checked `claude --help` and the official env-vars docs). These are silently **accepted** (never hard-errored -- real OpenAI clients routinely send explicit defaults like `temperature: 1.0` on every request, which carries no signal the caller actually wants non-default behavior, so erroring on presence would break compatibility for no benefit) but a one-time-per-parameter-name warning is written to the shim's own stderr (`claudecode-as-openai: warning: '<param>' was requested but Claude Code has no equivalent...`) so an operator running the shim can tell a request asked for something it can't honor. |
+| `reasoning` (OpenRouter reasoning-tokens) | ✅ | Mapped to Claude Code's own `--effort <low\|medium\|high\|max>` flag -- see "OpenRouter reasoning-tokens compatibility" below. Verified live: setting `reasoning.effort` genuinely produces real extended-thinking content, surfaced back to the client as `message.reasoning` (plaintext) and `message.reasoning_details` (OpenRouter's structured array shape, signature preserved). |
+| `usage.prompt_tokens_details.cached_tokens` | ✅ | The shim already tracks real prompt-cache-hit counts internally (`cache_read_input_tokens`); now also emitted in OpenAI's actual nested shape (`usage.prompt_tokens_details.cached_tokens`) alongside the existing flat custom field, so clients that specifically parse the standard nested structure (several cost-tracking dashboards/proxies do) get real numbers instead of ignoring a field they don't recognize. `completion_tokens_details.reasoning_tokens` is intentionally NOT fabricated -- Claude Code's usage payload has no separate reasoning-token count (verified live: `output_tokens` already includes any thinking-block tokens, undifferentiated), so no honest number exists to report there. |
 | Vision / image content blocks | ❌ | Silently dropped. `_flatten_content()` only extracts `type: "text"` blocks from multi-part content; `image_url` blocks are discarded with no error, no warning, no image ever reaching Claude. |
 | Local MCP tool leakage | ✅ **fixed** | `--disallowedTools` alone only blocks Claude Code's own named built-ins (Bash, Read, Write, etc.) -- it does nothing against MCP servers configured in the invoking user's local `~/.claude` settings, which could otherwise be dispatched unpredictably even on a request that declared no tools. Fixed for the no-tools-requested path via `--tools "" --strict-mcp-config --mcp-config '{"mcpServers":{}}'` together (verified: `--tools ""` alone still leaked real MCP tool calls; the combination gets `tools available: []`, fully closed). Note: when tools ARE requested, native `tool_use` dispatch is still used (see "Current approach" below) and this full lockdown does not apply there. |
 | CWD / local file exposure | ✅ **fixed** | Every spawned `claude` subprocess previously inherited the shim's own working directory, and Claude Code is aware of and can reference real files there (confirmed live: a "list files using any tool you have" request surfaced real project file references). Fixed by spawning every `claude` call with `cwd=` pointed at a dedicated, empty, per-run sandbox temp directory instead. |
@@ -119,6 +121,89 @@ caller might send by mistake) passes through completely unchanged --
 this is a compatibility translation layer, not a validator, and errors
 on an unrecognized model are left to Claude Code's own real error
 response (see "Error responses" above).
+
+## OpenRouter reasoning-tokens compatibility
+
+OpenRouter's `reasoning` request parameter
+(https://openrouter.ai/docs/guides/best-practices/reasoning-tokens) is
+how OpenAI-shaped clients ask a model to think step-by-step and get
+that thinking back in the response. Claude Code's own equivalent is
+`--effort <low|medium|high|max>` -- verified live (via a stream-json
+capture with a math prompt) that setting `--effort` genuinely produces
+real `thinking` content blocks (each with a cryptographic `signature`
+field) ahead of the final `text` block, not a cosmetic no-op.
+
+`resolve_reasoning_effort()` extracts an effort level from either of
+OpenRouter's real request shapes:
+
+- `{"reasoning": {"effort": "high"}}` -- mapped directly. `--effort`
+  only accepts exactly `low`/`medium`/`high`/`max` (verified live:
+  `none`, `minimal`, and `xhigh` are all rejected outright with
+  `"argument ... is invalid. It must be one of: low, medium, high,
+  max"`), so OpenRouter's wider vocabulary is clamped to the nearest
+  accepted value (`minimal` -> `low`, `xhigh` -> `max`) rather than
+  passed through and erroring the whole request. `effort: "none"`
+  disables reasoning entirely (no `--effort` flag at all).
+- `{"reasoning": {"max_tokens": N}}` -- Anthropic-style token budget,
+  approximated to an effort level via banding, since Claude Code's `-p`
+  mode has no raw token-budget flag to pass this through to directly.
+- `{"reasoning": {"enabled": true}}` alone -> `medium`, matching
+  OpenRouter's own documented default.
+
+The captured `thinking` text (plus its signature) is surfaced back to
+the client as both of OpenRouter's supported response shapes:
+`message.reasoning` (a plain string, for simple consumers) and
+`message.reasoning_details` (the structured array shape, type
+`reasoning.text`, `format: "anthropic-claude-v1"` -- the exact format
+OpenRouter itself uses to tag real Anthropic thinking blocks, signature
+preserved for consumers that round-trip reasoning back into a
+follow-up request). Neither field is present at all when no reasoning
+was requested or none was produced, rather than emitting an empty
+placeholder.
+
+`reasoning.exclude: true` (OpenRouter's "think but don't show me")
+is accepted but not enforced -- Claude Code has no mechanism to reason
+internally while withholding the thinking block from the transcript,
+so this shim's reasoning is always returned when requested.
+
+Verified live end-to-end through the actual running shim: a real
+`curl` request with `reasoning: {"effort": "high"}` against
+`/v1/chat/completions` returned a genuine `thinking` block's content in
+both `message.reasoning` and `message.reasoning_details[0].text`, with
+a real signature attached; a plain request with no `reasoning` key
+carried neither field at all.
+
+One consequence: live token-level SSE streaming (see "Real streaming"
+below) is skipped whenever `reasoning` is set, falling back to the
+existing buffered-then-emit behavior. The streaming path's
+`stream_callback` only hooks `text_delta` events, and correctly
+capturing the `thinking` block requires seeing it arrive BEFORE the
+`text` block starts -- adding a second callback path for
+`thinking_delta` was judged not worth the complexity for what is, in
+practice, a fairly rare combination (reasoning + real-time streaming
+UI) versus every other already-working combination.
+
+## Usage reporting: OpenAI's nested `usage.prompt_tokens_details` shape
+
+This shim has tracked real prompt-cache-hit/-creation counts internally
+since the session-caching work (`cache_read_input_tokens`,
+`cache_creation_input_tokens`), but previously only exposed them as
+flat custom keys on the `usage` object -- a shape most OpenAI-facing
+tooling doesn't recognize. `_build_openai_usage()` now ALSO nests the
+cache-read count into OpenAI's actual documented shape,
+`usage.prompt_tokens_details.cached_tokens`
+(https://platform.openai.com/docs/api-reference/chat/object), so
+clients/dashboards that specifically parse that nested structure get
+real numbers instead of silently ignoring a field they don't
+recognize. The flat custom keys are kept unchanged for backward
+compatibility with anything already reading them directly.
+
+`usage.completion_tokens_details.reasoning_tokens` is intentionally NOT
+fabricated: Claude Code's own `usage` payload has no separate
+reasoning-token count (verified live -- `output_tokens` already
+includes any thinking-block tokens, undifferentiated), so there is no
+honest number to report there. Making one up would be exactly the kind
+of unmeasured-estimate-presented-as-fact this project avoids.
 
 ## Hook/settings isolation: `--setting-sources ""`, not `--bare`
 

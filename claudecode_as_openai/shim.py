@@ -157,6 +157,84 @@ def normalize_model_name(model):
     return normalized
 
 
+# OpenRouter reasoning-tokens compatibility (2026-08-14). OpenRouter's
+# `reasoning` request parameter (https://openrouter.ai/docs/guides/best-
+# practices/reasoning-tokens) is how OpenAI-shaped clients ask a model to
+# think step-by-step and get that thinking back. Claude Code's own
+# equivalent is `--effort <low|medium|high|max>` -- verified live (via a
+# stream-json capture with a math prompt) that setting `--effort` genuinely
+# produces real `thinking` content blocks (with a `signature` field) ahead
+# of the final `text` block, not just a cosmetic flag.
+#
+# `--effort` only accepts exactly low/medium/high/max (verified live:
+# "none", "minimal", and "xhigh" are all rejected outright with "argument
+# ... is invalid. It must be one of: low, medium, high, max") -- so
+# OpenRouter's wider effort vocabulary is clamped down to the nearest
+# accepted value rather than passed through and erroring the whole
+# request.
+_REASONING_EFFORT_MAP = {
+    "none": None,        # reasoning explicitly disabled -- no --effort flag at all
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+}
+
+
+def resolve_reasoning_effort(payload):
+    """Extract Claude Code's `--effort` value (or None for "no reasoning
+    requested") from an OpenAI/OpenRouter-shaped request payload.
+
+    Supports both of OpenRouter's real request shapes for this
+    (https://openrouter.ai/docs/guides/best-practices/reasoning-tokens):
+    - `{"reasoning": {"effort": "high"}}` -- effort string, clamped via
+      _REASONING_EFFORT_MAP.
+    - `{"reasoning": {"max_tokens": N}}` -- Anthropic-style token budget;
+      approximated to an effort level using OpenRouter's own documented
+      percentage bands (each effort level's stated % of some overall
+      token budget), since Claude Code's -p mode has no raw token-budget
+      equivalent to pass through directly.
+    - `{"reasoning": {"enabled": true}}` alone (no effort/max_tokens) ->
+      "medium", matching OpenRouter's own documented default.
+    - `{"reasoning": {"exclude": true}}` -- accepted but NOT enforced:
+      Claude Code has no mechanism to reason internally while witholding
+      the thinking blocks from the transcript, so this shim's reasoning
+      is always returned when requested (see build_reasoning_details()).
+
+    Returns None when no `reasoning` key is present, or when
+    `reasoning.effort` is explicitly "none".
+    """
+    reasoning = payload.get("reasoning")
+    if not isinstance(reasoning, dict):
+        return None
+    if reasoning.get("enabled") is False:
+        return None
+    effort = reasoning.get("effort")
+    if effort is not None:
+        return _REASONING_EFFORT_MAP.get(str(effort).lower(), "medium")
+    max_tokens = reasoning.get("max_tokens")
+    if isinstance(max_tokens, (int, float)) and max_tokens > 0:
+        # OpenRouter's own documented effort/token-budget percentage
+        # bands (see reasoning-tokens docs): low ~20%, medium ~50%,
+        # high ~80%, max ~95% of an overall budget. Without a concrete
+        # overall budget to divide by, treat the raw token count itself
+        # against the same band thresholds as a reasonable proxy --
+        # this is a best-effort approximation, not an exact mapping,
+        # since Claude Code has no raw reasoning-token-budget flag.
+        if max_tokens >= 8000:
+            return "max"
+        if max_tokens >= 4000:
+            return "high"
+        if max_tokens >= 1000:
+            return "medium"
+        return "low"
+    if reasoning.get("enabled"):
+        return "medium"
+    return None
+
+
 # Claude Code's OAuth credentials (subscription auth, NOT an API key) --
 # used to authenticate the real Anthropic /v1/models call in
 # fetch_model_list() so /v1/models can return the actual current model
@@ -727,7 +805,7 @@ def _iter_ndjson_lines_pty(master_fd, proc, timeout_s):
                 continue
 
 
-def _build_claude_cmd(model, session_mode, session_id, tools_requested, max_turns, json_schema, want_partial_messages=False, mcp_tool_config=None):
+def _build_claude_cmd(model, session_mode, session_id, tools_requested, max_turns, json_schema, want_partial_messages=False, mcp_tool_config=None, effort=None):
     cmd = [CLAUDE_BIN]
     # Exclude user/project/local settings.json entirely -- this is what
     # actually prevents locally-configured SessionStart/other hooks from
@@ -800,6 +878,8 @@ def _build_claude_cmd(model, session_mode, session_id, tools_requested, max_turn
         cmd += ["--session-id", session_id]
     if model:
         cmd += ["--model", model]
+    if effort:
+        cmd += ["--effort", effort]
     if json_schema is not None:
         cmd += ["--json-schema", json.dumps(json_schema)]
     cmd += ["-p"]
@@ -817,6 +897,7 @@ def call_claude_streaming(
     json_schema=None,
     stop=None,
     stream_callback=None,
+    effort=None,
 ):
     """Spawn `claude -p` in native stream-json mode, feed the message array
     on stdin, and return as soon as a usable assistant message (text and/or
@@ -887,7 +968,7 @@ def call_claude_streaming(
     cmd = _build_claude_cmd(
         model, session_mode, session_id, tools_requested, max_turns, json_schema,
         want_partial_messages=bool(stop_sequences) or stream_callback is not None,
-        mcp_tool_config=mcp_tool_config,
+        mcp_tool_config=mcp_tool_config, effort=effort,
     )
     if system_prompt:
         if len(system_prompt) > 4000:
@@ -946,6 +1027,8 @@ def call_claude_streaming(
         proc.stdin.close()
 
         text_parts = []
+        reasoning_parts = []
+        reasoning_signature = None
         tool_calls = []
         structured_json = None
         usage = {}
@@ -1038,6 +1121,21 @@ def call_claude_streaming(
                 got_tool_use = False
                 for content in message.get("content", []):
                     ctype2 = content.get("type")
+                    if ctype2 == "thinking" and content.get("thinking"):
+                        # Real extended-thinking output, only present when
+                        # --effort was passed (see resolve_reasoning_effort
+                        # in _handle_chat_completion) -- verified live via
+                        # a stream-json capture with a math prompt: setting
+                        # --effort genuinely produces this block (with a
+                        # real `signature` field) ahead of the final `text`
+                        # block, not a cosmetic no-op. Surfaced back to the
+                        # caller as OpenRouter's `reasoning`/
+                        # `reasoning_details` shape -- see
+                        # build_reasoning_details().
+                        reasoning_parts.append(content["thinking"])
+                        if content.get("signature"):
+                            reasoning_signature = content["signature"]
+                        continue
                     if ctype2 == "text" and content.get("text"):
                         text_parts.append(content["text"])
                         # IMPORTANT: do NOT break here just because we saw
@@ -1079,8 +1177,10 @@ def call_claude_streaming(
                                 }
                             )
                             got_tool_use = True
-                    # "thinking"/"redacted_thinking" blocks are intentionally
-                    # ignored -- they carry no answer content.
+                    # "redacted_thinking" blocks (safety-redacted reasoning,
+                    # content deliberately withheld by Anthropic) are still
+                    # intentionally ignored -- there is no real content to
+                    # surface. Real "thinking" blocks are captured above.
                 if usage_data := message.get("usage"):
                     usage = usage_data
                 if got_tool_use or stop_matched:
@@ -1107,6 +1207,8 @@ def call_claude_streaming(
                 "usage": usage,
                 "finish_reason": "stop",
                 "structured_json": structured_json,
+                "reasoning": None,
+                "reasoning_signature": None,
             }
 
         return {
@@ -1116,6 +1218,8 @@ def call_claude_streaming(
             "finish_reason": finish_reason,
             "structured_json": None,
             "stop_matched": stop_matched,
+            "reasoning": "".join(reasoning_parts) or None,
+            "reasoning_signature": reasoning_signature,
         }
     finally:
         # Terminating here (rather than letting the subprocess run to its
@@ -1149,6 +1253,60 @@ def call_claude_streaming(
                 os.unlink(mcp_tool_config["manifest_path"])
             except OSError:
                 pass
+
+
+def build_reasoning_details(reasoning_text, signature):
+    """Build OpenRouter's `reasoning_details` array shape
+    (https://openrouter.ai/docs/guides/best-practices/reasoning-tokens)
+    from a captured Claude `thinking` block. Returns None when there's no
+    reasoning text (either --effort wasn't set, or the model didn't
+    produce any), so callers can omit the field entirely rather than
+    emit an empty array.
+
+    Uses the `reasoning.text` detail type (the raw-text variant, per
+    OpenRouter's documented schema) with `format: "anthropic-claude-v1"`,
+    which is the exact format OpenRouter itself uses to tag real
+    Anthropic thinking blocks. The `signature` field is Claude's own
+    cryptographic signature over the thinking block (verified present on
+    every live `thinking` block captured with --effort set) -- passed
+    through as-is since it's an opaque per-block token, not something
+    this shim can or should regenerate."""
+    if not reasoning_text:
+        return None
+    return [
+        {
+            "type": "reasoning.text",
+            "text": reasoning_text,
+            "signature": signature,
+            "format": "anthropic-claude-v1",
+        }
+    ]
+
+
+def _build_openai_usage(usage_totals):
+    """Reshape this shim's internal flat usage dict (real numbers, custom
+    field names -- cache_read_input_tokens/cache_creation_input_tokens)
+    into a superset that ALSO carries OpenAI/OpenRouter's actual nested
+    `usage.prompt_tokens_details.cached_tokens` shape
+    (https://platform.openai.com/docs/api-reference/chat/object), so
+    clients that specifically parse that nested structure (several cost-
+    tracking dashboards and proxies do) get real numbers instead of
+    silently ignoring a custom field they don't recognize. The flat
+    custom keys are kept too, unchanged, for backward compatibility with
+    anything already reading them directly.
+
+    `cached_tokens` maps from cache_read_input_tokens -- an actual
+    served-from-cache count, which is exactly what OpenAI's field means.
+    `completion_tokens_details.reasoning_tokens` is intentionally omitted:
+    Claude Code's usage payload has no separate reasoning-token count
+    (verified live -- the `usage` block's `output_tokens` already
+    includes any thinking-block tokens, undifferentiated), so fabricating
+    a split would be a made-up number, not a real one."""
+    usage = dict(usage_totals)
+    usage["prompt_tokens_details"] = {
+        "cached_tokens": usage_totals.get("cache_read_input_tokens", 0),
+    }
+    return usage
 
 
 # Bounded retries when tools were requested but Claude answered with plain
@@ -1190,6 +1348,7 @@ def call_claude_with_tool_retry(
     tools=None,
     stop=None,
     stream_callback=None,
+    effort=None,
 ):
     """Wraps call_claude_streaming with bounded retries for the documented
     tool-dispatch flakiness. The FIRST attempt uses whatever session mode
@@ -1232,6 +1391,7 @@ def call_claude_with_tool_retry(
             tools=tools,
             stop=stop,
             stream_callback=cb,
+            effort=effort,
         )
         if result["tool_calls"] or not tools_requested:
             return result, cur_mode, cur_id
@@ -1243,11 +1403,13 @@ def call_claude_with_tool_retry(
 
 # Sampling/formatting parameters that have NO equivalent anywhere in the
 # Claude Code CLI (checked `claude --help` and the official env-vars
-# docs, 2026-08-13): no flag, no env var, nothing. The closest available
-# knob is `--effort <low|medium|high|max>`, which controls REASONING
-# EFFORT (how much internal deliberation the model does), a genuinely
-# different axis from output randomness/diversity -- not a substitute for
-# temperature or top_p, so it is intentionally NOT auto-mapped here.
+# docs, 2026-08-13): no flag, no env var, nothing. `--effort
+# <low|medium|high|max>` (Claude Code's reasoning-effort knob) IS now
+# mapped, but only from OpenRouter's `reasoning` parameter (see
+# resolve_reasoning_effort) -- a genuinely different axis (how much
+# internal deliberation the model does) from output randomness/
+# diversity, so it is NOT treated as a substitute for temperature/top_p
+# below.
 #
 # These are silently accepted (never hard-errored) because real OpenAI
 # clients routinely send explicit defaults on every request (e.g.
@@ -1354,6 +1516,7 @@ class Handler(BaseHTTPRequestHandler):
         max_tokens = payload.get("max_tokens") or payload.get("max_completion_tokens")
         stop = payload.get("stop")
         response_format = payload.get("response_format") or {}
+        effort = resolve_reasoning_effort(payload)
 
         if n > MAX_N_CHOICES:
             raise ClaudeCliError(
@@ -1403,14 +1566,18 @@ class Handler(BaseHTTPRequestHandler):
         _warn_unsupported_sampling_params(payload)
 
         # Real token-level streaming is only safe for the single-choice,
-        # no-tools-requested, no-json_schema path: with tool retry in
-        # play, a failed attempt's narration text must not reach the
-        # client before the shim knows to discard it and retry, and
+        # no-tools-requested, no-json_schema, no-reasoning path: with tool
+        # retry in play, a failed attempt's narration text must not reach
+        # the client before the shim knows to discard it and retry,
         # --json-schema's multi-turn corrective mechanism doesn't map
-        # cleanly onto a single token stream either. Every other
-        # combination falls back to the existing buffered-then-emit
-        # behavior (SSE framing is still correct, just not real-time).
-        can_stream_live = stream and n == 1 and not effective_tools and json_schema is None
+        # cleanly onto a single token stream either, and reasoning
+        # (--effort) requires capturing the `thinking` block BEFORE the
+        # `text` block starts (see build_reasoning_details), which
+        # _handle_streaming_completion's stream_callback (text_delta only)
+        # has no hook for. Every other combination falls back to the
+        # existing buffered-then-emit behavior (SSE framing is still
+        # correct, just not real-time).
+        can_stream_live = stream and n == 1 and not effective_tools and json_schema is None and effort is None
         if can_stream_live:
             self._handle_streaming_completion(
                 messages, model, system_prompt, max_tokens, env_overrides, stop,
@@ -1441,7 +1608,7 @@ class Handler(BaseHTTPRequestHandler):
                 delta_claude_messages, full_claude_messages, system_prompt, model,
                 tools_requested=bool(effective_tools), session_mode=session_mode,
                 session_id=session_id, json_schema=json_schema, env_overrides=env_overrides,
-                tools=effective_tools, stop=stop,
+                tools=effective_tools, stop=stop, effort=effort,
             )
 
             text = result["text"]
@@ -1473,6 +1640,20 @@ class Handler(BaseHTTPRequestHandler):
             if tool_calls:
                 message["tool_calls"] = tool_calls
 
+            reasoning_details = build_reasoning_details(
+                result.get("reasoning"), result.get("reasoning_signature"),
+            )
+            if reasoning_details:
+                # OpenRouter's two supported shapes
+                # (https://openrouter.ai/docs/guides/best-practices/
+                # reasoning-tokens): `reasoning` (plaintext string) for
+                # simple consumers, `reasoning_details` (structured array,
+                # preserves the signature) for consumers that round-trip
+                # reasoning back into a follow-up request. Both point at
+                # the same captured thinking text.
+                message["reasoning"] = result["reasoning"]
+                message["reasoning_details"] = reasoning_details
+
             finish_reason = result["finish_reason"]
             if tool_calls:
                 finish_reason = "tool_calls"
@@ -1501,7 +1682,7 @@ class Handler(BaseHTTPRequestHandler):
             "created": int(time.time()),
             "model": model,
             "choices": choices,
-            "usage": usage_totals,
+            "usage": _build_openai_usage(usage_totals),
         }
         self._send_json(response)
 
@@ -1593,7 +1774,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _run_one_completion(self, delta_messages, full_messages, system_prompt, model,
                              tools_requested, session_mode, session_id, json_schema, env_overrides,
-                             tools=None, stop=None):
+                             tools=None, stop=None, effort=None):
         """Single entry point for producing one completion, regardless of
         whether env overrides (max_tokens), structured output (json_schema),
         and/or tool retry apply. Returns (result_dict, final_session_mode,
@@ -1606,7 +1787,7 @@ class Handler(BaseHTTPRequestHandler):
                 msgs, system_prompt, model,
                 session_mode=mode, session_id=sid,
                 tools_requested=tools_requested, tools=tools, json_schema=json_schema,
-                stop=stop,
+                stop=stop, effort=effort,
             )
 
         original_popen = subprocess.Popen
@@ -1630,7 +1811,7 @@ class Handler(BaseHTTPRequestHandler):
             return call_claude_with_tool_retry(
                 delta_messages, full_messages, system_prompt, model,
                 tools_requested=tools_requested, session_mode=session_mode, session_id=session_id,
-                tools=tools, stop=stop,
+                tools=tools, stop=stop, effort=effort,
             )
         finally:
             if env_overrides:
