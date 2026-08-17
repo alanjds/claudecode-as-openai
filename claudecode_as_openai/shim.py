@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import pty
+import queue
 import re
 import select
 import subprocess
@@ -625,7 +626,8 @@ def resolve_session(openai_messages):
         entry = _SESSION_STORE.get(key)
         if entry:
             synced = entry["synced_messages"]
-            if len(openai_messages) > len(synced) and _messages_equal(openai_messages[: len(synced)], synced):
+            match = len(openai_messages) > len(synced) and _messages_equal(openai_messages[: len(synced)], synced)
+            if match:
                 delta = openai_messages[len(synced) :]
                 return "resume", entry["claude_session_id"], delta, key
     return "fresh", str(uuid.uuid4()), openai_messages, key
@@ -640,6 +642,313 @@ def record_session(conv_key, claude_session_id, full_openai_messages, assistant_
             if oldest == conv_key:
                 break
             _SESSION_STORE.pop(oldest, None)
+
+
+def _normalize_stop_sequences(stop):
+    """Shared with WarmProcess.send_turn: OpenAI's `stop` is a string or
+    list of up to 4 strings; Claude Code has no native stop-sequence
+    flag, so this shim always emulates it client-side against the
+    accumulated text (see _apply_stop_sequences)."""
+    if not stop:
+        return []
+    return [stop] if isinstance(stop, str) else [s for s in stop if s]
+
+
+# ---------------------------------------------------------------------------
+# Persistent warm-pool: keeps ONE already-spawned, already-bootstrapped
+# `claude -p --input-format stream-json` process parked per conversation,
+# ready to take the NEXT turn without paying the ~5s process-spawn/
+# bootstrap cost a fresh `-p --resume` invocation pays on every call
+# (measured live: cold `-p --resume` wall time vs the CLI's own
+# self-reported duration_ms showed a ~5.2s unaccounted gap -- pure
+# process-lifecycle overhead outside the API call itself -- that
+# collapses to ~5ms once a process is already resident and warm).
+#
+# Design, per explicit user direction: at most ONE parked (idle, already
+# spawned) process at a time, never a process per concurrent conversation.
+# A "new" conversation here means "different from the immediately
+# preceding one" -- there is no attempt to keep N conversations warm
+# simultaneously.
+#
+#   1. A turn for a brand-new conversation arrives -> served cold (no
+#      warm process can exist for a conversation that didn't exist yet).
+#      In parallel, once that reply's real Claude session_id is known,
+#      spawn a WarmProcess pre-resuming that exact session, parked
+#      waiting for turn 2.
+#   2. The next turn for the SAME conversation (matching fingerprint +
+#      session_id) arrives -> claim the parked WarmProcess, feed it the
+#      turn directly (no spawn), and spawn a fresh WarmProcess to park
+#      for turn 3 once this reply is known.
+#   3. A turn for a DIFFERENT conversation arrives (new fingerprint, or a
+#      continuation whose synced history no longer matches this parked
+#      process's session) -> the stale parked process is useless (its
+#      --resume target is for the wrong conversation) and is killed
+#      immediately; that turn is served cold, and a new WarmProcess is
+#      parked for whatever comes next.
+#
+# Cross-compatible with the existing cold path by construction: a warm
+# process's Claude session_id is a completely normal Claude Code session
+# (created with plain --session-id / --resume, just kept alive across
+# turns via --input-format stream-json instead of exiting after one).
+# Verified live: a session created and advanced by a WarmProcess resumes
+# correctly via a totally separate one-shot `-p --resume` call after the
+# warm process is killed, and vice versa -- either side can pick up
+# where the other left off with no special handling needed.
+class WarmProcess:
+    """One already-spawned `claude -p --input-format stream-json
+    --output-format stream-json` subprocess, resumed onto a specific
+    Claude session_id, parked waiting to serve exactly one more turn of
+    that same conversation. Not reused after that turn is served --
+    callers spawn a fresh WarmProcess for the turn after this one (see
+    WarmPool)."""
+
+    def __init__(self, fingerprint, session_id, model, system_prompt, tools_requested, tools,
+                 mcp_tool_config, effort, use_pty, env_overrides=None):
+        self.fingerprint = fingerprint
+        self.session_id = session_id
+        self.model = model
+        self.system_prompt = system_prompt
+        self.tools_requested = tools_requested
+        self.tools = tools
+        self.mcp_tool_config = mcp_tool_config
+        self.effort = effort
+        self.use_pty = use_pty
+        self.env_overrides = env_overrides
+        self.proc = None
+        self.pty_master_fd = None
+        self.system_prompt_file = None
+        self._reader_thread = None
+        self._line_queue = queue.Queue()
+        self._lock = threading.Lock()
+        self._claimed = False
+        self._start()
+
+    def _start(self):
+        max_turns = 2 if self.mcp_tool_config else 1
+        cmd = _build_claude_cmd(
+            self.model, "resume", self.session_id, self.tools_requested, max_turns,
+            json_schema=None, want_partial_messages=self.use_pty,
+            mcp_tool_config=self.mcp_tool_config, effort=self.effort,
+            input_format="stream-json",
+        )
+        if self.system_prompt:
+            # Matches call_claude_streaming's own >4000-char threshold
+            # for --system-prompt-file vs --system-prompt (see there for
+            # why: argv length limits). A resumed session already has
+            # its system prompt recorded server-side, so this is
+            # belt-and-suspenders consistency with the cold path rather
+            # than something a resume strictly needs.
+            if len(self.system_prompt) > 4000:
+                fd, self.system_prompt_file = tempfile.mkstemp(
+                    prefix="claudecode-as-openai-sysprompt-", suffix=".txt",
+                )
+                with os.fdopen(fd, "w") as f:
+                    f.write(self.system_prompt)
+                cmd += ["--system-prompt-file", self.system_prompt_file]
+            else:
+                cmd += ["--system-prompt", self.system_prompt]
+        # A warm process's env is fixed for its whole parked lifetime
+        # (unlike the cold path's _scoped_env_overrides, which only
+        # needs to patch subprocess.Popen for the duration of one
+        # request's call stack) -- passed directly at spawn time here
+        # instead. Without this, CLAUDE_CODE_MAX_OUTPUT_TOKENS and
+        # CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC (see _BASE_ENV_OVERRIDES)
+        # would silently NOT apply to any turn served by a warm process.
+        spawn_env = dict(os.environ)
+        if self.env_overrides:
+            spawn_env.update(self.env_overrides)
+        if self.use_pty:
+            self.pty_master_fd, pty_slave_fd = pty.openpty()
+            self.proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=pty_slave_fd,
+                stderr=subprocess.PIPE, cwd=_CLAUDE_CWD, env=spawn_env,
+            )
+            os.close(pty_slave_fd)
+        else:
+            self.proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, bufsize=1, cwd=_CLAUDE_CWD, env=spawn_env,
+            )
+        self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader_thread.start()
+
+    def _read_loop(self):
+        # Runs for the whole process lifetime, pushing every parsed
+        # NDJSON line onto a queue that send_turn drains per-turn. A
+        # background reader (rather than reading synchronously inside
+        # send_turn) is what lets the process sit parked indefinitely
+        # between turns without a blocking read call pinning a thread
+        # doing nothing useful -- this thread blocks on I/O, which is
+        # cheap, not on CPU. timeout_s=None on the PTY path is
+        # deliberate: _iter_ndjson_lines_pty's deadline is per-
+        # generator-lifetime, not per-line, and this generator IS the
+        # process's whole lifetime (spawn through however many turns get
+        # served) -- a finite deadline here would silently kill an
+        # idle-but-still-alive parked process out from under send_turn.
+        # Per-turn bounding happens instead in send_turn's own
+        # queue.get(timeout=...).
+        try:
+            if self.use_pty:
+                for parsed in _iter_ndjson_lines_pty(self.pty_master_fd, self.proc, timeout_s=None):
+                    self._line_queue.put(parsed)
+            else:
+                for parsed in _iter_ndjson_lines(self.proc):
+                    self._line_queue.put(parsed)
+        except Exception:
+            pass
+        finally:
+            self._line_queue.put(None)  # sentinel: stdout closed / process exited
+
+    def is_alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def claim(self):
+        """Returns True exactly once -- the first caller to claim this
+        process for a turn. Guards against a race between the pool
+        handing out this same parked process to two concurrent
+        requests."""
+        with self._lock:
+            if self._claimed or not self.is_alive():
+                return False
+            self._claimed = True
+            return True
+
+    def send_turn(self, claude_messages, stop=None, stream_callback=None):
+        """Feed ONE turn (a list of new Claude-shaped messages -- the
+        delta beyond what this session already has) to the already-
+        running process and block for its result. Must only be called
+        after claim() returns True. Uses the exact same response-parsing
+        logic as the cold path (_consume_claude_response) so behavior is
+        identical either way."""
+        stop_sequences = _normalize_stop_sequences(stop)
+        # claude_messages is the delta list this shim would otherwise
+        # have written whole to a fresh process's stdin; stream-json
+        # input takes one JSON object per line instead, so each element
+        # is sent as its own {"type": "user", "message": ...} frame.
+        for msg in claude_messages:
+            line = json.dumps({"type": msg.get("role", "user"), "message": msg})
+            if self.use_pty:
+                os.write(self.proc.stdin.fileno(), (line + "\n").encode())
+            else:
+                self.proc.stdin.write(line + "\n")
+                self.proc.stdin.flush()
+
+        def chunk_source():
+            while True:
+                item = self._line_queue.get(timeout=CLAUDE_TIMEOUT_S)
+                if item is None:
+                    return
+                yield item
+
+        deadline = time.time() + CLAUDE_TIMEOUT_S
+        return _consume_claude_response(chunk_source(), deadline, stop_sequences, stream_callback)
+
+    def kill(self):
+        if self.proc is None:
+            return
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=2)
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+        if self.use_pty and self.pty_master_fd is not None:
+            try:
+                os.close(self.pty_master_fd)
+            except OSError:
+                pass
+        if self.system_prompt_file:
+            try:
+                os.unlink(self.system_prompt_file)
+            except OSError:
+                pass
+        if self.mcp_tool_config is not None:
+            try:
+                os.unlink(self.mcp_tool_config["manifest_path"])
+            except OSError:
+                pass
+
+
+class WarmPool:
+    """Holds at most one parked WarmProcess at a time (see module-level
+    comment above for the full protocol). Thread-safe: HTTP requests are
+    served from a ThreadingHTTPServer, so claiming/replacing the parked
+    process must be atomic against a concurrent request doing the same."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._parked = None  # WarmProcess | None
+
+    def take_if_matching(self, fingerprint):
+        """Returns the parked WarmProcess if it exists, is alive, and
+        matches `fingerprint` (same conversation), claiming it
+        atomically so no other request can also take it. Returns None
+        otherwise -- including when a parked process exists but is for
+        a DIFFERENT conversation, in which case it's killed here (a
+        stale parked process is useless once the conversation moves on,
+        per the "at most one parked process, discarded on mismatch"
+        design)."""
+        with self._lock:
+            candidate = self._parked
+            if candidate is None:
+                return None
+            if candidate.fingerprint != fingerprint:
+                self._parked = None
+                candidate.kill()
+                return None
+            self._parked = None
+        if not candidate.claim():
+            return None
+        return candidate
+
+    def park(self, warm_process):
+        """Installs `warm_process` as the new parked process, killing
+        whatever was parked before it (there is only ever one)."""
+        with self._lock:
+            stale = self._parked
+            self._parked = warm_process
+        if stale is not None:
+            stale.kill()
+
+    def discard(self, fingerprint):
+        """Kills and clears the parked process if it matches
+        `fingerprint`. Used when a conversation ends up not continuing
+        the way the parked process assumed (e.g. the caller's next
+        request diverged before ever reaching take_if_matching)."""
+        with self._lock:
+            candidate = self._parked
+            if candidate is None or candidate.fingerprint != fingerprint:
+                return
+            self._parked = None
+        candidate.kill()
+
+
+_WARM_POOL = WarmPool()
+
+
+def _parking_fingerprint(conv_key, model, tools_requested, tools, effort, env_overrides=None):
+    """What must stay IDENTICAL between the turn a WarmProcess was
+    parked for and the turn that claims it. Deliberately includes
+    everything _build_claude_cmd branches on for this call shape
+    (model/tools/effort change the spawned command line) plus the
+    session-cache conv_key (a different conv_key is, by definition, a
+    different conversation) and env_overrides (max_tokens changes
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS, which is baked into a warm process's
+    environment at spawn time -- see WarmProcess._start) -- any mismatch
+    here means the parked process's command line, environment, or
+    --resume target are wrong for the incoming turn, so per the user's
+    explicit design it must be discarded and respawned, never reused
+    with different parameters."""
+    tools_key = None
+    if tools:
+        try:
+            tools_key = json.dumps(tools, sort_keys=True, default=str)
+        except Exception:
+            tools_key = str(tools)
+    env_key = json.dumps(env_overrides, sort_keys=True) if env_overrides else None
+    return (conv_key, model, bool(tools_requested), tools_key, effort, env_key)
 
 
 def _parse_ndjson_line(line):
@@ -680,15 +989,28 @@ def _iter_ndjson_lines_pty(master_fd, proc, timeout_s):
     generation time (e.g. 21 deltas over ~22s of a 300-word story,
     roughly one every 0.5-0.7s, matching genuine token-generation pacing).
     This is the only way to get real client-facing streaming out of this
-    CLI; there is no flag to force unbuffered/line-buffered stdout."""
-    deadline = time.time() + timeout_s
+    CLI; there is no flag to force unbuffered/line-buffered stdout.
+
+    `timeout_s`, if given, is a single deadline for the WHOLE generator
+    lifetime, not per-line -- correct for call_claude_streaming's
+    one-shot use (one call, one bounded wait), but WRONG for a
+    WarmProcess's background reader, which must survive indefinitely
+    across an unbounded number of turns with idle gaps between them.
+    Pass timeout_s=None for that case: the generator then only returns
+    on EOF/process-exit, with no wall-clock cutoff at all (see
+    WarmProcess._read_loop)."""
+    deadline = None if timeout_s is None else time.time() + timeout_s
     buf = b""
     while True:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            return
+        if deadline is not None:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return
+            select_timeout = min(remaining, 1.0)
+        else:
+            select_timeout = 1.0
         try:
-            ready, _, _ = select.select([master_fd], [], [], min(remaining, 1.0))
+            ready, _, _ = select.select([master_fd], [], [], select_timeout)
         except (OSError, ValueError):
             return
         if not ready:
@@ -716,7 +1038,7 @@ def _iter_ndjson_lines_pty(master_fd, proc, timeout_s):
                 yield parsed
 
 
-def _build_claude_cmd(model, session_mode, session_id, tools_requested, max_turns, json_schema, want_partial_messages=False, mcp_tool_config=None, effort=None):
+def _build_claude_cmd(model, session_mode, session_id, tools_requested, max_turns, json_schema, want_partial_messages=False, mcp_tool_config=None, effort=None, input_format=None):
     cmd = [CLAUDE_BIN]
     # Excludes user/project/local settings.json entirely, preventing
     # locally-configured SessionStart/other hooks from injecting extra
@@ -746,6 +1068,15 @@ def _build_claude_cmd(model, session_mode, session_id, tools_requested, max_turn
         # and README "MCP tool leakage").
         cmd += ["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
     cmd += ["--output-format", "stream-json", "--verbose", "--max-turns", str(max_turns)]
+    if input_format == "stream-json":
+        # Used only by the persistent warm-pool process (see
+        # WarmProcess): keeps the underlying `claude -p` subprocess
+        # alive across multiple turns of the SAME conversation, reading
+        # one JSON line per turn from stdin instead of exiting after a
+        # single message array. --replay-user-messages makes the CLI
+        # echo each user turn back on stdout so the reader can align
+        # results to the right turn without a separate side channel.
+        cmd += ["--input-format", "stream-json", "--replay-user-messages"]
     if want_partial_messages:
         # Adds token-level "stream_event"/"content_block_delta" lines
         # interleaved with the existing full "assistant" message chunks.
@@ -767,6 +1098,196 @@ def _build_claude_cmd(model, session_mode, session_id, tools_requested, max_turn
         cmd += ["--json-schema", json.dumps(json_schema)]
     cmd += ["-p"]
     return cmd
+
+
+def _consume_claude_response(chunk_source, deadline, stop_sequences, stream_callback):
+    """Shared NDJSON-chunk parsing loop, used by both a one-shot `claude
+    -p` invocation (call_claude_streaming) and a persistent warm-pool
+    process serving one turn at a time (WarmProcess.send_turn). Reads
+    from `chunk_source` (any iterable of parsed NDJSON dicts) until a
+    "result" chunk, a tool_use/structured-output block, a stop-sequence
+    match, or the deadline ends it. Returns the same result dict shape
+    call_claude_streaming has always returned; raises ClaudeCliError on
+    the same conditions as before. Does NOT touch process lifecycle --
+    callers own spawning/terminating whatever produced chunk_source."""
+    text_parts = []
+    reasoning_parts = []
+    reasoning_signature = None
+    tool_calls = []
+    structured_json = None
+    usage = {}
+    finish_reason = "stop"
+    stop_matched = False
+    streaming_partial_text = ""
+
+    for chunk in chunk_source:
+        if time.time() > deadline:
+            break
+        ctype = chunk.get("type")
+
+        if ctype == "stream_event" and (stop_sequences or stream_callback):
+            # Real token-level deltas, only present when
+            # --include-partial-messages was passed. These interleave
+            # with, and arrive BEFORE, the full "assistant" chunk for
+            # the same content block: content_block_start ->
+            # content_block_delta(s) -> the full "assistant" chunk ->
+            # content_block_stop -> next content_block_start. That
+            # ordering is what makes resetting the per-block
+            # accumulator on content_block_start safe. This lets a
+            # stop sequence be caught mid-block instead of only after
+            # a full text block finishes, and is what delivers real
+            # client-facing streaming when stream_callback is set.
+            event = chunk.get("event", {})
+            etype = event.get("type")
+            if etype == "content_block_delta":
+                delta = event.get("delta", {})
+                if delta.get("type") == "text_delta" and delta.get("text"):
+                    new_text = delta["text"]
+                    streaming_partial_text += new_text
+                    if stop_sequences:
+                        combined = "".join(text_parts) + streaming_partial_text
+                        matched_text, matched = _apply_stop_sequences(combined, stop_sequences)
+                        if matched:
+                            # Truncate what we forward to the client too
+                            # -- stream only the portion up to the stop
+                            # match, never the text past it.
+                            already_streamed_len = len(combined) - len(new_text)
+                            visible_new_text = matched_text[already_streamed_len:]
+                            if stream_callback and visible_new_text:
+                                stream_callback(visible_new_text)
+                            text_parts = [matched_text]
+                            stop_matched = True
+                            finish_reason = "stop"
+                            break
+                    if stream_callback:
+                        stream_callback(new_text)
+            elif etype == "content_block_start":
+                streaming_partial_text = ""
+            continue
+
+        if ctype == "assistant" and "message" in chunk:
+            message = chunk["message"]
+            # NOTE: "error" is a sibling key of "message" at the chunk
+            # level (chunk["error"]), NOT inside message itself --
+            # verified against live captures for both an invalid model
+            # ({"type":"assistant","message":{...},"error":"invalid_request"})
+            # and an output-token-cap breach ({"error":"max_output_tokens"}).
+            err = chunk.get("error")
+            if err:
+                text = _flatten_content(message.get("content")) or ""
+                if err == "max_output_tokens":
+                    # Claude Code hard-fails on exceeding the output
+                    # cap rather than truncating like OpenAI's
+                    # max_tokens does. Closest honest mapping: report
+                    # finish_reason="length" with whatever text (if
+                    # any) had already accumulated -- there usually
+                    # isn't any, since the cap is enforced before the
+                    # text block completes (verified empirically).
+                    finish_reason = "length"
+                    break
+                status, etype, code = _classify_error_text(text)
+                raise ClaudeCliError(status, etype, text or f"claude reported error: {err}", code=code)
+            got_tool_use = False
+            for content in message.get("content", []):
+                ctype2 = content.get("type")
+                if ctype2 == "thinking" and content.get("thinking"):
+                    # Real extended-thinking output, only present when
+                    # --effort was passed (see resolve_reasoning_effort
+                    # in _handle_chat_completion) -- verified live via
+                    # a stream-json capture with a math prompt: setting
+                    # --effort genuinely produces this block (with a
+                    # real `signature` field) ahead of the final `text`
+                    # block, not a cosmetic no-op. Surfaced back to the
+                    # caller as OpenRouter's `reasoning`/
+                    # `reasoning_details` shape -- see
+                    # build_reasoning_details().
+                    reasoning_parts.append(content["thinking"])
+                    if content.get("signature"):
+                        reasoning_signature = content["signature"]
+                    continue
+                if ctype2 == "text" and content.get("text"):
+                    text_parts.append(content["text"])
+                    # IMPORTANT: do NOT break here just because we saw
+                    # text. Claude frequently narrates in one assistant
+                    # NDJSON message and dispatches the actual tool_use
+                    # in a SEPARATE, later assistant message within the
+                    # same turn ([thinking, text, tool_use] is common).
+                    # Breaking on the text-only message silently
+                    # swallows the tool_use that follows. Keep reading;
+                    # only stop early on an actual tool_use/structured-
+                    # output block, a stop-sequence match, an error, or
+                    # the stream ending naturally (the "result" chunk
+                    # case further down).
+                    if stop_sequences:
+                        accumulated = "".join(text_parts)
+                        matched_text, stop_matched = _apply_stop_sequences(accumulated, stop_sequences)
+                        if stop_matched:
+                            text_parts = [matched_text]
+                            finish_reason = "stop"
+                            break
+                elif ctype2 == "tool_use":
+                    name = content.get("name", "")
+                    if name == "StructuredOutput":
+                        # --json-schema enforcement mechanism: the
+                        # actual answer is the tool's input, not a
+                        # real tool call to expose to the caller.
+                        structured_json = content.get("input", {})
+                        got_tool_use = True
+                    else:
+                        tool_calls.append(
+                            {
+                                "id": content.get("id", _gen_tool_id()),
+                                "name": strip_mcp_tool_prefix(name),
+                                "input": content.get("input", {}),
+                            }
+                        )
+                        got_tool_use = True
+                # "redacted_thinking" blocks (safety-redacted reasoning,
+                # content deliberately withheld by Anthropic) are still
+                # intentionally ignored -- there is no real content to
+                # surface. Real "thinking" blocks are captured above.
+            if usage_data := message.get("usage"):
+                usage = usage_data
+            if got_tool_use or stop_matched:
+                # A stop-sequence match ends the response right here --
+                # the caller tears down (or, for a warm process, simply
+                # stops reading -- the process itself stays alive for
+                # the next turn) immediately, which is the actual
+                # latency/cost win over letting `claude` keep generating
+                # a response nobody will see.
+                break
+            continue
+
+        if ctype == "result":
+            if chunk.get("is_error") and chunk.get("subtype") not in ("error_max_turns",):
+                text = chunk.get("result") or f"claude error: {chunk.get('subtype')}"
+                status, etype, code = _classify_error_text(text)
+                raise ClaudeCliError(status, etype, text, code=code or chunk.get("subtype"))
+            if not usage and chunk.get("usage"):
+                usage = chunk["usage"]
+            break
+
+    if structured_json is not None:
+        return {
+            "text": json.dumps(structured_json),
+            "tool_calls": [],
+            "usage": usage,
+            "finish_reason": "stop",
+            "structured_json": structured_json,
+            "reasoning": None,
+            "reasoning_signature": None,
+        }
+
+    return {
+        "text": "".join(text_parts) or None,
+        "tool_calls": tool_calls,
+        "usage": usage,
+        "finish_reason": finish_reason,
+        "structured_json": None,
+        "stop_matched": stop_matched,
+        "reasoning": "".join(reasoning_parts) or None,
+        "reasoning_signature": reasoning_signature,
+    }
 
 
 def call_claude_streaming(
@@ -894,187 +1415,12 @@ def call_claude_streaming(
             proc.stdin.write(json.dumps(claude_messages))
         proc.stdin.close()
 
-        text_parts = []
-        reasoning_parts = []
-        reasoning_signature = None
-        tool_calls = []
-        structured_json = None
-        usage = {}
-        finish_reason = "stop"
-        stop_matched = False
-        streaming_partial_text = ""
         deadline = time.time() + CLAUDE_TIMEOUT_S
-
         chunk_source = (
             _iter_ndjson_lines_pty(pty_master_fd, proc, CLAUDE_TIMEOUT_S)
             if use_pty else _iter_ndjson_lines(proc)
         )
-        for chunk in chunk_source:
-            if time.time() > deadline:
-                break
-            ctype = chunk.get("type")
-
-            if ctype == "stream_event" and (stop_sequences or stream_callback):
-                # Real token-level deltas, only present when
-                # --include-partial-messages was passed. These interleave
-                # with, and arrive BEFORE, the full "assistant" chunk for
-                # the same content block: content_block_start ->
-                # content_block_delta(s) -> the full "assistant" chunk ->
-                # content_block_stop -> next content_block_start. That
-                # ordering is what makes resetting the per-block
-                # accumulator on content_block_start safe. This lets a
-                # stop sequence be caught mid-block instead of only after
-                # a full text block finishes, and is what delivers real
-                # client-facing streaming when stream_callback is set.
-                event = chunk.get("event", {})
-                etype = event.get("type")
-                if etype == "content_block_delta":
-                    delta = event.get("delta", {})
-                    if delta.get("type") == "text_delta" and delta.get("text"):
-                        new_text = delta["text"]
-                        streaming_partial_text += new_text
-                        if stop_sequences:
-                            combined = "".join(text_parts) + streaming_partial_text
-                            matched_text, matched = _apply_stop_sequences(combined, stop_sequences)
-                            if matched:
-                                # Truncate what we forward to the client too
-                                # -- stream only the portion up to the stop
-                                # match, never the text past it.
-                                already_streamed_len = len(combined) - len(new_text)
-                                visible_new_text = matched_text[already_streamed_len:]
-                                if stream_callback and visible_new_text:
-                                    stream_callback(visible_new_text)
-                                text_parts = [matched_text]
-                                stop_matched = True
-                                finish_reason = "stop"
-                                break
-                        if stream_callback:
-                            stream_callback(new_text)
-                elif etype == "content_block_start":
-                    streaming_partial_text = ""
-                continue
-
-            if ctype == "assistant" and "message" in chunk:
-                message = chunk["message"]
-                # NOTE: "error" is a sibling key of "message" at the chunk
-                # level (chunk["error"]), NOT inside message itself --
-                # verified against live captures for both an invalid model
-                # ({"type":"assistant","message":{...},"error":"invalid_request"})
-                # and an output-token-cap breach ({"error":"max_output_tokens"}).
-                err = chunk.get("error")
-                if err:
-                    text = _flatten_content(message.get("content")) or ""
-                    if err == "max_output_tokens":
-                        # Claude Code hard-fails on exceeding the output
-                        # cap rather than truncating like OpenAI's
-                        # max_tokens does. Closest honest mapping: report
-                        # finish_reason="length" with whatever text (if
-                        # any) had already accumulated -- there usually
-                        # isn't any, since the cap is enforced before the
-                        # text block completes (verified empirically).
-                        finish_reason = "length"
-                        break
-                    status, etype, code = _classify_error_text(text)
-                    raise ClaudeCliError(status, etype, text or f"claude reported error: {err}", code=code)
-                got_tool_use = False
-                for content in message.get("content", []):
-                    ctype2 = content.get("type")
-                    if ctype2 == "thinking" and content.get("thinking"):
-                        # Real extended-thinking output, only present when
-                        # --effort was passed (see resolve_reasoning_effort
-                        # in _handle_chat_completion) -- verified live via
-                        # a stream-json capture with a math prompt: setting
-                        # --effort genuinely produces this block (with a
-                        # real `signature` field) ahead of the final `text`
-                        # block, not a cosmetic no-op. Surfaced back to the
-                        # caller as OpenRouter's `reasoning`/
-                        # `reasoning_details` shape -- see
-                        # build_reasoning_details().
-                        reasoning_parts.append(content["thinking"])
-                        if content.get("signature"):
-                            reasoning_signature = content["signature"]
-                        continue
-                    if ctype2 == "text" and content.get("text"):
-                        text_parts.append(content["text"])
-                        # IMPORTANT: do NOT break here just because we saw
-                        # text. Claude frequently narrates in one assistant
-                        # NDJSON message and dispatches the actual tool_use
-                        # in a SEPARATE, later assistant message within the
-                        # same turn ([thinking, text, tool_use] is common).
-                        # Breaking on the text-only message silently
-                        # swallows the tool_use that follows. Keep reading;
-                        # only stop early on an actual tool_use/structured-
-                        # output block, a stop-sequence match, an error, or
-                        # the stream ending naturally (the "result" chunk
-                        # case further down).
-                        if stop_sequences:
-                            accumulated = "".join(text_parts)
-                            matched_text, stop_matched = _apply_stop_sequences(accumulated, stop_sequences)
-                            if stop_matched:
-                                text_parts = [matched_text]
-                                finish_reason = "stop"
-                                break
-                    elif ctype2 == "tool_use":
-                        name = content.get("name", "")
-                        if name == "StructuredOutput":
-                            # --json-schema enforcement mechanism: the
-                            # actual answer is the tool's input, not a
-                            # real tool call to expose to the caller.
-                            structured_json = content.get("input", {})
-                            got_tool_use = True
-                        else:
-                            tool_calls.append(
-                                {
-                                    "id": content.get("id", _gen_tool_id()),
-                                    "name": strip_mcp_tool_prefix(name),
-                                    "input": content.get("input", {}),
-                                }
-                            )
-                            got_tool_use = True
-                    # "redacted_thinking" blocks (safety-redacted reasoning,
-                    # content deliberately withheld by Anthropic) are still
-                    # intentionally ignored -- there is no real content to
-                    # surface. Real "thinking" blocks are captured above.
-                if usage_data := message.get("usage"):
-                    usage = usage_data
-                if got_tool_use or stop_matched:
-                    # A stop-sequence match ends the response right here --
-                    # `finally` below tears down the subprocess immediately,
-                    # which is the actual latency/cost win over letting
-                    # `claude` keep generating a response nobody will see.
-                    break
-                continue
-
-            if ctype == "result":
-                if chunk.get("is_error") and chunk.get("subtype") not in ("error_max_turns",):
-                    text = chunk.get("result") or f"claude error: {chunk.get('subtype')}"
-                    status, etype, code = _classify_error_text(text)
-                    raise ClaudeCliError(status, etype, text, code=code or chunk.get("subtype"))
-                if not usage and chunk.get("usage"):
-                    usage = chunk["usage"]
-                break
-
-        if structured_json is not None:
-            return {
-                "text": json.dumps(structured_json),
-                "tool_calls": [],
-                "usage": usage,
-                "finish_reason": "stop",
-                "structured_json": structured_json,
-                "reasoning": None,
-                "reasoning_signature": None,
-            }
-
-        return {
-            "text": "".join(text_parts) or None,
-            "tool_calls": tool_calls,
-            "usage": usage,
-            "finish_reason": finish_reason,
-            "structured_json": None,
-            "stop_matched": stop_matched,
-            "reasoning": "".join(reasoning_parts) or None,
-            "reasoning_signature": reasoning_signature,
-        }
+        return _consume_claude_response(chunk_source, deadline, stop_sequences, stream_callback)
     finally:
         # Terminating here (rather than letting the subprocess run to its
         # own natural end) is what actually delivers the latency/cost win
@@ -1479,7 +1825,7 @@ class Handler(BaseHTTPRequestHandler):
                 delta_claude_messages, full_claude_messages, system_prompt, model,
                 tools_requested=bool(effective_tools), session_mode=session_mode,
                 session_id=session_id, json_schema=json_schema, env_overrides=env_overrides,
-                tools=effective_tools, stop=stop, effort=effort,
+                tools=effective_tools, stop=stop, effort=effort, conv_key=conv_key,
             )
 
             text = result["text"]
@@ -1564,9 +1910,21 @@ class Handler(BaseHTTPRequestHandler):
         then forwards each real text_delta from
         call_claude_streaming(stream_callback=...) to the client as it
         arrives, instead of buffering the full response first. Falls back
-        to the same session-caching/resume logic as the buffered path."""
+        to the same session-caching/resume logic as the buffered path.
+
+        Also checks the warm pool (see WarmPool/WarmProcess) for a parked
+        process matching this turn's fingerprint before spawning cold --
+        a warm process is created with use_pty=True specifically so it
+        can serve a LATER streaming turn just as well as a buffered one;
+        verified live that token-level deltas remain correctly paced
+        (not bursty) when streamed off an already-resident --resume'd
+        process, same signature as the cold path."""
         session_mode, session_id, delta_messages, conv_key = resolve_session(messages)
         delta_claude_messages = build_claude_messages(delta_messages)
+
+        fingerprint = None
+        if conv_key is not None:
+            fingerprint = _parking_fingerprint(conv_key, model, False, None, None, env_overrides)
 
         chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
@@ -1593,14 +1951,60 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 emit({"content": text_piece})
 
+        def _park_next(final_sid):
+            # Same best-effort contract as _run_one_completion's
+            # _park_next: a spawn failure here must never surface as a
+            # request failure, since the completion already succeeded.
+            try:
+                warm = WarmProcess(
+                    fingerprint, final_sid, model, system_prompt, False, None,
+                    None, None, use_pty=True, env_overrides=env_overrides,
+                )
+                _WARM_POOL.park(warm)
+            except Exception:
+                pass
+
         try:
             with _scoped_env_overrides(env_overrides):
-                result = call_claude_streaming(
-                    delta_claude_messages, system_prompt, model,
-                    session_mode=session_mode, session_id=session_id,
-                    tools_requested=False, stop=stop,
-                    stream_callback=on_text_delta,
+                # Guarded on session_mode == "resume", matching
+                # _run_one_completion's warm-pool gate exactly: a
+                # "fresh" session_mode means delta_claude_messages is
+                # the FULL conversation history (resolve_session found
+                # no matching prior sync), not a true delta -- sending
+                # that to an already-`--resume`d warm process would
+                # duplicate/corrupt its session transcript. A parked
+                # process can only ever be correctly claimed for the
+                # NEXT turn of a conversation it already knows about.
+                warm = (
+                    _WARM_POOL.take_if_matching(fingerprint)
+                    if fingerprint is not None and session_mode == "resume"
+                    else None
                 )
+                if warm is not None:
+                    try:
+                        result = warm.send_turn(delta_claude_messages, stop=stop, stream_callback=on_text_delta)
+                    except ClaudeCliError:
+                        warm.kill()
+                        raise
+                    else:
+                        # A WarmProcess serves exactly one turn, ever
+                        # (see its docstring) -- kill it as soon as
+                        # that turn is done, whether or not this reply
+                        # ends up parking a fresh replacement below.
+                        # Without this, a successfully-served warm
+                        # process is simply abandoned: still alive,
+                        # still holding an --include-partial-messages
+                        # PTY subprocess open, forever (verified live:
+                        # ps showed the spent process sitting in S
+                        # state indefinitely after being claimed).
+                        warm.kill()
+                else:
+                    result = call_claude_streaming(
+                        delta_claude_messages, system_prompt, model,
+                        session_mode=session_mode, session_id=session_id,
+                        tools_requested=False, stop=stop,
+                        stream_callback=on_text_delta,
+                    )
         except ClaudeCliError as e:
             # Headers are already sent by this point (SSE has to commit to
             # a 200 before any content is known) -- an OpenAI SSE client
@@ -1625,16 +2029,40 @@ class Handler(BaseHTTPRequestHandler):
         if conv_key is not None:
             message = {"role": "assistant", "content": result["text"]}
             record_session(conv_key, session_id, messages, message)
+            # fingerprint is set whenever conv_key is (see above), so
+            # this always parks a fresh WarmProcess for this
+            # conversation's next turn -- whether this turn was itself
+            # served warm or cold.
+            _park_next(session_id)
 
     def _run_one_completion(self, delta_messages, full_messages, system_prompt, model,
                              tools_requested, session_mode, session_id, json_schema, env_overrides,
-                             tools=None, stop=None, effort=None):
+                             tools=None, stop=None, effort=None, conv_key=None):
         """Single entry point for producing one completion, regardless of
         whether env overrides (max_tokens), structured output (json_schema),
         and/or tool retry apply. Returns (result_dict, final_session_mode,
         final_session_id). Consolidating this here (rather than branching
         across several call sites) keeps the env-var scoping and retry
-        logic each applied exactly once, in a well-defined order."""
+        logic each applied exactly once, in a well-defined order.
+
+        Also owns the warm-pool fast path (see WarmPool/WarmProcess): when
+        `conv_key` is given, `session_mode == "resume"` (a brand-new
+        conversation's first turn can never have a parked process, by
+        definition), and a parked process matches this exact call's
+        fingerprint, the turn is served by that already-running process
+        instead of spawning a fresh one -- skipping the ~5s cold
+        process-spawn/bootstrap cost measured live between a fresh `-p
+        --resume` call and an already-resident warm process. Whether
+        served warm or cold, a new WarmProcess is parked afterward for
+        this conversation's NEXT turn, per the user's explicit "one
+        parked process, replaced on any mismatch" design -- never one
+        process per concurrent conversation."""
+        mcp_tool_config = build_mcp_tool_config(tools) if tools else None
+        fingerprint = None
+        if conv_key is not None:
+            fingerprint = _parking_fingerprint(
+                conv_key, model, tools_requested, tools, effort, env_overrides,
+            )
 
         def _do_call(msgs, mode, sid):
             return call_claude_streaming(
@@ -1644,20 +2072,64 @@ class Handler(BaseHTTPRequestHandler):
                 stop=stop, effort=effort,
             )
 
+        def _park_next(final_sid):
+            # Best-effort: a warm-process spawn failure here must never
+            # surface as a request failure -- the completion this turn
+            # produced is already valid and about to be returned. Worst
+            # case, the next turn just falls back to the cold path.
+            try:
+                warm = WarmProcess(
+                    fingerprint, final_sid, model, system_prompt, tools_requested, tools,
+                    mcp_tool_config, effort, use_pty=False, env_overrides=env_overrides,
+                )
+                _WARM_POOL.park(warm)
+            except Exception:
+                pass
+
         with _scoped_env_overrides(env_overrides):
             if json_schema is not None:
                 # Structured output doesn't go through the tool-call retry
-                # loop -- --json-schema uses its own internal mechanism
-                # (a StructuredOutput tool + corrective turn) that isn't
-                # the "narrated instead of dispatching" failure mode the
-                # retry loop targets.
+                # loop, or the warm pool -- --json-schema uses its own
+                # internal mechanism (a StructuredOutput tool + corrective
+                # turn) that isn't the "narrated instead of dispatching"
+                # failure mode the retry loop targets, and its multi-turn
+                # correction doesn't fit the warm pool's one-turn-per-park
+                # model cleanly. Kept on the cold path unconditionally.
                 result = _do_call(delta_messages, session_mode, session_id)
                 return result, session_mode, session_id
-            return call_claude_with_tool_retry(
+
+            if fingerprint is not None and session_mode == "resume":
+                warm = _WARM_POOL.take_if_matching(fingerprint)
+                if warm is not None:
+                    try:
+                        result = warm.send_turn(delta_messages, stop=stop)
+                    except ClaudeCliError:
+                        warm.kill()
+                        raise
+                    if result["tool_calls"] or not tools_requested:
+                        # A WarmProcess serves exactly one turn, ever --
+                        # kill it now that this turn is done, same as
+                        # the streaming path (see there for the leak
+                        # this fixes: an unkilled spent process just
+                        # sits alive indefinitely).
+                        warm.kill()
+                        _park_next(session_id)
+                        return result, session_mode, session_id
+                    # Warm-served turn wanted a tool call but didn't get
+                    # one: fall through to the cold retry loop exactly
+                    # like a first cold attempt would (see
+                    # call_claude_with_tool_retry) -- the warm process is
+                    # already spent (one turn each) and not reused.
+                    warm.kill()
+
+            result, final_mode, final_id = call_claude_with_tool_retry(
                 delta_messages, full_messages, system_prompt, model,
                 tools_requested=tools_requested, session_mode=session_mode, session_id=session_id,
                 tools=tools, stop=stop, effort=effort,
             )
+            if fingerprint is not None:
+                _park_next(final_id)
+            return result, final_mode, final_id
 
 
     def _send_stream_chunks(self, model, choices):
