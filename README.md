@@ -1,8 +1,9 @@
 # claudecode-as-openai
 
-OpenAI-chat-completions-compatible HTTP shim over the local `claude` CLI
-(Claude Code), so any OpenAI-client-compatible tool can drive a Claude
-subscription instead of metered API billing.
+Exposes a local service with OpenAI-chat-completions compatible HTTP,
+that uses shell calls to `claude` CLI (Claude Code),
+so any OpenAI-client compatible tool/agent/harness can drive a Claude
+subscription instead of using its metered API billing directly.
 
 ## Why this exists
 
