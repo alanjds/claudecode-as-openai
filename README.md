@@ -15,7 +15,7 @@ API surfaces working reliably against a local Claude Code CLI/subscription.
 
 ## Installation
 
-```
+```console
 pip install claudecode-as-openai
 # or from source:
 pip install .
@@ -23,7 +23,7 @@ pip install .
 
 ## Quickstart
 
-```
+```console
 # Start the shim (default port 8977; override with CLAUDE_OPENAI_PORT):
 claudecode-as-openai
 
@@ -38,7 +38,7 @@ Or point any OpenAI-compatible client at `http://127.0.0.1:8977/v1`.
 
 Alternate invocation forms:
 
-```
+```console
 python3 -m claudecode_as_openai [port]
 python3 -m claudecode_as_openai.shim [port]
 claudecode-as-openai [port]
@@ -71,7 +71,7 @@ Legend: ✅ works, ⚠️ partial/limited, ❌ not implemented.
 
 ## Tests
 
-```
+```console
 # Offline unit tests (no live claude needed):
 python3 -m unittest tests.test_shim_unit -v
 
