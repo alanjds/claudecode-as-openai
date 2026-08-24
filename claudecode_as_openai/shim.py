@@ -41,6 +41,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CLAUDE_BIN = "claude"
 DEFAULT_MODEL = "sonnet"
+# Default port, overridable via CLAUDE_OPENAI_PORT env var. The running
+# Hermes Agent itself may already be consuming port 8977 (the shim it runs on),
+# so tests or secondary instances should use a different port via the env var.
+DEFAULT_PORT = int(os.environ.get("CLAUDE_OPENAI_PORT", "8977"))
+# When a caller doesn't pass `reasoning` at all (e.g. Hermes on a custom
+# provider URL, which skips extra_body.reasoning to avoid 400s on unknown
+# backends), fall back to this effort level rather than silently disabling
+# thinking. Set to the effort level configured in Hermes's reasoning_effort
+# config or any other value from _REASONING_EFFORT_MAP. Empty string or
+# absent = no default effort (thinking disabled unless explicitly requested).
+_DEFAULT_EFFORT_ENV = os.environ.get("CLAUDE_OPENAI_DEFAULT_EFFORT", "").strip().lower() or None
 KNOWN_MODEL_ALIASES = [
     # Hardcoded last-resort fallback for /v1/models when neither OAuth nor
     # an API key is available to query the real Anthropic /v1/models
@@ -147,9 +158,18 @@ def resolve_reasoning_effort(payload):
 
     Returns None when no `reasoning` key is present, or when
     `reasoning.effort` is explicitly "none".
+
+    Falls back to `_DEFAULT_EFFORT_ENV` (CLAUDE_OPENAI_DEFAULT_EFFORT)
+    when the payload has no `reasoning` key at all -- lets callers that
+    skip `extra_body.reasoning` for custom/localhost providers (e.g.
+    Hermes on a 127.0.0.1 base_url) still get thinking blocks when a
+    default is configured.
     """
     reasoning = payload.get("reasoning")
     if not isinstance(reasoning, dict):
+        # No reasoning key in payload -- apply env default (None if unset).
+        if _DEFAULT_EFFORT_ENV and _DEFAULT_EFFORT_ENV != "none":
+            return _REASONING_EFFORT_MAP.get(_DEFAULT_EFFORT_ENV, "medium")
         return None
     if reasoning.get("enabled") is False:
         return None
@@ -2171,7 +2191,7 @@ def main():
         print(__doc__)
         return
     try:
-        port = int(sys.argv[1]) if len(sys.argv) > 1 else 8977
+        port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
     except ValueError:
         print(f"Invalid port: {sys.argv[1]!r}", file=sys.stderr)
         sys.exit(2)
