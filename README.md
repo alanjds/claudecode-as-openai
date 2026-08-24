@@ -162,15 +162,16 @@ Every `claude` subprocess runs with:
 This package is licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
-and can undestand more at http://choosealicense.com/licenses/apache/ on the
+and can understand more at http://choosealicense.com/licenses/apache/ on the
 sidebar notes.
 
-Apache Licence v2.0 is a MIT-like licence. This means, in plain English:
+Apache License v2.0 is a MIT-like license. This means, in plain English:
 - It's truly open source
 - You can use it as you wish, for money or not
-- You can sublicence it (change the licence!!)
+- You can sublicense it (change the license!!)
 - This way, you can even use it on your closed-source project
+
 As long as:
-- You cannot use the authors name, logos, etc, to endorse a project
+- You cannot use the authors names, logos, etc, to endorse a project
 - You keep the authors copyright notices where this code got used, even on your closed-source project
 (come on, even Microsoft kept BSD notices on Windows about its TCP/IP stack :P)
