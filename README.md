@@ -156,3 +156,21 @@ Every `claude` subprocess runs with:
 - `--setting-sources ""` -- excludes `~/.claude/settings.json` and its hooks. Auth reads from the separate `~/.claude/.credentials.json` and is unaffected.
 - `--tools "" --strict-mcp-config --mcp-config '{"mcpServers":{}}'` on no-tools requests -- prevents locally-configured MCP servers from leaking into responses.
 - `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` -- disables the autoupdater, telemetry, error reporting, and feedback prompt. Side effect: `claude` won't self-update while running under this shim; run `claude update` manually on your own schedule.
+
+## License
+
+This package is licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+and can undestand more at http://choosealicense.com/licenses/apache/ on the
+sidebar notes.
+
+Apache Licence v2.0 is a MIT-like licence. This means, in plain English:
+- It's truly open source
+- You can use it as you wish, for money or not
+- You can sublicence it (change the licence!!)
+- This way, you can even use it on your closed-source project
+As long as:
+- You cannot use the authors name, logos, etc, to endorse a project
+- You keep the authors copyright notices where this code got used, even on your closed-source project
+(come on, even Microsoft kept BSD notices on Windows about its TCP/IP stack :P)

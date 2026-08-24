@@ -7,7 +7,8 @@ name = "claudecode-as-openai"
 dynamic = ["version"]
 description = "OpenAI-chat-completions-compatible HTTP shim over the local Claude Code CLI, for using a Claude subscription (not metered API billing) from any OpenAI-client-compatible tool."
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICEN[CS]E*"]
 authors = [{ name = "Alan Justino", email = "alan.justino@yahoo.com.br" }]
 requires-python = ">=3.9"
 dependencies = []
@@ -24,6 +25,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/alanjds/claudecode-as-openai"
+Issues = "https://github.com/alanjds/claudecode-as-openai/issues"
 
 [project.scripts]
 claudecode-as-openai = "claudecode_as_openai.shim:main"
