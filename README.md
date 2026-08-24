@@ -83,7 +83,7 @@ python3 tests/test_tool_call_reliability.py --attempts 15
 
 ---
 
-## Internals lore
+## Internals Lore
 
 The sections below are for contributors and the curious. Users can stop here.
 
