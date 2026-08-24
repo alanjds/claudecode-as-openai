@@ -445,32 +445,161 @@ def _fetch_models_from_anthropic_api(auth_header):
     return data
 
 
+def _anthropic_id_to_openrouter(model_id):
+    """Convert a Claude Code / Anthropic API model ID to the OpenRouter
+    canonical form: `anthropic/<family>-<major>.<minor>[-suffix]`.
+
+    Anthropic API returns IDs like `claude-opus-4-8-20260528` (dashes,
+    date suffix). OpenRouter advertises them as `anthropic/claude-opus-4.8`
+    (dots, no date suffix, prefixed). We emit BOTH so clients using either
+    naming convention see a match in our catalog.
+
+    Returns the OpenRouter-style ID, or None if the pattern doesn't match
+    (already-alias or unrecognised shape -- caller skips ORouter form)."""
+    import re as _re
+    # e.g. "claude-opus-4-8-20260528" or "claude-haiku-4-5-20251001"
+    m = _re.match(
+        r"^claude-(opus|sonnet|haiku|fable)-(\d+)-(\d+)(?:-\d{8})?$",
+        model_id,
+    )
+    if m:
+        family, major, minor = m.group(1), m.group(2), m.group(3)
+        return f"anthropic/claude-{family}-{major}.{minor}"
+    # e.g. "claude-opus-5" or "claude-fable-5" (no minor)
+    m2 = _re.match(r"^claude-(opus|sonnet|haiku|fable)-(\d+)$", model_id)
+    if m2:
+        family, major = m2.group(1), m2.group(2)
+        return f"anthropic/claude-{family}-{major}"
+    return None
+
+
+# OpenRouter-compatible supported_parameters for Claude models.
+# Older Claude 3 models don't support reasoning; everything 4+ does.
+# We tag all models generically with the superset -- the shim does not
+# distinguish per-model version here, so consumers should treat this as
+# "this endpoint supports reasoning" rather than per-model granularity.
+_SUPPORTED_PARAMS_WITH_REASONING = [
+    # Fully supported: honored on every request.
+    "include_reasoning",  # OpenRouter: return reasoning tokens in response
+    "max_tokens",         # -> CLAUDE_CODE_MAX_OUTPUT_TOKENS env var
+    "reasoning",          # -> --effort flag (see resolve_reasoning_effort)
+    "response_format",    # -> --json-schema (json_schema/json_object types)
+    "stop",               # client-side emulation via _apply_stop_sequences
+    "tools",              # native MCP tool registration (see build_mcp_tool_config)
+    "tool_choice",        # "none" fully honored; "required"/named: accepted, not enforced
+]
+_SUPPORTED_PARAMS_NO_REASONING = [
+    # Same as WITH_REASONING minus the reasoning-specific entries.
+    "max_tokens",
+    "response_format",
+    "stop",
+    "tools",
+    "tool_choice",
+]
+_LEGACY_NO_REASONING_PREFIXES = ("claude-3-",)
+
+
+def _supports_reasoning_params(model_id):
+    """Return True when the model ID looks like a reasoning-capable Claude
+    model (Claude 4+ family). Claude 3.x and older return False."""
+    import re as _re
+    lower = model_id.lower()
+    # Any Claude 3 model (3-haiku, 3.5-haiku, etc.)
+    if _re.search(r"claude-3", lower):
+        return False
+    # Claude 4+ opus/sonnet/haiku/fable all support reasoning
+    return True
+
+
+def _model_entry(model_id, context_length=None):
+    """Build an OpenRouter-compatible model entry dict for a single model.
+
+    Emits `supported_parameters` and a minimal `reasoning` object so
+    consumers (e.g. Hermes) can auto-detect reasoning support from the
+    catalog without per-model config. See README 'OpenRouter model-name
+    compatibility' for the schema source."""
+    has_reasoning = _supports_reasoning_params(model_id)
+    entry = {
+        "id": model_id,
+        "object": "model",
+        "supported_parameters": (
+            _SUPPORTED_PARAMS_WITH_REASONING if has_reasoning
+            else _SUPPORTED_PARAMS_NO_REASONING
+        ),
+    }
+    if context_length:
+        entry["context_length"] = context_length
+    if has_reasoning:
+        # Minimal OpenRouter-schema reasoning object. `mandatory: false`
+        # means reasoning can be disabled; `supported_efforts` matches the
+        # four values Claude Code's --effort flag accepts.
+        entry["reasoning"] = {
+            "mandatory": False,
+            "default_enabled": False,
+            "supports_max_tokens": True,
+            "supported_efforts": ["low", "medium", "high", "max"],
+            "default_effort": "medium",
+        }
+    return entry
+
+
 def fetch_model_list():
-    """Returns the real, current Anthropic model list for /v1/models.
-    Order tried: (1) Claude Code's own OAuth token, so callers don't need
-    a separate ANTHROPIC_API_KEY; (2) ANTHROPIC_API_KEY from the
-    environment; (3) KNOWN_MODEL_ALIASES hardcoded fallback. Results are
-    cached in-process for _MODEL_LIST_CACHE_TTL_S. Returns
-    [{"id": ..., "object": "model"}, ...]. Never raises."""
+    """Returns the current Anthropic model list for /v1/models, shaped as
+    OpenRouter-compatible entries with reasoning capability signals.
+
+    Each model is emitted TWICE:
+      1. In native Claude Code format (e.g. `claude-opus-4-8`) -- so a
+         client using Claude Code model names finds an exact match.
+      2. In OpenRouter format (e.g. `anthropic/claude-opus-4.8`, dotted,
+         prefixed) -- so a client configured for OpenRouter model names
+         also finds a match.
+
+    Both entries carry `supported_parameters` (including `"reasoning"` for
+    Claude 4+ models) and a `reasoning` object, so consumers like Hermes
+    can auto-detect reasoning capability from this catalog response without
+    any per-model config override.
+
+    Auth order: (1) Claude Code OAuth token; (2) ANTHROPIC_API_KEY env var;
+    (3) KNOWN_MODEL_ALIASES hardcoded fallback. Cached for
+    _MODEL_LIST_CACHE_TTL_S. Never raises."""
     with _model_list_cache_lock:
         cached = _model_list_cache["data"]
         if cached is not None and (time.time() - _model_list_cache["fetched_at"]) < _MODEL_LIST_CACHE_TTL_S:
             return cached
 
-    data = None
+    raw_data = None
     oauth_token = _read_claude_oauth_token()
     if oauth_token:
-        data = _fetch_models_from_anthropic_api({"Authorization": f"Bearer {oauth_token}"})
+        raw_data = _fetch_models_from_anthropic_api({"Authorization": f"Bearer {oauth_token}"})
 
-    if data is None:
+    if raw_data is None:
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if api_key:
-            data = _fetch_models_from_anthropic_api({"x-api-key": api_key})
+            raw_data = _fetch_models_from_anthropic_api({"x-api-key": api_key})
 
-    if data is not None:
-        result = [{"id": m["id"], "object": "model"} for m in data if m.get("id")]
+    seen_ids = set()
+    result = []
+
+    def add_entry(model_id, context_length=None):
+        if model_id and model_id not in seen_ids:
+            seen_ids.add(model_id)
+            result.append(_model_entry(model_id, context_length))
+
+    if raw_data is not None:
+        for m in raw_data:
+            native_id = m.get("id")
+            if not native_id:
+                continue
+            ctx = m.get("context_window") or m.get("context_length")
+            # Native Claude Code / Anthropic API ID (e.g. claude-opus-4-8-20260528)
+            add_entry(native_id, ctx)
+            # OpenRouter-format alias (e.g. anthropic/claude-opus-4.8)
+            or_id = _anthropic_id_to_openrouter(native_id)
+            add_entry(or_id, ctx)
     else:
-        result = [{"id": m, "object": "model"} for m in KNOWN_MODEL_ALIASES]
+        # Hardcoded fallback: bare aliases only, no OpenRouter duplicates
+        for alias in KNOWN_MODEL_ALIASES:
+            add_entry(alias)
 
     with _model_list_cache_lock:
         _model_list_cache["data"] = result
@@ -1760,6 +1889,10 @@ class Handler(BaseHTTPRequestHandler):
         stop = payload.get("stop")
         response_format = payload.get("response_format") or {}
         effort = resolve_reasoning_effort(payload)
+        # include_reasoning: OpenRouter's flag to include/suppress reasoning
+        # tokens in the response. True or absent = include (default); False =
+        # suppress reasoning/reasoning_details even when --effort was set.
+        include_reasoning = payload.get("include_reasoning", True)
 
         if n > MAX_N_CHOICES:
             raise ClaudeCliError(
@@ -1877,19 +2010,23 @@ class Handler(BaseHTTPRequestHandler):
             if tool_calls:
                 message["tool_calls"] = tool_calls
 
-            reasoning_details = build_reasoning_details(
-                result.get("reasoning"), result.get("reasoning_signature"),
-            )
-            if reasoning_details:
-                # OpenRouter's two supported shapes
-                # (https://openrouter.ai/docs/guides/best-practices/
-                # reasoning-tokens): `reasoning` (plaintext string) for
-                # simple consumers, `reasoning_details` (structured array,
-                # preserves the signature) for consumers that round-trip
-                # reasoning back into a follow-up request. Both point at
-                # the same captured thinking text.
-                message["reasoning"] = result["reasoning"]
-                message["reasoning_details"] = reasoning_details
+            if include_reasoning is not False:
+                # include_reasoning=False suppresses thinking blocks from the
+                # response even when --effort produced them. Default (True or
+                # absent) always includes them when present.
+                reasoning_details = build_reasoning_details(
+                    result.get("reasoning"), result.get("reasoning_signature"),
+                )
+                if reasoning_details:
+                    # OpenRouter's two supported shapes
+                    # (https://openrouter.ai/docs/guides/best-practices/
+                    # reasoning-tokens): `reasoning` (plaintext string) for
+                    # simple consumers, `reasoning_details` (structured array,
+                    # preserves the signature) for consumers that round-trip
+                    # reasoning back into a follow-up request. Both point at
+                    # the same captured thinking text.
+                    message["reasoning"] = result["reasoning"]
+                    message["reasoning_details"] = reasoning_details
 
             finish_reason = result["finish_reason"]
             if tool_calls:
