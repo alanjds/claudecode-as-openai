@@ -1385,7 +1385,44 @@ def _consume_claude_response(chunk_source, deadline, stop_sequences, stream_call
 
         if ctype == "rate_limit_event":
             global _rate_limit_cache
-            _rate_limit_cache = chunk.get("rate_limit_info")
+            info = chunk.get("rate_limit_info") or {}
+            _rate_limit_cache = info
+            status = info.get("status")
+            if status == "rejected":
+                # Quota window exhausted: failing immediately avoids
+                # burning tokens on retries that will all be rejected
+                # anyway (this was the root cause of the quota-burndown
+                # incident -- a stuck --resume kept retrying on 429s).
+                overage = info.get("overageStatus", "unknown")
+                five_h_util = (
+                    info.get("unifiedWindows", {})
+                    .get("five_hour", {})
+                    .get("utilization", 1.0)
+                )
+                sys.stderr.write(
+                    f"claudecode-as-openai: quota rejected"
+                    f" (5h={five_h_util*100:.1f}%, overage={overage});"
+                    f" failing immediately\n"
+                )
+                raise ClaudeCliError(
+                    429, "rate_limit_error",
+                    f"Claude Code quota rejected: 5-hour window at"
+                    f" {five_h_util*100:.1f}% ({overage}).",
+                    code="quota_rejected",
+                )
+            # Log when quota is getting high (once per function call, not
+            # once per session -- rate_limit_events arrive roughly once
+            # per API round-trip so this doesn't spam in normal usage).
+            five_h = info.get("unifiedWindows", {}).get("five_hour", {})
+            util = five_h.get("utilization", 0.0)
+            if util >= 0.9:
+                severity = "CRITICAL" if util >= 0.95 else "WARNING"
+                resets_at = five_h.get("resetsAt", "unknown")
+                sys.stderr.write(
+                    f"claudecode-as-openai: QUOTA_{severity}"
+                    f" 5h={util*100:.1f}% status={status}"
+                    f" resets_at={resets_at}\n"
+                )
             continue
 
         if ctype == "stream_event" and (stop_sequences or stream_callback):
