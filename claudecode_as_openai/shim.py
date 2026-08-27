@@ -1096,12 +1096,25 @@ class WarmPool:
     served from a ThreadingHTTPServer, so claiming/replacing the parked
     process must be atomic against a concurrent request doing the same."""
 
+    # A parked process that hasn't been claimed within this window is
+    # evicted: any gap longer than this means the conversation probably
+    # ended or moved on, so the next request will bring a different
+    # fingerprint and kill it anyway. Killing proactively here prevents
+    # the process from sitting alive indefinitely if the user never
+    # returns -- which is exactly what caused the quota-burndown incident
+    # (a parked --resume process kept retrying an invalid session for hours).
+    _PARK_IDLE_TIMEOUT_S = 300   # 5 minutes idle (parked, unclaimed)
+    # Hard upper bound on a process's entire lifetime regardless of idle
+    # state: caps the worst-case quota burn from a stuck parked subprocess.
+    _LIFETIME_TIMEOUT_S = 600    # 10 minutes total
+
     def __init__(self):
         self._lock = threading.Lock()
         self._parked = None  # WarmProcess | None
 
     def take_if_matching(self, fingerprint):
-        """Returns the parked WarmProcess if it exists, is alive, and
+        """Returns the parked WarmProcess if it exists, is alive, not
+        stale (idle or lifetime timeout -- see class constants), and
         matches `fingerprint` (same conversation), claiming it
         atomically so no other request can also take it. Returns None
         otherwise -- including when a parked process exists but is for
@@ -1112,6 +1125,31 @@ class WarmPool:
         with self._lock:
             candidate = self._parked
             if candidate is None:
+                return None
+            now = time.time()
+            # Kill stale processes before even checking fingerprint.
+            # Idle check: parked too long without being claimed.
+            if (candidate.parked_at is not None
+                    and now - candidate.parked_at > self._PARK_IDLE_TIMEOUT_S):
+                self._parked = None
+                idle_s = now - candidate.parked_at
+                sys.stderr.write(
+                    f"claudecode-as-openai: warm-pool: evicting"
+                    f" {candidate.session_id} -- idle {idle_s:.0f}s"
+                    f" > {self._PARK_IDLE_TIMEOUT_S}s limit\n"
+                )
+                candidate.kill()
+                return None
+            # Lifetime check: total age since spawn.
+            if now - candidate.spawned_at > self._LIFETIME_TIMEOUT_S:
+                self._parked = None
+                age_s = now - candidate.spawned_at
+                sys.stderr.write(
+                    f"claudecode-as-openai: warm-pool: evicting"
+                    f" {candidate.session_id} -- lifetime {age_s:.0f}s"
+                    f" > {self._LIFETIME_TIMEOUT_S}s limit\n"
+                )
+                candidate.kill()
                 return None
             if candidate.fingerprint != fingerprint:
                 self._parked = None
