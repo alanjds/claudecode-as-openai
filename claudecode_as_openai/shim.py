@@ -204,6 +204,12 @@ _MODEL_LIST_CACHE_TTL_S = 300
 _model_list_cache = {"data": None, "fetched_at": 0.0}
 _model_list_cache_lock = threading.Lock()
 
+# Quota state captured from rate_limit_event chunks during completions.
+# Updated on every completion that receives a rate_limit_event, then read
+# by /v1/key, /v1/credits, and /health endpoints for monitoring. Initialized
+# to None; stays None until the first completion.
+_rate_limit_cache = None
+
 # Every spawned `claude` subprocess inherits whatever directory the shim
 # process happens to be running from, and Claude Code can read real
 # files there. Spawning every `claude` call from a dedicated, empty,
