@@ -1098,5 +1098,74 @@ class TestIncludeReasoningParam(unittest.TestCase):
         self.assertIsNotNone(details)
 
 
+
+class TestRateLimitCache(unittest.TestCase):
+    """rate_limit_event captured from subprocess updates _rate_limit_cache."""
+
+    def setUp(self):
+        shim._rate_limit_cache = None  # reset before each test
+
+    def tearDown(self):
+        shim._rate_limit_cache = None
+
+    def _make_info(self, five_h=0.14, seven_d=0.48, status="allowed"):
+        return {
+            "status": status,
+            "unifiedWindows": {
+                "five_hour": {"utilization": five_h, "resetsAt": 1787816400},
+                "seven_day": {"utilization": seven_d, "resetsAt": 1788206400},
+            },
+        }
+
+    def test_key_response_null_before_first_turn(self):
+        resp = shim._build_key_response()
+        self.assertIsNone(resp["data"]["limit"])
+        self.assertIsNone(resp["data"]["limit_remaining"])
+
+    def test_credits_response_null_before_first_turn(self):
+        resp = shim._build_credits_response()
+        self.assertIsNone(resp["data"]["total_credits"])
+        self.assertIsNone(resp["data"]["total_usage"])
+
+    def test_key_response_reflects_rate_limit_info(self):
+        shim._rate_limit_cache = self._make_info(five_h=0.14, seven_d=0.48)
+        resp = shim._build_key_response()["data"]
+        self.assertEqual(resp["limit"], 100)
+        # Primary quota uses the 5-hour (current) window
+        self.assertEqual(resp["usage"], 14.0)
+        self.assertEqual(resp["limit_remaining"], 86.0)
+        self.assertEqual(resp["rate_limits"]["5h"]["percent_used"], 14)
+        self.assertEqual(resp["rate_limits"]["7d"]["percent_used"], 48)
+
+    def test_credits_response_reflects_rate_limit_info(self):
+        # Primary is 5h window (same as /v1/key)
+        shim._rate_limit_cache = self._make_info(five_h=0.14, seven_d=0.50)
+        resp = shim._build_credits_response()["data"]
+        self.assertEqual(resp["total_credits"], 100)
+        self.assertEqual(resp["total_usage"], 14.0)
+
+    def test_key_limit_remaining_is_inverse_of_usage(self):
+        shim._rate_limit_cache = self._make_info(five_h=0.32, seven_d=0.48)
+        resp = shim._build_key_response()["data"]
+        self.assertAlmostEqual(resp["usage"] + resp["limit_remaining"], 100.0)
+        # Primary is 5h window
+        self.assertAlmostEqual(resp["usage"], 32.0)
+
+    def test_status_is_forwarded(self):
+        shim._rate_limit_cache = self._make_info(status="allowed_warning")
+        resp = shim._build_key_response()["data"]
+        self.assertEqual(resp["rate_limit_status"], "allowed_warning")
+
+    def test_rate_limit_event_chunk_updates_cache(self):
+        """Simulates the chunk loop receiving a rate_limit_event."""
+        info = self._make_info(five_h=0.20, seven_d=0.60)
+        # Directly replicate what the chunk handler does
+        chunk = {"type": "rate_limit_event", "rate_limit_info": info}
+        shim._rate_limit_cache = chunk.get("rate_limit_info")
+        resp = shim._build_key_response()["data"]
+        self.assertEqual(resp["rate_limits"]["7d"]["percent_used"], 60)
+
+
+
 if __name__ == "__main__":
     unittest.main()

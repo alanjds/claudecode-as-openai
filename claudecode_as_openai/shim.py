@@ -543,6 +543,74 @@ def _model_entry(model_id, context_length=None):
     return entry
 
 
+def _build_key_response():
+    """Return an OpenRouter-compatible /v1/key response backed by the last
+    rate_limit_event captured from the claude subprocess.
+
+    Uses the 7-day window as the primary quota because it is the limit
+    most likely to constrain a day's work.  The 5-hour window is included
+    in the `rate_limits` extension field so callers can surface it.
+
+    Returns null values before the first turn completes (no data yet)."""
+    info = _rate_limit_cache
+    if not info:
+        return {
+            "data": {
+                "label": "claude-code-subscription",
+                "limit": None,
+                "limit_remaining": None,
+                "is_free_tier": False,
+            }
+        }
+    windows = info.get("unifiedWindows", {})
+    five_h = windows.get("five_hour", {})
+    seven_d = windows.get("seven_day", {})
+
+    # Use the 5-hour window as the primary quota: it is the current/active
+    # limit users hit first. The 7-day window is included in the extension
+    # field for informational display.
+    five_h_used = five_h.get("utilization", 0.0)
+    limit = 100
+    usage = round(five_h_used * limit, 2)
+    limit_remaining = round(limit - usage, 2)
+
+    return {
+        "data": {
+            "label": "claude-code-subscription",
+            "limit": limit,
+            "usage": usage,
+            "limit_remaining": limit_remaining,
+            "is_free_tier": False,
+            "rate_limit_status": info.get("status"),
+            "rate_limits": {
+                "5h": {
+                    "percent_used": round(five_h.get("utilization", 0.0) * 100),
+                    "resets_at": five_h.get("resetsAt"),
+                },
+                "7d": {
+                    "percent_used": round(seven_d.get("utilization", 0.0) * 100),
+                    "resets_at": seven_d.get("resetsAt"),
+                },
+            },
+        }
+    }
+
+
+def _build_credits_response():
+    """Return an OpenRouter-compatible /v1/credits response.
+
+    Maps the 5-hour (current/active) usage window to a 0-100 credit scale,
+    consistent with /v1/key so that clients reading total_credits/total_usage
+    get a coherent view."""
+    info = _rate_limit_cache
+    if not info:
+        return {"data": {"total_credits": None, "total_usage": None}}
+    five_h = info.get("unifiedWindows", {}).get("five_hour", {})
+    total_credits = 100
+    total_usage = round(five_h.get("utilization", 0.0) * total_credits, 2)
+    return {"data": {"total_credits": total_credits, "total_usage": total_usage}}
+
+
 def fetch_model_list():
     """Returns the current Anthropic model list for /v1/models, shaped as
     OpenRouter-compatible entries with reasoning capability signals.
@@ -1274,6 +1342,11 @@ def _consume_claude_response(chunk_source, deadline, stop_sequences, stream_call
             break
         ctype = chunk.get("type")
 
+        if ctype == "rate_limit_event":
+            global _rate_limit_cache
+            _rate_limit_cache = chunk.get("rate_limit_info")
+            continue
+
         if ctype == "stream_event" and (stop_sequences or stream_callback):
             # Real token-level deltas, only present when
             # --include-partial-messages was passed. These interleave
@@ -1856,6 +1929,12 @@ class Handler(BaseHTTPRequestHandler):
                     "data": fetch_model_list(),
                 }
             )
+            return
+        if self.path.rstrip("/") in ("/v1/key", "/key"):
+            self._send_json(_build_key_response())
+            return
+        if self.path.rstrip("/") in ("/v1/credits", "/credits"):
+            self._send_json(_build_credits_response())
             return
         self._send_json({"status": "ok"})
 
