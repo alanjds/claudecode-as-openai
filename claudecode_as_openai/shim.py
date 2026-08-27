@@ -1054,7 +1054,26 @@ class WarmProcess:
 
         def chunk_source():
             while True:
-                item = self._line_queue.get(timeout=CLAUDE_TIMEOUT_S)
+                try:
+                    item = self._line_queue.get(timeout=CLAUDE_TIMEOUT_S)
+                except queue.Empty:
+                    # No output from the warm process for CLAUDE_TIMEOUT_S
+                    # seconds -- it is stuck. Kill it so quota stops burning
+                    # and surface a proper error to the caller.
+                    elapsed = time.time() - self.spawned_at
+                    sys.stderr.write(
+                        f"claudecode-as-openai: warm-pool: subprocess"
+                        f" {self.session_id} produced no output for"
+                        f" {CLAUDE_TIMEOUT_S}s (total age {elapsed:.0f}s);"
+                        f" killing\n"
+                    )
+                    self.kill()
+                    raise ClaudeCliError(
+                        500, "api_error",
+                        f"Warm-pool subprocess timed out after"
+                        f" {CLAUDE_TIMEOUT_S}s with no output.",
+                        code="warm_process_timeout",
+                    )
                 if item is None:
                     return
                 yield item
