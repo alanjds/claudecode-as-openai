@@ -1136,6 +1136,7 @@ class WarmPool:
     def __init__(self):
         self._lock = threading.Lock()
         self._parked = None  # WarmProcess | None
+        self._reaper_thread = None  # Background thread that evicts stale processes
 
     def take_if_matching(self, fingerprint):
         """Returns the parked WarmProcess if it exists, is alive, not
@@ -1187,11 +1188,30 @@ class WarmPool:
 
     def park(self, warm_process):
         """Installs `warm_process` as the new parked process, killing
-        whatever was parked before it (there is only ever one)."""
+        whatever was parked before it (there is only ever one). Also
+        checks if the process is already stale (shouldn't happen in normal
+        flow, but defensive against race conditions) and starts the reaper
+        thread if it's not already running."""
         with self._lock:
             stale = self._parked
+            now = time.time()
+            # Defensive check: if somehow the new process is already stale,
+            # don't park it, just kill it immediately.
+            if (now - warm_process.spawned_at > self._LIFETIME_TIMEOUT_S
+                    or (warm_process.parked_at is not None
+                        and now - warm_process.parked_at > self._PARK_IDLE_TIMEOUT_S)):
+                sys.stderr.write(
+                    f"claudecode-as-openai: warm-pool: not parking {warm_process.session_id}"
+                    f" -- already stale on arrival\n"
+                )
+                warm_process.kill()
+                return
             self._parked = warm_process
-            warm_process.parked_at = time.time()  # mark when parked
+            warm_process.parked_at = now
+            # Start the reaper thread if it's not already running
+            if self._reaper_thread is None or not self._reaper_thread.is_alive():
+                self._reaper_thread = threading.Thread(target=self._reap_loop, daemon=True)
+                self._reaper_thread.start()
         if stale is not None:
             stale.kill()
 
@@ -1206,6 +1226,41 @@ class WarmPool:
                 return
             self._parked = None
         candidate.kill()
+
+    def _reap_loop(self):
+        """Background thread that periodically evicts stale parked processes.
+        Runs once the first process is parked, sleeps 60 seconds between checks.
+        Exits cleanly if _parked becomes None."""
+        while True:
+            time.sleep(60)  # Check every 60 seconds for stale processes
+            with self._lock:
+                candidate = self._parked
+                if candidate is None:
+                    # No process parked; reaper can exit
+                    return
+                now = time.time()
+                # Check if stale
+                if now - candidate.spawned_at > self._LIFETIME_TIMEOUT_S:
+                    age = now - candidate.spawned_at
+                    sys.stderr.write(
+                        f"claudecode-as-openai: warm-pool: reaper evicting"
+                        f" {candidate.session_id} -- lifetime {age:.0f}s"
+                        f" > {self._LIFETIME_TIMEOUT_S}s limit\n"
+                    )
+                    self._parked = None
+                    candidate.kill()
+                    return
+                elif (candidate.parked_at is not None
+                        and now - candidate.parked_at > self._PARK_IDLE_TIMEOUT_S):
+                    idle = now - candidate.parked_at
+                    sys.stderr.write(
+                        f"claudecode-as-openai: warm-pool: reaper evicting"
+                        f" {candidate.session_id} -- idle {idle:.0f}s"
+                        f" > {self._PARK_IDLE_TIMEOUT_S}s limit\n"
+                    )
+                    self._parked = None
+                    candidate.kill()
+                    return
 
 
 _WARM_POOL = WarmPool()
