@@ -683,10 +683,10 @@ def fetch_model_list():
 
 def render_tools_into_system_prompt(tools, base_system_prompt):
     """LEGACY prose-based tool-description fallback, superseded by
-    build_mcp_tool_config() (real MCP tool schemas). Kept as an automatic
+    build_mcp_tool_manifest() (real MCP tool schemas). Kept as an automatic
     fallback for tool names that can't be represented as a valid MCP
     tool name -- see call_claude_streaming's use of this function only
-    when build_mcp_tool_config() returns None. Framing tools as
+    when build_mcp_tool_manifest() returns None. Framing tools as
     already-wired, real, harness-implemented tools (not "custom"/
     hypothetical) is what makes Claude actually call them instead of
     hedging; this path still only reaches ~40% single-shot reliability
@@ -716,6 +716,9 @@ def render_tools_into_system_prompt(tools, base_system_prompt):
     if base_system_prompt:
         return base_system_prompt + "\n\n" + tool_desc
     return tool_desc
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -949,7 +952,10 @@ class WarmProcess:
         self._start()
 
     def _start(self):
-        max_turns = 2 if self.mcp_tool_config else 1
+        # Warm pool always resumes a known session; json_schema=None here
+        # (json_schema requires fresh spawns with full orchestration). With
+        # prose fallback removed, max_turns=1 is always safe.
+        max_turns = 1
         cmd = _build_claude_cmd(
             self.model, "resume", self.session_id, self.tools_requested, max_turns,
             json_schema=None, want_partial_messages=self.use_pty,
@@ -1749,11 +1755,10 @@ def call_claude_streaming(
     # --json-schema needs a couple of internal turns (an internal
     # "StructuredOutput" tool call + a corrective retry if the model
     # forgets it) to actually enforce the schema -- max_turns=1 leaves it
-    # hanging at error_max_turns. Native MCP tool dispatch also needs 2
-    # turns when a tool fires (though this shim breaks out on tool_use
-    # before that matters -- see below), so max_turns stays >= 2 whenever
-    # any real tool dispatch is possible.
-    max_turns = 3 if json_schema is not None else (2 if mcp_tool_config else 1)
+    # hanging at error_max_turns. MCP tool dispatch (and prose fallback, now
+    # removed) both break out on tool_use before a second turn matters, so
+    # max_turns stays >= 2 only when json_schema is set.
+    max_turns = 3 if json_schema is not None else 1
     cmd = _build_claude_cmd(
         model, session_mode, session_id, tools_requested, max_turns, json_schema,
         want_partial_messages=bool(stop_sequences) or stream_callback is not None,
@@ -2099,6 +2104,36 @@ class Handler(BaseHTTPRequestHandler):
     def _send_error(self, err: ClaudeCliError):
         self._send_json(err.to_openai_body(), err.http_status)
 
+    def _check_quota_headroom(self):
+        """Early check: if quota is rejected and won't reset soon, fail fast
+        without spawning claude. Saves subprocess overhead when we know it
+        will fail anyway."""
+        info = _rate_limit_cache
+        if not info:
+            # No quota data yet; proceed normally
+            return
+        status = info.get("status")
+        if status != "rejected":
+            # Quota is not currently exhausted; proceed
+            return
+        # Quota is rejected. Check if the 5h window has reset yet.
+        resets_at = info.get("unifiedWindows", {}).get("five_hour", {}).get("resetsAt")
+        if resets_at is None:
+            # No reset time available; proceed (defensive)
+            return
+        now = time.time()
+        if now < resets_at:
+            # 5h window hasn't reset yet; fail immediately
+            secs_until_reset = int(resets_at - now)
+            raise ClaudeCliError(
+                429, "rate_limit_error",
+                f"Claude Code quota rejected. 5-hour window resets in {secs_until_reset}s.",
+                code="quota_rejected_known_reset",
+            )
+        # Window has reset but status is still "rejected" (stale cache or
+        # 7-day limit exhausted); proceed and let the subprocess discover
+        # the real state
+
     def do_GET(self):
         if self.path.rstrip("/") in ("/v1/models", "/models"):
             self._send_json(
@@ -2194,6 +2229,10 @@ class Handler(BaseHTTPRequestHandler):
         # suppress reasoning/reasoning_details even when --effort was set.
         include_reasoning = payload.get("include_reasoning", True)
 
+        # Short-circuit if quota is exhausted and won't reset for a while.
+        # Check before any subprocess spawn to save time/resources.
+        self._check_quota_headroom()
+
         if n > MAX_N_CHOICES:
             raise ClaudeCliError(
                 400, "invalid_request_error",
@@ -2221,12 +2260,13 @@ class Handler(BaseHTTPRequestHandler):
         system_prompt = system_prompt_from_messages(messages)
         # Native MCP tool registration is the real fix for tool-call
         # reliability and is always attempted first inside
-        # call_claude_streaming/_run_one_completion. The prose fallback
-        # below is only needed when a tool name can't be represented as a
-        # valid MCP tool name -- checked here up front so the prompt
-        # doesn't carry redundant tool descriptions on the common path.
+        # call_claude_streaming/_run_one_completion. If any tool name can't
+        # be represented as a valid MCP tool name, it will be silently dropped
+        # (MCP is the only supported path now; prose fallback removed).
         if effective_tools and build_mcp_tool_manifest(effective_tools) is None:
-            system_prompt = render_tools_into_system_prompt(effective_tools, system_prompt)
+            # Tool name(s) fail MCP constraint -- drop them silently rather
+            # than falling back to prose (removed for cost: max_turns=1 now)
+            effective_tools = None
 
         env_overrides = dict(_BASE_ENV_OVERRIDES)
         if max_tokens:
