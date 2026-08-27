@@ -938,6 +938,8 @@ class WarmProcess:
         self._line_queue = queue.Queue()
         self._lock = threading.Lock()
         self._claimed = False
+        self.spawned_at = time.time()  # when this process was spawned
+        self.parked_at = None          # set by WarmPool.park(); when it was parked idle
         self._start()
 
     def _start(self):
@@ -1126,6 +1128,7 @@ class WarmPool:
         with self._lock:
             stale = self._parked
             self._parked = warm_process
+            warm_process.parked_at = time.time()  # mark when parked
         if stale is not None:
             stale.kill()
 
