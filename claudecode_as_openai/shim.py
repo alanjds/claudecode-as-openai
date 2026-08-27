@@ -2033,7 +2033,50 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.rstrip("/") in ("/v1/credits", "/credits"):
             self._send_json(_build_credits_response())
             return
+        if self.path.rstrip("/") in ("/health", "/v1/health"):
+            self._send_json(self._build_health())
+            return
         self._send_json({"status": "ok"})
+
+    def _build_health(self):
+        """Returns a dict with quota and warm-pool state for the /health
+        endpoint.  Useful for monitoring: lets operators see quota
+        utilization and whether a parked process is sitting alive without
+        making a real completion call."""
+        health = {"status": "ok"}
+        # Quota info -- populated after the first completion that returned
+        # a rate_limit_event; null before that.
+        info = _rate_limit_cache
+        if info:
+            windows = info.get("unifiedWindows", {})
+            five_h = windows.get("five_hour", {})
+            seven_d = windows.get("seven_day", {})
+            health["quota"] = {
+                "status": info.get("status"),
+                "5h_utilization": five_h.get("utilization"),
+                "5h_resets_at": five_h.get("resetsAt"),
+                "7d_utilization": seven_d.get("utilization"),
+                "overage_status": info.get("overageStatus"),
+            }
+        else:
+            health["quota"] = None
+        # Warm-pool state.
+        with _WARM_POOL._lock:
+            parked = _WARM_POOL._parked
+            if parked is not None and parked.is_alive():
+                now = time.time()
+                health["warm_pool"] = {
+                    "active": True,
+                    "session_id": parked.session_id,
+                    "spawned_s_ago": round(now - parked.spawned_at, 1),
+                    "parked_s_ago": (
+                        round(now - parked.parked_at, 1)
+                        if parked.parked_at is not None else None
+                    ),
+                }
+            else:
+                health["warm_pool"] = {"active": False}
+        return health
 
     def do_POST(self):
         if self.path.rstrip("/") != "/v1/chat/completions":
