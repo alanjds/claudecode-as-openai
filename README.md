@@ -67,7 +67,7 @@ Legend: ✅ works, ⚠️ partial/limited, ❌ not implemented.
 | Vision / image blocks | ❌ | Silently dropped. |
 | Error responses | ✅ | Translated to proper OpenAI `{"error": {"message", "type", "code"}}` with matching HTTP status (400/404/429/500/503). |
 | `/v1/models` | ✅ | Queries the real Anthropic model list, using Claude Code's own OAuth token, then `ANTHROPIC_API_KEY`, then a hardcoded fallback. Cached 5 minutes. |
-| Authentication | ❌ | None. Fine as `127.0.0.1` binding is hardcoded. |
+| Authentication | ❌ | Not needed. Ignored if provided. Fine as `127.0.0.1` binding is hardcoded. |
 
 ## Tests
 
@@ -83,7 +83,7 @@ python3 tests/test_tool_call_reliability.py --attempts 15
 
 ---
 
-## Internals lore
+## Internals Lore
 
 The sections below are for contributors and the curious. Users can stop here.
 
