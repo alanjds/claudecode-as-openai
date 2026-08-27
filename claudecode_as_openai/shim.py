@@ -1266,6 +1266,26 @@ class WarmPool:
 _WARM_POOL = WarmPool()
 
 
+def _log_quota_snapshot():
+    """Log current quota state to stderr if available. Called after every
+    completion to give operators visibility into quota burn rate and
+    remaining headroom."""
+    info = _rate_limit_cache
+    if not info:
+        return
+    status = info.get("status", "unknown")
+    five_h = info.get("unifiedWindows", {}).get("five_hour", {})
+    util = five_h.get("utilization", 0.0)
+    resets_at = five_h.get("resetsAt")
+    # Only log at WARNING/CRITICAL levels to reduce noise on normal operations
+    if util >= 0.90:
+        severity = "CRITICAL" if util >= 0.95 else "WARNING"
+        sys.stderr.write(
+            "claudecode-as-openai: quota_snapshot status=%s util_5h=%.1f%% "
+            "severity=%s resets_at=%s\n" % (status, util * 100, severity, resets_at)
+        )
+
+
 def _parking_fingerprint(conv_key, model, tools_requested, tools, effort, env_overrides=None):
     """What must stay IDENTICAL between the turn a WarmProcess was
     parked for and the turn that claims it. Deliberately includes
@@ -2328,6 +2348,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if stream:
             self._send_stream_chunks(model, choices)
+            _log_quota_snapshot()
             return
 
         response = {
@@ -2339,6 +2360,7 @@ class Handler(BaseHTTPRequestHandler):
             "usage": _build_openai_usage(usage_totals),
         }
         self._send_json(response)
+        _log_quota_snapshot()
 
     def _handle_streaming_completion(self, messages, model, system_prompt, max_tokens, env_overrides, stop):
         """Real token-level SSE streaming for the safe case (single choice,
