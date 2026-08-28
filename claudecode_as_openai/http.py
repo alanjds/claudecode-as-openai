@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""OpenAI-chat-completions-compatible shim over the local Claude Code CLI.
-
-Translates OpenAI's `/v1/chat/completions` API onto `claude -p` (Claude
-Code's non-interactive mode): native tool-calling via MCP tool
-registration, session caching via --session-id/--resume, OpenAI-shaped
-error translation, response_format via --json-schema, OpenRouter model-
-name and reasoning-effort compatibility, and stop-sequence emulation.
+"""OpenAI-chat-completions-compatible shim over the local Claude Code CLI:
+the HTTP request handler and server entry point. Translates OpenAI's
+`/v1/chat/completions` API onto `claude -p` (Claude Code's non-interactive
+mode): native tool-calling via MCP tool registration, session caching via
+--session-id/--resume, OpenAI-shaped error translation, response_format
+via --json-schema, OpenRouter model-name and reasoning-effort
+compatibility, and stop-sequence emulation.
 
 See README.md "Capability audit" for the full, empirically-verified list
 of what works, what's approximated, and what's a genuine CLI limitation,
@@ -21,69 +21,101 @@ Point Hermes at it:
     hermes config set model.api_key not-needed
     hermes config set model.default sonnet
 """
-import hashlib
 import json
 import os
-import pty
-import queue
-import re
-import select
-import subprocess
 import sys
-import tempfile
-import threading
 import time
-import urllib.error
-import urllib.request
 import uuid
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-CLAUDE_BIN = "claude"
-DEFAULT_MODEL = "sonnet"
-# Default port, overridable via CLAUDE_OPENAI_PORT env var. The running
-# Hermes Agent itself may already be consuming port 8977 (the shim it runs on),
-# so tests or secondary instances should use a different port via the env var.
-DEFAULT_PORT = int(os.environ.get("CLAUDE_OPENAI_PORT", "8977"))
-# When a caller doesn't pass `reasoning` at all (e.g. Hermes on a custom
-# provider URL, which skips extra_body.reasoning to avoid 400s on unknown
-# backends), fall back to this effort level rather than silently disabling
-# thinking. Set to the effort level configured in Hermes's reasoning_effort
-# config or any other value from _REASONING_EFFORT_MAP. Empty string or
-# absent = no default effort (thinking disabled unless explicitly requested).
-_DEFAULT_EFFORT_ENV = os.environ.get("CLAUDE_OPENAI_DEFAULT_EFFORT", "").strip().lower() or None
-KNOWN_MODEL_ALIASES = [
-    # Hardcoded last-resort fallback for /v1/models when neither OAuth nor
-    # an API key is available to query the real Anthropic /v1/models
-    # endpoint (see fetch_model_list()). Extracted from strings embedded
-    # in the compiled `claude` binary (2026-08-14) -- will go stale as new
-    # models ship, which is exactly why the live query is preferred.
-    "sonnet", "opus", "haiku",
-]
-CLAUDE_TIMEOUT_S = 300
-
-# OpenRouter model-slug compatibility (see CHANGELOG). Translates
-# OpenRouter's Anthropic model naming convention
-# (`anthropic/claude-sonnet-4.5`, `~anthropic/claude-sonnet-latest`) into
-# Claude Code's own `--model` convention (`claude-sonnet-4-5`, bare
-# `sonnet`/`opus`/`haiku` aliases) so a client pointed at this shim with
-# an OpenRouter-style model string just works.
-_OPENROUTER_LATEST_ALIAS_RE = re.compile(r"^claude-(sonnet|opus|haiku)-latest$")
-_OPENROUTER_VERSION_RE = re.compile(r"^claude-(sonnet|opus|haiku)-(\d+)\.(\d+)$")
-_OPENROUTER_FAST_SUFFIX_RE = re.compile(r"^(claude-(?:sonnet|opus|haiku)-[\d.]+)-fast$")
-_warned_fast_models = set()
-
-
-
-
-# Local imports
-from claudecode_as_openai.constants import DEFAULT_MODEL, TOOL_CALL_MAX_RETRIES, _EXTENDED_DISALLOWED_TOOLS
-from claudecode_as_openai.state import initialize, _WARM_POOL, _WARM_POOL_LOCK, _CLAUDE_CWD
+from claudecode_as_openai.constants import DEFAULT_MODEL, MAX_N_CHOICES, _BASE_ENV_OVERRIDES
+from claudecode_as_openai import state
 from claudecode_as_openai.errors import ClaudeCliError
-from claudecode_as_openai.models import fetch_model_list, normalize_model_name
-from claudecode_as_openai.streaming import call_claude_streaming
-from claudecode_as_openai.warm_pool import WarmPool
-from claudecode_as_openai.quota import _build_key_response, _build_credits_response
+from claudecode_as_openai.models import fetch_model_list, normalize_model_name, resolve_reasoning_effort
+from claudecode_as_openai.messages import build_claude_messages, system_prompt_from_messages
+from claudecode_as_openai.tools import build_mcp_tool_manifest, build_mcp_tool_config
+from claudecode_as_openai.sessions import resolve_session, record_session
+from claudecode_as_openai.streaming import (
+    call_claude_streaming, call_claude_with_tool_retry, build_reasoning_details,
+    _build_openai_usage, _apply_stop_sequences,
+)
+from claudecode_as_openai.warm_pool import WarmProcess, _parking_fingerprint
+from claudecode_as_openai.quota import _build_key_response, _build_credits_response, _log_quota_snapshot
+
+DEFAULT_PORT = int(os.environ.get("CLAUDE_OPENAI_PORT", "8977"))
+
+# Eager on import (matching the original monolith's module-level
+# `_CLAUDE_CWD = tempfile.mkdtemp(...)` / `_WARM_POOL = WarmPool()`):
+# Handler methods assume both are already real values, not None, from the
+# moment this module is importable -- see state.initialize().
+state.initialize()
+
+_UNSUPPORTED_SAMPLING_PARAMS = (
+    "temperature", "top_p", "seed", "logprobs", "top_logprobs",
+    "presence_penalty", "frequency_penalty", "logit_bias",
+)
+_warned_sampling_params = set()
+
+
+def _warn_unsupported_sampling_params(payload):
+    """Emit a one-time-per-parameter-name stderr warning when a request
+    includes a sampling parameter Claude Code has no way to honor. Does
+    NOT reject the request -- these are silently accepted (never
+    hard-errored) because real OpenAI clients routinely send explicit
+    defaults on every request (e.g. `temperature: 1.0`, the OpenAI
+    default itself, carries no signal the caller wants non-default
+    behavior) -- hard-erroring on presence-of-key would break
+    compatibility with well-behaved clients for no benefit."""
+    for name in _UNSUPPORTED_SAMPLING_PARAMS:
+        if name in payload and payload[name] is not None and name not in _warned_sampling_params:
+            _warned_sampling_params.add(name)
+            sys.stderr.write(
+                f"claudecode-as-openai: warning: '{name}' was requested but Claude "
+                f"Code has no equivalent (no CLI flag, no env var) -- ignored, not "
+                f"applied. See README \"Capability audit\".\n"
+            )
+
+
+def _build_sse_chunk(chat_id, created, model, index, delta, finish=None):
+    """Shared shape for an OpenAI `chat.completion.chunk` SSE event, used
+    by both the real-token streaming path and the buffered-then-emit
+    streaming path."""
+    return {
+        "id": chat_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": index, "delta": delta, "finish_reason": finish}],
+    }
+
+
+@contextmanager
+def _scoped_env_overrides(env_overrides):
+    """Temporarily patches subprocess.Popen so any process it spawns
+    while this context is active inherits `env_overrides` merged into
+    the current environment. Used to scope CLAUDE_CODE_MAX_OUTPUT_TOKENS
+    (from `max_tokens`) to a single completion's subprocess call without
+    mutating the shim's own process-wide environment."""
+    import subprocess
+
+    if not env_overrides:
+        yield
+        return
+    original_popen = subprocess.Popen
+
+    def scoped_popen(*args, **kwargs):
+        env = dict(os.environ)
+        env.update(env_overrides)
+        kwargs["env"] = env
+        return original_popen(*args, **kwargs)
+
+    subprocess.Popen = scoped_popen
+    try:
+        yield
+    finally:
+        subprocess.Popen = original_popen
+
 
 class Handler(BaseHTTPRequestHandler):
     def _send_json(self, obj, status=200):
@@ -101,7 +133,7 @@ class Handler(BaseHTTPRequestHandler):
         """Early check: if quota is rejected and won't reset soon, fail fast
         without spawning claude. Saves subprocess overhead when we know it
         will fail anyway."""
-        info = _rate_limit_cache
+        info = state._rate_limit_cache
         if not info:
             # No quota data yet; proceed normally
             return
@@ -155,7 +187,7 @@ class Handler(BaseHTTPRequestHandler):
         health = {"status": "ok"}
         # Quota info -- populated after the first completion that returned
         # a rate_limit_event; null before that.
-        info = _rate_limit_cache
+        info = state._rate_limit_cache
         if info:
             windows = info.get("unifiedWindows", {})
             five_h = windows.get("five_hour", {})
@@ -170,8 +202,8 @@ class Handler(BaseHTTPRequestHandler):
         else:
             health["quota"] = None
         # Warm-pool state.
-        with _WARM_POOL._lock:
-            parked = _WARM_POOL._parked
+        with state._WARM_POOL._lock:
+            parked = state._WARM_POOL._parked
             if parked is not None and parked.is_alive():
                 now = time.time()
                 health["warm_pool"] = {
@@ -452,7 +484,7 @@ class Handler(BaseHTTPRequestHandler):
                     fingerprint, final_sid, model, system_prompt, False, None,
                     None, None, use_pty=True, env_overrides=env_overrides,
                 )
-                _WARM_POOL.park(warm)
+                state._WARM_POOL.park(warm)
             except Exception:
                 pass
 
@@ -468,7 +500,7 @@ class Handler(BaseHTTPRequestHandler):
                 # process can only ever be correctly claimed for the
                 # NEXT turn of a conversation it already knows about.
                 warm = (
-                    _WARM_POOL.take_if_matching(fingerprint)
+                    state._WARM_POOL.take_if_matching(fingerprint)
                     if fingerprint is not None and session_mode == "resume"
                     else None
                 )
@@ -574,7 +606,7 @@ class Handler(BaseHTTPRequestHandler):
                     fingerprint, final_sid, model, system_prompt, tools_requested, tools,
                     mcp_tool_config, effort, use_pty=False, env_overrides=env_overrides,
                 )
-                _WARM_POOL.park(warm)
+                state._WARM_POOL.park(warm)
             except Exception:
                 pass
 
@@ -591,7 +623,7 @@ class Handler(BaseHTTPRequestHandler):
                 return result, session_mode, session_id
 
             if fingerprint is not None and session_mode == "resume":
-                warm = _WARM_POOL.take_if_matching(fingerprint)
+                warm = state._WARM_POOL.take_if_matching(fingerprint)
                 if warm is not None:
                     try:
                         result = warm.send_turn(delta_messages, stop=stop)

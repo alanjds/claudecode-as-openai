@@ -1,50 +1,18 @@
 #!/usr/bin/env python3
-"""OpenAI-chat-completions-compatible shim over the local Claude Code CLI.
+"""Model-name normalization (OpenRouter <-> Claude Code), reasoning-effort
+resolution, and the /v1/models catalog (fetch_model_list)."""
 
-Translates OpenAI's `/v1/chat/completions` API onto `claude -p` (Claude
-Code's non-interactive mode): native tool-calling via MCP tool
-registration, session caching via --session-id/--resume, OpenAI-shaped
-error translation, response_format via --json-schema, OpenRouter model-
-name and reasoning-effort compatibility, and stop-sequence emulation.
-
-See README.md "Capability audit" for the full, empirically-verified list
-of what works, what's approximated, and what's a genuine CLI limitation,
-and CHANGELOG.md for the investigation trail behind each design choice
-referenced in comments below.
-
-Run:
-    python3 -m claudecode_as_openai.shim [port]   # default port 8977
-
-Point Hermes at it:
-    hermes config set model.provider custom
-    hermes config set model.base_url http://127.0.0.1:8977/v1
-    hermes config set model.api_key not-needed
-    hermes config set model.default sonnet
-"""
-import hashlib
 import json
 import os
-import pty
-import queue
 import re
-import select
-import subprocess
 import sys
-import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
-import uuid
-from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-CLAUDE_BIN = "claude"
-DEFAULT_MODEL = "sonnet"
-# Default port, overridable via CLAUDE_OPENAI_PORT env var. The running
-# Hermes Agent itself may already be consuming port 8977 (the shim it runs on),
-# so tests or secondary instances should use a different port via the env var.
-DEFAULT_PORT = int(os.environ.get("CLAUDE_OPENAI_PORT", "8977"))
+from claudecode_as_openai.constants import _OPENROUTER_ALIASES
+
 # When a caller doesn't pass `reasoning` at all (e.g. Hermes on a custom
 # provider URL, which skips extra_body.reasoning to avoid 400s on unknown
 # backends), fall back to this effort level rather than silently disabling
@@ -52,15 +20,13 @@ DEFAULT_PORT = int(os.environ.get("CLAUDE_OPENAI_PORT", "8977"))
 # config or any other value from _REASONING_EFFORT_MAP. Empty string or
 # absent = no default effort (thinking disabled unless explicitly requested).
 _DEFAULT_EFFORT_ENV = os.environ.get("CLAUDE_OPENAI_DEFAULT_EFFORT", "").strip().lower() or None
-KNOWN_MODEL_ALIASES = [
-    # Hardcoded last-resort fallback for /v1/models when neither OAuth nor
-    # an API key is available to query the real Anthropic /v1/models
-    # endpoint (see fetch_model_list()). Extracted from strings embedded
-    # in the compiled `claude` binary (2026-08-14) -- will go stale as new
-    # models ship, which is exactly why the live query is preferred.
-    "sonnet", "opus", "haiku",
-]
-CLAUDE_TIMEOUT_S = 300
+
+# Hardcoded last-resort fallback for /v1/models when neither OAuth nor
+# an API key is available to query the real Anthropic /v1/models
+# endpoint (see fetch_model_list()). Extracted from strings embedded
+# in the compiled `claude` binary (2026-08-14) -- will go stale as new
+# models ship, which is exactly why the live query is preferred.
+KNOWN_MODEL_ALIASES = list(_OPENROUTER_ALIASES)
 
 # OpenRouter model-slug compatibility (see CHANGELOG). Translates
 # OpenRouter's Anthropic model naming convention
@@ -73,12 +39,6 @@ _OPENROUTER_VERSION_RE = re.compile(r"^claude-(sonnet|opus|haiku)-(\d+)\.(\d+)$"
 _OPENROUTER_FAST_SUFFIX_RE = re.compile(r"^(claude-(?:sonnet|opus|haiku)-[\d.]+)-fast$")
 _warned_fast_models = set()
 
-
-
-
-# Local imports
-from claudecode_as_openai.constants import DEFAULT_MODEL, _OPENROUTER_ALIASES
-from claudecode_as_openai.errors import ClaudeCliError
 
 def normalize_model_name(model):
     """Translate an OpenRouter-style Anthropic model slug into the
@@ -210,209 +170,6 @@ _MODEL_LIST_CACHE_TTL_S = 300
 _model_list_cache = {"data": None, "fetched_at": 0.0}
 _model_list_cache_lock = threading.Lock()
 
-# Quota state captured from rate_limit_event chunks during completions.
-# Updated on every completion that receives a rate_limit_event, then read
-# by /v1/key, /v1/credits, and /health endpoints for monitoring. Initialized
-# to None; stays None until the first completion.
-_rate_limit_cache = None
-
-# Every spawned `claude` subprocess inherits whatever directory the shim
-# process happens to be running from, and Claude Code can read real
-# files there. Spawning every `claude` call from a dedicated, empty,
-# per-run temp directory closes this off.
-_CLAUDE_CWD = tempfile.mkdtemp(prefix="claudecode-as-openai-sandbox-")
-MAX_N_CHOICES = 5
-
-# Applied to every spawned `claude` subprocess (see _scoped_env_overrides).
-# CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC bundles DISABLE_AUTOUPDATER,
-# DISABLE_TELEMETRY, DISABLE_ERROR_REPORTING, and DISABLE_FEEDBACK_COMMAND
-# into one flag. Since this shim spawns a fresh `claude -p` process per
-# request, the startup work those four disable (autoupdater version
-# check, telemetry, error reporting, feedback prompts) is otherwise paid
-# on every single call -- disabling it is a real per-request latency win.
-# This also means `claude` will never self-update here; the user updates
-# it manually on their own schedule instead.
-_BASE_ENV_OVERRIDES = {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
-
-# Claude Code's built-in tool names, PLUS the MCP-adjacent helper tools
-# that also leak custom-tool dispatch surface: RemoteTrigger (a generic
-# dispatcher that can invoke ANY declared custom tool by name), and
-# ListMcpResourcesTool/ReadMcpResourceTool (MCP resource browsers, not
-# server-specific so --strict-mcp-config doesn't touch them). This does
-# NOT fully close the leak when tools ARE requested -- see README "MCP
-# tool leakage". When NO tools are requested, the no-tools path below
-# (--tools "" --strict-mcp-config) closes this completely instead.
-EXTENDED_DISALLOWED_TOOLS = ",".join(
-    [
-        "Task", "TaskOutput", "Bash", "Glob", "Grep", "Read", "Edit", "Write",
-        "NotebookEdit", "WebFetch", "TodoWrite", "WebSearch", "TaskStop",
-        "AskUserQuestion", "Skill", "EnterPlanMode", "ExitPlanMode",
-        "EnterWorktree", "ExitWorktree", "CronCreate", "CronDelete",
-        "CronList", "ToolSearch", "RemoteTrigger", "ListMcpResourcesTool",
-        "ReadMcpResourceTool",
-    ]
-)
-
-
-class ClaudeCliError(Exception):
-    """Carries enough info to build an OpenAI-shaped error response.
-    http_status: int: e.g. 400, 401, 404, 429, 500, 503.
-    error_type: OpenAI error taxonomy string, e.g. "invalid_request_error",
-        "authentication_error", "rate_limit_error", "api_error".
-    code: short machine-readable code, e.g. "model_not_found", or None.
-    """
-
-    def __init__(self, http_status, error_type, message, code=None, param=None):
-        super().__init__(message)
-        self.http_status = http_status
-        self.error_type = error_type
-        self.message = message
-        self.code = code
-        self.param = param
-
-    def to_openai_body(self):
-        return {
-            "error": {
-                "message": self.message,
-                "type": self.error_type,
-                "param": self.param,
-                "code": self.code,
-            }
-        }
-
-
-# Heuristic classification of Claude Code's own plain-text error messages
-# into OpenAI's error taxonomy. This is necessarily fragile -- it string-
-# matches phrases from https://code.claude.com/docs/en/errors (checked
-# 2026-08-13) -- and will need updating if Anthropic changes their error
-# wording. Order matters: more specific patterns should come first.
-_ERROR_PATTERNS = [
-    (
-        (
-            "not logged in", "please run /login", "login expired",
-            "oauth token", "invalid api key", "could not resolve authentication",
-            "invalid auth token", "authentication credentials",
-            "organization has disabled api key authentication",
-            "organization has disabled claude subscription access",
-        ),
-        401, "authentication_error", "authentication_failed",
-    ),
-    (
-        (
-            "session limit", "weekly limit", "credit balance is too low",
-            "spend limit", "request rejected (429)",
-            "server is temporarily limiting requests", "rate limit",
-        ),
-        429, "rate_limit_error", "rate_limit_exceeded",
-    ),
-    (
-        (
-            "issue with the selected model", "not a recognized model id",
-            "restricted by your organization", "not available with the claude",
-        ),
-        404, "invalid_request_error", "model_not_found",
-    ),
-    (
-        (
-            "prompt is too long", "context exceeds", "request too large",
-            "conversation too long", "extra inputs are not permitted",
-        ),
-        400, "invalid_request_error", "context_length_exceeded",
-    ),
-    (
-        ("overloaded", "internal server error", "500 internal"),
-        503, "api_error", "overloaded",
-    ),
-]
-
-
-def _classify_error_text(text):
-    lower = (text or "").lower()
-    for phrases, status, etype, code in _ERROR_PATTERNS:
-        if any(p in lower for p in phrases):
-            return status, etype, code
-    return 500, "api_error", None
-
-
-def _gen_tool_id():
-    return f"toolu_{uuid.uuid4().hex[:20]}"
-
-
-def _flatten_content(content):
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                parts.append(block.get("text", ""))
-        return "\n".join(parts)
-    return content or ""
-
-
-def build_claude_messages(openai_messages):
-    """Translate a list of OpenAI chat messages into Claude Code's native
-    message array shape: [{"role": "user"|"assistant", "content": <str or
-    blocks>}]. System messages are skipped here (handled separately by the
-    caller via system_prompt_from_messages) since Claude Code takes the
-    system prompt as a separate CLI flag, not as an array element."""
-    claude_messages = []
-
-    for m in openai_messages:
-        role = m.get("role", "user")
-        if role == "system":
-            continue
-
-        if role == "tool":
-            claude_messages.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": m.get("tool_call_id", ""),
-                            "content": _flatten_content(m.get("content")),
-                        }
-                    ],
-                }
-            )
-            continue
-
-        if role == "assistant":
-            tool_calls = m.get("tool_calls") or []
-            content_blocks = []
-            text = _flatten_content(m.get("content"))
-            if text:
-                content_blocks.append({"type": "text", "text": text})
-            for tc in tool_calls:
-                fn = tc.get("function", {})
-                args = fn.get("arguments", "{}")
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except Exception:
-                        args = {}
-                content_blocks.append(
-                    {
-                        "type": "tool_use",
-                        "id": tc.get("id", _gen_tool_id()),
-                        "name": fn.get("name", ""),
-                        "input": args,
-                    }
-                )
-            claude_messages.append(
-                {"role": "assistant", "content": content_blocks or text}
-            )
-            continue
-
-        # user (or anything else) -> plain user message
-        claude_messages.append({"role": "user", "content": _flatten_content(m.get("content"))})
-
-    return claude_messages
-
-
-def system_prompt_from_messages(openai_messages):
-    parts = [_flatten_content(m.get("content")) for m in openai_messages if m.get("role") == "system"]
-    return "\n\n".join(p for p in parts if p)
-
 
 def _read_claude_oauth_token():
     """Read Claude Code's own OAuth access token from its local
@@ -468,9 +225,8 @@ def _anthropic_id_to_openrouter(model_id):
 
     Returns the OpenRouter-style ID, or None if the pattern doesn't match
     (already-alias or unrecognised shape -- caller skips ORouter form)."""
-    import re as _re
     # e.g. "claude-opus-4-8-20260528" or "claude-haiku-4-5-20251001"
-    m = _re.match(
+    m = re.match(
         r"^claude-(opus|sonnet|haiku|fable)-(\d+)-(\d+)(?:-\d{8})?$",
         model_id,
     )
@@ -478,7 +234,7 @@ def _anthropic_id_to_openrouter(model_id):
         family, major, minor = m.group(1), m.group(2), m.group(3)
         return f"anthropic/claude-{family}-{major}.{minor}"
     # e.g. "claude-opus-5" or "claude-fable-5" (no minor)
-    m2 = _re.match(r"^claude-(opus|sonnet|haiku|fable)-(\d+)$", model_id)
+    m2 = re.match(r"^claude-(opus|sonnet|haiku|fable)-(\d+)$", model_id)
     if m2:
         family, major = m2.group(1), m2.group(2)
         return f"anthropic/claude-{family}-{major}"
@@ -514,10 +270,9 @@ _LEGACY_NO_REASONING_PREFIXES = ("claude-3-",)
 def _supports_reasoning_params(model_id):
     """Return True when the model ID looks like a reasoning-capable Claude
     model (Claude 4+ family). Claude 3.x and older return False."""
-    import re as _re
     lower = model_id.lower()
     # Any Claude 3 model (3-haiku, 3.5-haiku, etc.)
-    if _re.search(r"claude-3", lower):
+    if re.search(r"claude-3", lower):
         return False
     # Claude 4+ opus/sonnet/haiku/fable all support reasoning
     return True
@@ -553,74 +308,6 @@ def _model_entry(model_id, context_length=None):
             "default_effort": "medium",
         }
     return entry
-
-
-def _build_key_response():
-    """Return an OpenRouter-compatible /v1/key response backed by the last
-    rate_limit_event captured from the claude subprocess.
-
-    Uses the 7-day window as the primary quota because it is the limit
-    most likely to constrain a day's work.  The 5-hour window is included
-    in the `rate_limits` extension field so callers can surface it.
-
-    Returns null values before the first turn completes (no data yet)."""
-    info = _rate_limit_cache
-    if not info:
-        return {
-            "data": {
-                "label": "claude-code-subscription",
-                "limit": None,
-                "limit_remaining": None,
-                "is_free_tier": False,
-            }
-        }
-    windows = info.get("unifiedWindows", {})
-    five_h = windows.get("five_hour", {})
-    seven_d = windows.get("seven_day", {})
-
-    # Use the 5-hour window as the primary quota: it is the current/active
-    # limit users hit first. The 7-day window is included in the extension
-    # field for informational display.
-    five_h_used = five_h.get("utilization", 0.0)
-    limit = 100
-    usage = round(five_h_used * limit, 2)
-    limit_remaining = round(limit - usage, 2)
-
-    return {
-        "data": {
-            "label": "claude-code-subscription",
-            "limit": limit,
-            "usage": usage,
-            "limit_remaining": limit_remaining,
-            "is_free_tier": False,
-            "rate_limit_status": info.get("status"),
-            "rate_limits": {
-                "5h": {
-                    "percent_used": round(five_h.get("utilization", 0.0) * 100),
-                    "resets_at": five_h.get("resetsAt"),
-                },
-                "7d": {
-                    "percent_used": round(seven_d.get("utilization", 0.0) * 100),
-                    "resets_at": seven_d.get("resetsAt"),
-                },
-            },
-        }
-    }
-
-
-def _build_credits_response():
-    """Return an OpenRouter-compatible /v1/credits response.
-
-    Maps the 5-hour (current/active) usage window to a 0-100 credit scale,
-    consistent with /v1/key so that clients reading total_credits/total_usage
-    get a coherent view."""
-    info = _rate_limit_cache
-    if not info:
-        return {"data": {"total_credits": None, "total_usage": None}}
-    five_h = info.get("unifiedWindows", {}).get("five_hour", {})
-    total_credits = 100
-    total_usage = round(five_h.get("utilization", 0.0) * total_credits, 2)
-    return {"data": {"total_credits": total_credits, "total_usage": total_usage}}
 
 
 def fetch_model_list():
@@ -685,7 +372,3 @@ def fetch_model_list():
         _model_list_cache["data"] = result
         _model_list_cache["fetched_at"] = time.time()
     return result
-
-
-
-

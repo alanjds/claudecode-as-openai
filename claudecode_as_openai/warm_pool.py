@@ -1,87 +1,58 @@
 #!/usr/bin/env python3
-"""OpenAI-chat-completions-compatible shim over the local Claude Code CLI.
+"""Persistent warm-pool: keeps ONE already-spawned, already-bootstrapped
+`claude -p --input-format stream-json` process parked per conversation,
+ready to take the NEXT turn without paying the ~5s process-spawn/
+bootstrap cost a fresh `-p --resume` invocation pays on every call
+(measured live: cold `-p --resume` wall time vs the CLI's own
+self-reported duration_ms showed a ~5.2s unaccounted gap -- pure
+process-lifecycle overhead outside the API call itself -- that
+collapses to ~5ms once a process is already resident and warm).
 
-Translates OpenAI's `/v1/chat/completions` API onto `claude -p` (Claude
-Code's non-interactive mode): native tool-calling via MCP tool
-registration, session caching via --session-id/--resume, OpenAI-shaped
-error translation, response_format via --json-schema, OpenRouter model-
-name and reasoning-effort compatibility, and stop-sequence emulation.
+Design, per explicit user direction: at most ONE parked (idle, already
+spawned) process at a time, never a process per concurrent conversation.
+A "new" conversation here means "different from the immediately
+preceding one" -- there is no attempt to keep N conversations warm
+simultaneously.
 
-See README.md "Capability audit" for the full, empirically-verified list
-of what works, what's approximated, and what's a genuine CLI limitation,
-and CHANGELOG.md for the investigation trail behind each design choice
-referenced in comments below.
+  1. A turn for a brand-new conversation arrives -> served cold (no
+     warm process can exist for a conversation that didn't exist yet).
+     In parallel, once that reply's real Claude session_id is known,
+     spawn a WarmProcess pre-resuming that exact session, parked
+     waiting for turn 2.
+  2. The next turn for the SAME conversation (matching fingerprint +
+     session_id) arrives -> claim the parked WarmProcess, feed it the
+     turn directly (no spawn), and spawn a fresh WarmProcess to park
+     for turn 3 once this reply is known.
+  3. A turn for a DIFFERENT conversation arrives (new fingerprint, or a
+     continuation whose synced history no longer matches this parked
+     process's session) -> the stale parked process is useless (its
+     --resume target is for the wrong conversation) and is killed
+     immediately; that turn is served cold, and a new WarmProcess is
+     parked for whatever comes next.
 
-Run:
-    python3 -m claudecode_as_openai.shim [port]   # default port 8977
+Cross-compatible with the existing cold path by construction: a warm
+process's Claude session_id is a completely normal Claude Code session
+(created with plain --session-id / --resume, just kept alive across
+turns via --input-format stream-json instead of exiting after one).
+Verified live: a session created and advanced by a WarmProcess resumes
+correctly via a totally separate one-shot `-p --resume` call after the
+warm process is killed, and vice versa -- either side can pick up
+where the other left off with no special handling needed."""
 
-Point Hermes at it:
-    hermes config set model.provider custom
-    hermes config set model.base_url http://127.0.0.1:8977/v1
-    hermes config set model.api_key not-needed
-    hermes config set model.default sonnet
-"""
-import hashlib
 import json
 import os
 import pty
 import queue
-import re
-import select
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-import urllib.error
-import urllib.request
-import uuid
-from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-CLAUDE_BIN = "claude"
-DEFAULT_MODEL = "sonnet"
-# Default port, overridable via CLAUDE_OPENAI_PORT env var. The running
-# Hermes Agent itself may already be consuming port 8977 (the shim it runs on),
-# so tests or secondary instances should use a different port via the env var.
-DEFAULT_PORT = int(os.environ.get("CLAUDE_OPENAI_PORT", "8977"))
-# When a caller doesn't pass `reasoning` at all (e.g. Hermes on a custom
-# provider URL, which skips extra_body.reasoning to avoid 400s on unknown
-# backends), fall back to this effort level rather than silently disabling
-# thinking. Set to the effort level configured in Hermes's reasoning_effort
-# config or any other value from _REASONING_EFFORT_MAP. Empty string or
-# absent = no default effort (thinking disabled unless explicitly requested).
-_DEFAULT_EFFORT_ENV = os.environ.get("CLAUDE_OPENAI_DEFAULT_EFFORT", "").strip().lower() or None
-KNOWN_MODEL_ALIASES = [
-    # Hardcoded last-resort fallback for /v1/models when neither OAuth nor
-    # an API key is available to query the real Anthropic /v1/models
-    # endpoint (see fetch_model_list()). Extracted from strings embedded
-    # in the compiled `claude` binary (2026-08-14) -- will go stale as new
-    # models ship, which is exactly why the live query is preferred.
-    "sonnet", "opus", "haiku",
-]
-CLAUDE_TIMEOUT_S = 300
-
-# OpenRouter model-slug compatibility (see CHANGELOG). Translates
-# OpenRouter's Anthropic model naming convention
-# (`anthropic/claude-sonnet-4.5`, `~anthropic/claude-sonnet-latest`) into
-# Claude Code's own `--model` convention (`claude-sonnet-4-5`, bare
-# `sonnet`/`opus`/`haiku` aliases) so a client pointed at this shim with
-# an OpenRouter-style model string just works.
-_OPENROUTER_LATEST_ALIAS_RE = re.compile(r"^claude-(sonnet|opus|haiku)-latest$")
-_OPENROUTER_VERSION_RE = re.compile(r"^claude-(sonnet|opus|haiku)-(\d+)\.(\d+)$")
-_OPENROUTER_FAST_SUFFIX_RE = re.compile(r"^(claude-(?:sonnet|opus|haiku)-[\d.]+)-fast$")
-_warned_fast_models = set()
-
-
-
-
-# Local imports
 from claudecode_as_openai.constants import CLAUDE_TIMEOUT_S
-from claudecode_as_openai.state import _CLAUDE_CWD, _WARM_POOL, _WARM_POOL_LOCK
-from claudecode_as_openai.sessions import resolve_session, record_session
-from claudecode_as_openai.parsing import _iter_ndjson_lines, _iter_ndjson_lines_pty
-from claudecode_as_openai.quota import _log_quota_snapshot
+from claudecode_as_openai.errors import ClaudeCliError
+from claudecode_as_openai import state
+
 
 class WarmProcess:
     """One already-spawned `claude -p --input-format stream-json
@@ -115,6 +86,13 @@ class WarmProcess:
         self._start()
 
     def _start(self):
+        # Deferred import: streaming.py imports WarmPool from this module
+        # at its own top level, so importing it back here at module level
+        # would be circular. By the time a WarmProcess is actually
+        # constructed (well after both modules have finished loading),
+        # this resolves without issue.
+        from claudecode_as_openai.streaming import _build_claude_cmd
+
         # Warm pool always resumes a known session; json_schema=None here
         # (json_schema requires fresh spawns with full orchestration). With
         # prose fallback removed, max_turns=1 is always safe.
@@ -155,13 +133,13 @@ class WarmProcess:
             self.pty_master_fd, pty_slave_fd = pty.openpty()
             self.proc = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE, stdout=pty_slave_fd,
-                stderr=subprocess.PIPE, cwd=_CLAUDE_CWD, env=spawn_env,
+                stderr=subprocess.PIPE, cwd=state._CLAUDE_CWD, env=spawn_env,
             )
             os.close(pty_slave_fd)
         else:
             self.proc = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, bufsize=1, cwd=_CLAUDE_CWD, env=spawn_env,
+                stderr=subprocess.PIPE, text=True, bufsize=1, cwd=state._CLAUDE_CWD, env=spawn_env,
             )
         self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
         self._reader_thread.start()
@@ -181,6 +159,8 @@ class WarmProcess:
         # idle-but-still-alive parked process out from under send_turn.
         # Per-turn bounding happens instead in send_turn's own
         # queue.get(timeout=...).
+        from claudecode_as_openai.parsing import _iter_ndjson_lines, _iter_ndjson_lines_pty
+
         try:
             if self.use_pty:
                 for parsed in _iter_ndjson_lines_pty(self.pty_master_fd, self.proc, timeout_s=None):
@@ -214,6 +194,8 @@ class WarmProcess:
         after claim() returns True. Uses the exact same response-parsing
         logic as the cold path (_consume_claude_response) so behavior is
         identical either way."""
+        from claudecode_as_openai.streaming import _consume_claude_response, _normalize_stop_sequences
+
         stop_sequences = _normalize_stop_sequences(stop)
         # claude_messages is the delta list this shim would otherwise
         # have written whole to a fresh process's stdin; stream-json
@@ -284,3 +266,172 @@ class WarmProcess:
                 pass
 
 
+class WarmPool:
+    """Holds at most one parked WarmProcess at a time (see module-level
+    comment above for the full protocol). Thread-safe: HTTP requests are
+    served from a ThreadingHTTPServer, so claiming/replacing the parked
+    process must be atomic against a concurrent request doing the same."""
+
+    # A parked process that hasn't been claimed within this window is
+    # evicted: any gap longer than this means the conversation probably
+    # ended or moved on, so the next request will bring a different
+    # fingerprint and kill it anyway. Killing proactively here prevents
+    # the process from sitting alive indefinitely if the user never
+    # returns -- which is exactly what caused the quota-burndown incident
+    # (a parked --resume process kept retrying an invalid session for hours).
+    _PARK_IDLE_TIMEOUT_S = 300   # 5 minutes idle (parked, unclaimed)
+    # Hard upper bound on a process's entire lifetime regardless of idle
+    # state: caps the worst-case quota burn from a stuck parked subprocess.
+    _LIFETIME_TIMEOUT_S = 600    # 10 minutes total
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._parked = None  # WarmProcess | None
+        self._reaper_thread = None  # Background thread that evicts stale processes
+
+    def take_if_matching(self, fingerprint):
+        """Returns the parked WarmProcess if it exists, is alive, not
+        stale (idle or lifetime timeout -- see class constants), and
+        matches `fingerprint` (same conversation), claiming it
+        atomically so no other request can also take it. Returns None
+        otherwise -- including when a parked process exists but is for
+        a DIFFERENT conversation, in which case it's killed here (a
+        stale parked process is useless once the conversation moves on,
+        per the "at most one parked process, discarded on mismatch"
+        design)."""
+        with self._lock:
+            candidate = self._parked
+            if candidate is None:
+                return None
+            now = time.time()
+            # Kill stale processes before even checking fingerprint.
+            # Idle check: parked too long without being claimed.
+            if (candidate.parked_at is not None
+                    and now - candidate.parked_at > self._PARK_IDLE_TIMEOUT_S):
+                self._parked = None
+                idle_s = now - candidate.parked_at
+                sys.stderr.write(
+                    f"claudecode-as-openai: warm-pool: evicting"
+                    f" {candidate.session_id} -- idle {idle_s:.0f}s"
+                    f" > {self._PARK_IDLE_TIMEOUT_S}s limit\n"
+                )
+                candidate.kill()
+                return None
+            # Lifetime check: total age since spawn.
+            if now - candidate.spawned_at > self._LIFETIME_TIMEOUT_S:
+                self._parked = None
+                age_s = now - candidate.spawned_at
+                sys.stderr.write(
+                    f"claudecode-as-openai: warm-pool: evicting"
+                    f" {candidate.session_id} -- lifetime {age_s:.0f}s"
+                    f" > {self._LIFETIME_TIMEOUT_S}s limit\n"
+                )
+                candidate.kill()
+                return None
+            if candidate.fingerprint != fingerprint:
+                self._parked = None
+                candidate.kill()
+                return None
+            self._parked = None
+        if not candidate.claim():
+            return None
+        return candidate
+
+    def park(self, warm_process):
+        """Installs `warm_process` as the new parked process, killing
+        whatever was parked before it (there is only ever one). Also
+        checks if the process is already stale (shouldn't happen in normal
+        flow, but defensive against race conditions) and starts the reaper
+        thread if it's not already running."""
+        with self._lock:
+            stale = self._parked
+            now = time.time()
+            # Defensive check: if somehow the new process is already stale,
+            # don't park it, just kill it immediately.
+            if (now - warm_process.spawned_at > self._LIFETIME_TIMEOUT_S
+                    or (warm_process.parked_at is not None
+                        and now - warm_process.parked_at > self._PARK_IDLE_TIMEOUT_S)):
+                sys.stderr.write(
+                    f"claudecode-as-openai: warm-pool: not parking {warm_process.session_id}"
+                    f" -- already stale on arrival\n"
+                )
+                warm_process.kill()
+                return
+            self._parked = warm_process
+            warm_process.parked_at = now
+            # Start the reaper thread if it's not already running
+            if self._reaper_thread is None or not self._reaper_thread.is_alive():
+                self._reaper_thread = threading.Thread(target=self._reap_loop, daemon=True)
+                self._reaper_thread.start()
+        if stale is not None:
+            stale.kill()
+
+    def discard(self, fingerprint):
+        """Kills and clears the parked process if it matches
+        `fingerprint`. Used when a conversation ends up not continuing
+        the way the parked process assumed (e.g. the caller's next
+        request diverged before ever reaching take_if_matching)."""
+        with self._lock:
+            candidate = self._parked
+            if candidate is None or candidate.fingerprint != fingerprint:
+                return
+            self._parked = None
+        candidate.kill()
+
+    def _reap_loop(self):
+        """Background thread that periodically evicts stale parked processes.
+        Runs once the first process is parked, sleeps 60 seconds between checks.
+        Exits cleanly if _parked becomes None."""
+        while True:
+            time.sleep(60)  # Check every 60 seconds for stale processes
+            with self._lock:
+                candidate = self._parked
+                if candidate is None:
+                    # No process parked; reaper can exit
+                    return
+                now = time.time()
+                # Check if stale
+                if now - candidate.spawned_at > self._LIFETIME_TIMEOUT_S:
+                    age = now - candidate.spawned_at
+                    sys.stderr.write(
+                        f"claudecode-as-openai: warm-pool: reaper evicting"
+                        f" {candidate.session_id} -- lifetime {age:.0f}s"
+                        f" > {self._LIFETIME_TIMEOUT_S}s limit\n"
+                    )
+                    self._parked = None
+                    candidate.kill()
+                    return
+                elif (candidate.parked_at is not None
+                        and now - candidate.parked_at > self._PARK_IDLE_TIMEOUT_S):
+                    idle = now - candidate.parked_at
+                    sys.stderr.write(
+                        f"claudecode-as-openai: warm-pool: reaper evicting"
+                        f" {candidate.session_id} -- idle {idle:.0f}s"
+                        f" > {self._PARK_IDLE_TIMEOUT_S}s limit\n"
+                    )
+                    self._parked = None
+                    candidate.kill()
+                    return
+
+
+def _parking_fingerprint(conv_key, model, tools_requested, tools, effort, env_overrides=None):
+    """What must stay IDENTICAL between the turn a WarmProcess was
+    parked for and the turn that claims it. Deliberately includes
+    everything _build_claude_cmd branches on for this call shape
+    (model/tools/effort change the spawned command line) plus the
+    session-cache conv_key (a different conv_key is, by definition, a
+    different conversation) and env_overrides (max_tokens changes
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS, which is baked into a warm process's
+    environment at spawn time -- see WarmProcess._start) -- any mismatch
+    here means the parked process's command line, environment, or
+    --resume target are wrong for the incoming turn, so per the user's
+    explicit design it must be discarded and respawned, never reused
+    with different parameters."""
+    tools_key = None
+    if tools:
+        try:
+            tools_key = json.dumps(tools, sort_keys=True, default=str)
+        except Exception:
+            tools_key = str(tools)
+    env_key = json.dumps(env_overrides, sort_keys=True) if env_overrides else None
+    return (conv_key, model, bool(tools_requested), tools_key, effort, env_key)

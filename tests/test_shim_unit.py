@@ -25,7 +25,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from claudecode_as_openai import shim  # noqa: E402
+from claudecode_as_openai import shim, state, streaming, models  # noqa: E402
 
 
 def _ndjson_lines(*dicts):
@@ -93,15 +93,6 @@ class TestMessageBuilding(unittest.TestCase):
         blocks = claude_messages[0]["content"]
         self.assertEqual(blocks[0]["type"], "tool_use")
         self.assertEqual(blocks[0]["input"], {"city": "Paris"})
-
-    def test_tools_rendered_with_strong_framing_not_weak(self):
-        tools = [{"type": "function", "function": {"name": "get_weather", "description": "get weather", "parameters": {}}}]
-        prompt = shim.render_tools_into_system_prompt(tools, "base prompt")
-        self.assertIn("get_weather", prompt)
-        # Regression guard: weak/hedgy framing measured 0/8 real tool_use
-        # dispatch in manual testing; strong framing measured 6/6.
-        self.assertIn("ARE implemented", prompt)
-        self.assertNotIn("custom tools available", prompt)
 
 
 class TestSessionCaching(unittest.TestCase):
@@ -265,9 +256,10 @@ class TestMcpToolConfig(unittest.TestCase):
 
     def test_manifest_returns_none_for_invalid_tool_name(self):
         """A tool name that can't satisfy MCP's ^[a-zA-Z0-9_-]{1,64}$
-        constraint (e.g. containing a space) must fall back to the prose
-        path -- returning None here is what signals the caller to use
-        render_tools_into_system_prompt() instead."""
+        constraint (e.g. containing a space) means the whole tool set gets
+        dropped -- returning None here is what signals the caller
+        (_handle_chat_completion) to drop the tools silently rather than
+        registering a partial/incorrect manifest."""
         tools = [{"type": "function", "function": {"name": "get weather", "parameters": {}}}]
         self.assertIsNone(shim.build_mcp_tool_manifest(tools))
 
@@ -341,7 +333,7 @@ class TestCallClaudeStreaming(unittest.TestCase):
         with patch.object(shim.subprocess, "Popen", return_value=fake_proc), \
              patch.object(shim.pty, "openpty", return_value=(-1, -1)), \
              patch.object(shim.os, "close", lambda fd: None), \
-             patch.object(shim, "_iter_ndjson_lines_pty", lambda master_fd, proc, timeout_s: iter(_parse_ndjson_lines(fake_proc.stdout))):
+             patch.object(streaming, "_iter_ndjson_lines_pty", lambda master_fd, proc, timeout_s: iter(_parse_ndjson_lines(fake_proc.stdout))):
             return shim.call_claude_streaming([{"role": "user", "content": "hi"}], "", "sonnet", **kwargs)
 
     def test_immediate_text_message(self):
@@ -679,7 +671,7 @@ class TestToolRetryWrapper(unittest.TestCase):
         return {"text": text, "tool_calls": tool_calls or [], "usage": {}, "finish_reason": "stop", "structured_json": None}
 
     def test_no_retry_needed_when_tool_call_on_first_try(self):
-        with patch.object(shim, "call_claude_streaming", return_value=self._stub_result(tool_calls=[{"name": "x"}])) as mock_call, \
+        with patch.object(streaming, "call_claude_streaming", return_value=self._stub_result(tool_calls=[{"name": "x"}])) as mock_call, \
              patch.object(shim.time, "sleep") as mock_sleep:
             result, mode, sid = shim.call_claude_with_tool_retry(
                 [], [], "", "sonnet", tools_requested=True, session_mode="resume", session_id="abc"
@@ -691,7 +683,7 @@ class TestToolRetryWrapper(unittest.TestCase):
         self.assertEqual(sid, "abc")
 
     def test_no_retry_when_no_tools_requested(self):
-        with patch.object(shim, "call_claude_streaming", return_value=self._stub_result(text="just text")) as mock_call, \
+        with patch.object(streaming, "call_claude_streaming", return_value=self._stub_result(text="just text")) as mock_call, \
              patch.object(shim.time, "sleep") as mock_sleep:
             result, mode, sid = shim.call_claude_with_tool_retry(
                 [], [], "", "sonnet", tools_requested=False, session_mode="fresh", session_id="abc"
@@ -706,7 +698,7 @@ class TestToolRetryWrapper(unittest.TestCase):
             self._stub_result(text="narrating again..."),
             self._stub_result(tool_calls=[{"name": "get_weather"}]),
         ]
-        with patch.object(shim, "call_claude_streaming", side_effect=side_effects) as mock_call, \
+        with patch.object(streaming, "call_claude_streaming", side_effect=side_effects) as mock_call, \
              patch.object(shim.time, "sleep") as mock_sleep:
             result, mode, sid = shim.call_claude_with_tool_retry(
                 [], [], "", "sonnet", tools_requested=True, session_mode="resume", session_id="abc"
@@ -723,7 +715,7 @@ class TestToolRetryWrapper(unittest.TestCase):
         brand-new fresh session sending the FULL history."""
         side_effects = [self._stub_result(text="narrating"), self._stub_result(tool_calls=[{"name": "x"}])]
         full_history = [{"role": "user", "content": "full history msg"}]
-        with patch.object(shim, "call_claude_streaming", side_effect=side_effects) as mock_call, \
+        with patch.object(streaming, "call_claude_streaming", side_effect=side_effects) as mock_call, \
              patch.object(shim.time, "sleep"):
             shim.call_claude_with_tool_retry(
                 [{"role": "user", "content": "delta only"}], full_history, "", "sonnet",
@@ -740,7 +732,7 @@ class TestToolRetryWrapper(unittest.TestCase):
     def test_gives_up_after_total_attempts_exhausted(self):
         total_attempts = 1 + shim.TOOL_CALL_MAX_RETRIES
         side_effects = [self._stub_result(text="still narrating")] * total_attempts
-        with patch.object(shim, "call_claude_streaming", side_effect=side_effects) as mock_call, \
+        with patch.object(streaming, "call_claude_streaming", side_effect=side_effects) as mock_call, \
              patch.object(shim.time, "sleep"):
             result, mode, sid = shim.call_claude_with_tool_retry(
                 [], [], "", "sonnet", tools_requested=True, session_mode="fresh", session_id="abc"
@@ -826,7 +818,7 @@ class TestFetchModelList(unittest.TestCase):
                 return self._fake_urlopen_response(oauth_models)
             return self._fake_urlopen_response(api_key_models)
 
-        with patch.object(shim, "_read_claude_oauth_token", return_value="tok123"), \
+        with patch.object(models, "_read_claude_oauth_token", return_value="tok123"), \
              patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-fake"}), \
              patch.object(shim.urllib.request, "urlopen", side_effect=fake_urlopen):
             result = shim.fetch_model_list()
@@ -837,7 +829,7 @@ class TestFetchModelList(unittest.TestCase):
         self.assertNotIn("claude-apikey-model", ids)
 
     def test_falls_back_to_api_key_when_oauth_absent(self):
-        with patch.object(shim, "_read_claude_oauth_token", return_value=None), \
+        with patch.object(models, "_read_claude_oauth_token", return_value=None), \
              patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-fake"}), \
              patch.object(shim.urllib.request, "urlopen",
                            return_value=self._fake_urlopen_response([{"id": "claude-apikey-model"}])):
@@ -845,7 +837,7 @@ class TestFetchModelList(unittest.TestCase):
         self._assert_model_entry_shape(result[0], "claude-apikey-model")
 
     def test_falls_back_to_hardcoded_list_when_no_auth_available(self):
-        with patch.object(shim, "_read_claude_oauth_token", return_value=None), \
+        with patch.object(models, "_read_claude_oauth_token", return_value=None), \
              patch.dict(os.environ, {}, clear=True):
             result = shim.fetch_model_list()
         result_ids = [e["id"] for e in result]
@@ -859,7 +851,7 @@ class TestFetchModelList(unittest.TestCase):
         """Even with a token present, a network/auth failure must fall
         through to the hardcoded list, never raise up into a /v1/models
         request."""
-        with patch.object(shim, "_read_claude_oauth_token", return_value="tok123"), \
+        with patch.object(models, "_read_claude_oauth_token", return_value="tok123"), \
              patch.dict(os.environ, {}, clear=True), \
              patch.object(shim.urllib.request, "urlopen", side_effect=shim.urllib.error.URLError("boom")):
             result = shim.fetch_model_list()
@@ -870,7 +862,7 @@ class TestFetchModelList(unittest.TestCase):
             self.assertIn("supported_parameters", entry)
 
     def test_result_is_cached_within_ttl(self):
-        with patch.object(shim, "_read_claude_oauth_token", return_value="tok123"), \
+        with patch.object(models, "_read_claude_oauth_token", return_value="tok123"), \
              patch.object(shim.urllib.request, "urlopen",
                            return_value=self._fake_urlopen_response([{"id": "claude-cached-model"}])) as mock_urlopen:
             first = shim.fetch_model_list()
@@ -1103,10 +1095,10 @@ class TestRateLimitCache(unittest.TestCase):
     """rate_limit_event captured from subprocess updates _rate_limit_cache."""
 
     def setUp(self):
-        shim._rate_limit_cache = None  # reset before each test
+        state._rate_limit_cache = None  # reset before each test
 
     def tearDown(self):
-        shim._rate_limit_cache = None
+        state._rate_limit_cache = None
 
     def _make_info(self, five_h=0.14, seven_d=0.48, status="allowed"):
         return {
@@ -1128,7 +1120,7 @@ class TestRateLimitCache(unittest.TestCase):
         self.assertIsNone(resp["data"]["total_usage"])
 
     def test_key_response_reflects_rate_limit_info(self):
-        shim._rate_limit_cache = self._make_info(five_h=0.14, seven_d=0.48)
+        state._rate_limit_cache = self._make_info(five_h=0.14, seven_d=0.48)
         resp = shim._build_key_response()["data"]
         self.assertEqual(resp["limit"], 100)
         # Primary quota uses the 5-hour (current) window
@@ -1139,20 +1131,20 @@ class TestRateLimitCache(unittest.TestCase):
 
     def test_credits_response_reflects_rate_limit_info(self):
         # Primary is 5h window (same as /v1/key)
-        shim._rate_limit_cache = self._make_info(five_h=0.14, seven_d=0.50)
+        state._rate_limit_cache = self._make_info(five_h=0.14, seven_d=0.50)
         resp = shim._build_credits_response()["data"]
         self.assertEqual(resp["total_credits"], 100)
         self.assertEqual(resp["total_usage"], 14.0)
 
     def test_key_limit_remaining_is_inverse_of_usage(self):
-        shim._rate_limit_cache = self._make_info(five_h=0.32, seven_d=0.48)
+        state._rate_limit_cache = self._make_info(five_h=0.32, seven_d=0.48)
         resp = shim._build_key_response()["data"]
         self.assertAlmostEqual(resp["usage"] + resp["limit_remaining"], 100.0)
         # Primary is 5h window
         self.assertAlmostEqual(resp["usage"], 32.0)
 
     def test_status_is_forwarded(self):
-        shim._rate_limit_cache = self._make_info(status="allowed_warning")
+        state._rate_limit_cache = self._make_info(status="allowed_warning")
         resp = shim._build_key_response()["data"]
         self.assertEqual(resp["rate_limit_status"], "allowed_warning")
 
@@ -1161,16 +1153,16 @@ class TestRateLimitCache(unittest.TestCase):
         info = self._make_info(five_h=0.20, seven_d=0.60)
         # Directly replicate what the chunk handler does
         chunk = {"type": "rate_limit_event", "rate_limit_info": info}
-        shim._rate_limit_cache = chunk.get("rate_limit_info")
+        state._rate_limit_cache = chunk.get("rate_limit_info")
         resp = shim._build_key_response()["data"]
         self.assertEqual(resp["rate_limits"]["7d"]["percent_used"], 60)
 
     def test_health_returns_null_quota_before_first_completion(self):
         """GET /health before any completion returns null quota."""
         # Store original to restore later
-        original = shim._rate_limit_cache
+        original = state._rate_limit_cache
         try:
-            shim._rate_limit_cache = None
+            state._rate_limit_cache = None
             # Call the method directly (HTTP handler is tested separately)
             # We just verify the data structure it produces
             health = {
@@ -1181,14 +1173,14 @@ class TestRateLimitCache(unittest.TestCase):
             self.assertIsNone(health["quota"])
             self.assertFalse(health["warm_pool"]["active"])
         finally:
-            shim._rate_limit_cache = original
+            state._rate_limit_cache = original
 
     def test_health_quota_field_structure_when_cached(self):
         """Verify /health quota structure matches expected keys."""
         info = self._make_info(five_h=0.87, seven_d=0.63, status="allowed_warning")
-        original = shim._rate_limit_cache
+        original = state._rate_limit_cache
         try:
-            shim._rate_limit_cache = info
+            state._rate_limit_cache = info
             # Simulate what _build_health() does
             windows = info.get("unifiedWindows", {})
             five_h = windows.get("five_hour", {})
@@ -1203,7 +1195,7 @@ class TestRateLimitCache(unittest.TestCase):
             self.assertAlmostEqual(quota_info["5h_utilization"], 0.87, places=2)
             self.assertAlmostEqual(quota_info["7d_utilization"], 0.63, places=2)
         finally:
-            shim._rate_limit_cache = original
+            state._rate_limit_cache = original
 
 
 
