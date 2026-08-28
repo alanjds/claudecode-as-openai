@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """OpenAI-chat-completions-compatible shim over the local Claude Code CLI:
-the HTTP request handler and server entry point. Translates OpenAI's
+the HTTP request handler and server entry point. Named server.py, not
+http.py, because a package submodule named `http` shadows the stdlib
+`http` package for any code in this process that does `import http`
+(urllib.request does exactly this) once this package's own directory
+ends up on sys.path -- as it does when this file (or shim.py) is run
+directly as a script rather than via `python -m`. Translates OpenAI's
 `/v1/chat/completions` API onto `claude -p` (Claude Code's non-interactive
 mode): native tool-calling via MCP tool registration, session caching via
 --session-id/--resume, OpenAI-shaped error translation, response_format

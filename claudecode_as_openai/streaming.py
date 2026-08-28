@@ -250,7 +250,7 @@ def _consume_claude_response(chunk_source, deadline, stop_sequences, stream_call
                 if ctype2 == "thinking" and content.get("thinking"):
                     # Real extended-thinking output, only present when
                     # --effort was passed (see resolve_reasoning_effort
-                    # in http.py) -- verified live via a stream-json
+                    # in server.py) -- verified live via a stream-json
                     # capture with a math prompt: setting --effort
                     # genuinely produces this block (with a real
                     # `signature` field) ahead of the final `text`
@@ -375,7 +375,7 @@ def call_claude_streaming(
     chunk as it arrives via --include-partial-messages content_block_delta
     events -- this delivers genuine real-time streaming to an OpenAI
     client. Only wired up for the single-choice, no-tools, no-json_schema
-    path (see http.py's _handle_chat_completion): with tool retry in play,
+    path (see server.py's _handle_chat_completion): with tool retry in play,
     a failed attempt's narration text must not reach the client before the
     shim knows to discard it and retry.
 
@@ -612,7 +612,7 @@ def call_claude_with_tool_retry(
     loop should rarely need more than its first attempt whenever `tools`
     resolves to a valid MCP manifest. Retries remain as a safety net for
     tools that can't be represented as MCP tool names (dropped, see
-    http.py) and for any future Claude Code regression.
+    server.py) and for any future Claude Code regression.
 
     `stream_callback`, if given, should only ever be passed by the caller
     when tools_requested is False -- with tools in play, a failed

@@ -15,7 +15,7 @@ _CLAUDE_BIN = "claude"
 CLAUDE_TIMEOUT_S = 300
 
 # Applied to every spawned `claude` subprocess (see _scoped_env_overrides in
-# http.py). CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC bundles
+# server.py). CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC bundles
 # DISABLE_AUTOUPDATER, DISABLE_TELEMETRY, DISABLE_ERROR_REPORTING, and
 # DISABLE_FEEDBACK_COMMAND into one flag. Since this shim spawns a fresh
 # `claude -p` process per request, the startup work those four disable

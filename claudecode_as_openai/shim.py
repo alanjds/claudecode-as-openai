@@ -3,7 +3,7 @@
 
 This module is now a thin compatibility/entry-point layer: the actual
 implementation lives in the split modules below (errors, models, tools,
-messages, sessions, parsing, quota, warm_pool, streaming, http). Kept
+messages, sessions, parsing, quota, warm_pool, streaming, server). Kept
 around, and re-exporting their public + test-facing names, so:
 
   - `python3 -m claudecode_as_openai.shim [port]` / `claudecode-as-openai`
@@ -54,10 +54,10 @@ from claudecode_as_openai.streaming import (
     _apply_stop_sequences, _backoff_delay_s, _build_claude_cmd, _build_openai_usage,
     build_reasoning_details, call_claude_streaming, call_claude_with_tool_retry,
 )
-from claudecode_as_openai.http import (
+from claudecode_as_openai.server import (
     DEFAULT_PORT, Handler, _warn_unsupported_sampling_params, _warned_sampling_params,
 )
-from claudecode_as_openai.http import main as _http_main
+from claudecode_as_openai.server import main as _http_main
 
 
 def main():

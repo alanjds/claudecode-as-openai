@@ -70,7 +70,7 @@
 - Reasoning: `build_reasoning_details()`, `_build_openai_usage()`
 - **Remove:** Comments about prose fallback needing retry (~5 lines)
 
-### 10. `http.py` (200 lines)
+### 10. `server.py` (200 lines)
 - `Handler` class - HTTP request handler
 - `ThreadingHTTPServer` - HTTP server
 - Helper: `_warn_unsupported_sampling_params()`, `_apply_stop_sequences()`, `_build_sse_chunk()`, `_scoped_env_overrides()`
@@ -100,7 +100,7 @@ parsing.py
 quota.py
 warm_pool.py → sessions.py, quota.py, parsing.py
 streaming.py → errors.py, tools.py, messages.py, parsing.py, warm_pool.py, quota.py
-http.py → streaming.py, models.py, errors.py
+server.py → streaming.py, models.py, errors.py
 shim.py (main) → all modules
 ```
 
@@ -114,7 +114,7 @@ shim.py (main) → all modules
 7. Extract `quota.py` (no deps)
 8. Extract `warm_pool.py` (depends on sessions, quota, parsing)
 9. Extract `streaming.py` (depends on errors, tools, messages, parsing, warm_pool, quota)
-10. Extract `http.py` (depends on streaming, models, errors)
+10. Extract `server.py` (depends on streaming, models, errors)
 11. Update `shim.py` to import and delegate to modules
 12. Clean up obsolete comments throughout
 
