@@ -177,3 +177,32 @@ _Unreleased_
   `claude` will never self-update while running under this shim -- the
   operator is expected to run `claude update` manually on their own
   schedule. See README.md "Startup-latency" section.
+* Observability: new `claudecode_as_openai/tracking.py` module with a
+  pluggable `UsageTracker` seam (`register_tracker`/`emit_usage`), a
+  `JsonlFileTracker` sink (`CLAUDE_OPENAI_USAGE_LOG`), and an optional
+  `LiteLLMCostTracker` attaching `cost_usd` via LiteLLM's pricing table
+  (`CLAUDE_OPENAI_TRACK_COST=1`). All best-effort -- a tracker exception
+  is swallowed and never affects the response, matching this shim's
+  existing warm-pool-parking failure contract. New `tracking` extra
+  (`pip install "claudecode-as-openai[tracking]"`) for `litellm`/`logfire`;
+  the shim runs identically with neither installed. See README.md
+  "Observability" section.
+* Fixed usage under-reporting across the tool-call retry loop:
+  `call_claude_with_tool_retry` previously kept only the winning
+  attempt's `usage`, silently discarding every earlier attempt's real,
+  billed tokens. Usage is now summed across every attempt before being
+  returned, so both the response's `usage` field and tracker events
+  reflect true billed usage.
+* DEBUG-level logging (`CLAUDE_OPENAI_LOG_LEVEL=DEBUG`) of the exact
+  `claude` command line at every subprocess spawn (cold and warm-pool
+  init), plus which path (warm vs. cold) served each turn. The value
+  following `--system-prompt`/`--json-schema` is always redacted to
+  `<len=N>` -- prompt/schema content is never written to logs;
+  user message content was already never in argv (sent via stdin).
+* Optional OTEL/Logfire span tracing (`CLAUDE_OPENAI_TRACING=1`,
+  `LOGFIRE_TOKEN`): nested spans per request, per `n`-fan-out choice, per
+  tool-retry attempt, and per `claude` subprocess spawn (carrying the
+  redacted command and `gen_ai.usage.*` attributes) -- surfaces the
+  retry-loop/fan-out/warm-vs-cold amplification that's invisible from a
+  single request otherwise. Degrades to a true no-op with `logfire`
+  uninstalled or tracing disabled.

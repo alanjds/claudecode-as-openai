@@ -52,6 +52,8 @@ import time
 from claudecode_as_openai.constants import CLAUDE_TIMEOUT_S
 from claudecode_as_openai.errors import ClaudeCliError
 from claudecode_as_openai import state
+from claudecode_as_openai import tracking
+from claudecode_as_openai.tracking import logger
 
 
 class WarmProcess:
@@ -77,6 +79,7 @@ class WarmProcess:
         self.proc = None
         self.pty_master_fd = None
         self.system_prompt_file = None
+        self._debug_cmd = None
         self._reader_thread = None
         self._line_queue = queue.Queue()
         self._lock = threading.Lock()
@@ -129,6 +132,15 @@ class WarmProcess:
         spawn_env = dict(os.environ)
         if self.env_overrides:
             spawn_env.update(self.env_overrides)
+        # Captured once here (not rebuilt in send_turn, which never touches
+        # argv again -- a warm process is spawned once and then only fed
+        # turns over stdin) so send_turn's leaf span can still report the
+        # command line this process was started with.
+        self._debug_cmd = tracking.redact_cmd_for_log(cmd)
+        logger.debug(
+            "spawning claude (warm-pool init): %s | session_id=%s",
+            self._debug_cmd, self.session_id,
+        )
         if self.use_pty:
             self.pty_master_fd, pty_slave_fd = pty.openpty()
             self.proc = subprocess.Popen(
@@ -197,46 +209,51 @@ class WarmProcess:
         from claudecode_as_openai.streaming import _consume_claude_response, _normalize_stop_sequences
 
         stop_sequences = _normalize_stop_sequences(stop)
-        # claude_messages is the delta list this shim would otherwise
-        # have written whole to a fresh process's stdin; stream-json
-        # input takes one JSON object per line instead, so each element
-        # is sent as its own {"type": "user", "message": ...} frame.
-        for msg in claude_messages:
-            line = json.dumps({"type": msg.get("role", "user"), "message": msg})
-            if self.use_pty:
-                os.write(self.proc.stdin.fileno(), (line + "\n").encode())
-            else:
-                self.proc.stdin.write(line + "\n")
-                self.proc.stdin.flush()
+        with tracking.span("claude_spawn", cmd=self._debug_cmd, path="warm") as sp:
+            # claude_messages is the delta list this shim would otherwise
+            # have written whole to a fresh process's stdin; stream-json
+            # input takes one JSON object per line instead, so each element
+            # is sent as its own {"type": "user", "message": ...} frame.
+            for msg in claude_messages:
+                line = json.dumps({"type": msg.get("role", "user"), "message": msg})
+                if self.use_pty:
+                    os.write(self.proc.stdin.fileno(), (line + "\n").encode())
+                else:
+                    self.proc.stdin.write(line + "\n")
+                    self.proc.stdin.flush()
 
-        def chunk_source():
-            while True:
-                try:
-                    item = self._line_queue.get(timeout=CLAUDE_TIMEOUT_S)
-                except queue.Empty:
-                    # No output from the warm process for CLAUDE_TIMEOUT_S
-                    # seconds -- it is stuck. Kill it so quota stops burning
-                    # and surface a proper error to the caller.
-                    elapsed = time.time() - self.spawned_at
-                    sys.stderr.write(
-                        f"claudecode-as-openai: warm-pool: subprocess"
-                        f" {self.session_id} produced no output for"
-                        f" {CLAUDE_TIMEOUT_S}s (total age {elapsed:.0f}s);"
-                        f" killing\n"
-                    )
-                    self.kill()
-                    raise ClaudeCliError(
-                        500, "api_error",
-                        f"Warm-pool subprocess timed out after"
-                        f" {CLAUDE_TIMEOUT_S}s with no output.",
-                        code="warm_process_timeout",
-                    )
-                if item is None:
-                    return
-                yield item
+            def chunk_source():
+                while True:
+                    try:
+                        item = self._line_queue.get(timeout=CLAUDE_TIMEOUT_S)
+                    except queue.Empty:
+                        # No output from the warm process for CLAUDE_TIMEOUT_S
+                        # seconds -- it is stuck. Kill it so quota stops burning
+                        # and surface a proper error to the caller.
+                        elapsed = time.time() - self.spawned_at
+                        sys.stderr.write(
+                            f"claudecode-as-openai: warm-pool: subprocess"
+                            f" {self.session_id} produced no output for"
+                            f" {CLAUDE_TIMEOUT_S}s (total age {elapsed:.0f}s);"
+                            f" killing\n"
+                        )
+                        self.kill()
+                        raise ClaudeCliError(
+                            500, "api_error",
+                            f"Warm-pool subprocess timed out after"
+                            f" {CLAUDE_TIMEOUT_S}s with no output.",
+                            code="warm_process_timeout",
+                        )
+                    if item is None:
+                        return
+                    yield item
 
-        deadline = time.time() + CLAUDE_TIMEOUT_S
-        return _consume_claude_response(chunk_source(), deadline, stop_sequences, stream_callback)
+            deadline = time.time() + CLAUDE_TIMEOUT_S
+            result = _consume_claude_response(chunk_source(), deadline, stop_sequences, stream_callback)
+            usage = result.get("usage") or {}
+            sp.set_attribute("gen_ai.usage.input_tokens", usage.get("input_tokens", 0))
+            sp.set_attribute("gen_ai.usage.output_tokens", usage.get("output_tokens", 0))
+            return result
 
     def kill(self):
         if self.proc is None:

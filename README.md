@@ -81,6 +81,40 @@ python3 tests/test_plain_chat.py
 python3 tests/test_tool_call_reliability.py --attempts 15
 ```
 
+## Observability
+
+All optional -- the shim runs exactly as before with none of these set, and
+with none of the `tracking` extra's dependencies installed.
+
+| Env var | Effect |
+|---|---|
+| `CLAUDE_OPENAI_LOG_LEVEL` | Sets the shim's log level (default `INFO`). Set to `DEBUG` to see the exact redacted `claude` command line spawned for every request (cold and warm-pool-init), plus which path (warm vs. cold) served each turn. |
+| `CLAUDE_OPENAI_USAGE_LOG` | Path to a file. When set, one JSON line per completion (id, model, usage, timestamp, `stream`, `n`, and `cost_usd` if `CLAUDE_OPENAI_TRACK_COST=1`) is appended there. |
+| `CLAUDE_OPENAI_TRACK_COST` | Set to `1` to attach a `cost_usd` field to every usage event via [LiteLLM](https://github.com/BerriAI/litellm)'s pricing table. Requires the `tracking` extra (`pip install "claudecode-as-openai[tracking]"`); a no-op otherwise. |
+| `CLAUDE_OPENAI_TRACING` | Set to `1` to emit OTEL spans via [Logfire](https://logfire.pydantic.dev/), one nested per request / per `n`-choice / per tool-retry-attempt / per `claude` subprocess spawn -- exposes the retry loop, `n` fan-out, and warm-vs-cold amplification that's otherwise invisible from outside a single request. Requires the `tracking` extra; a no-op otherwise. |
+| `LOGFIRE_TOKEN` | Read by Logfire itself when `CLAUDE_OPENAI_TRACING=1`; see Logfire's own docs for where to get one. |
+
+**Redaction**: at `DEBUG` log level, the value following `--system-prompt`,
+`--json-schema`, `--mcp-config`, `--disallowedTools`, and `--allowedTools` in
+a logged command line is replaced with `<len=N>` -- the first two
+because prompt/schema content should never be written to logs, the latter
+three purely to cut noise (their values are a JSON blob or a long tool list,
+rarely what you're looking for in a DEBUG line). User message content is
+never logged at all (it's sent to `claude` over
+stdin, never as a command-line argument).
+
+Usage tracking is a pluggable seam (`claudecode_as_openai/tracking.py`): a
+custom sink just needs to subclass `UsageTracker` and call
+`register_tracker(...)` before serving requests.
+
+```console
+pip install "claudecode-as-openai[tracking]"
+CLAUDE_OPENAI_USAGE_LOG=/var/log/claudecode-usage.jsonl \
+CLAUDE_OPENAI_TRACK_COST=1 \
+CLAUDE_OPENAI_LOG_LEVEL=DEBUG \
+claudecode-as-openai
+```
+
 ---
 
 ## Internals Lore

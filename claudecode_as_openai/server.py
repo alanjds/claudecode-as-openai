@@ -47,6 +47,8 @@ from claudecode_as_openai.streaming import (
 )
 from claudecode_as_openai.warm_pool import WarmProcess, _parking_fingerprint
 from claudecode_as_openai.quota import _build_key_response, _build_credits_response, _log_quota_snapshot
+from claudecode_as_openai import tracking
+from claudecode_as_openai.tracking import logger
 
 DEFAULT_PORT = int(os.environ.get("CLAUDE_OPENAI_PORT", "8977"))
 
@@ -92,6 +94,16 @@ def _build_sse_chunk(chat_id, created, model, index, delta, finish=None):
         "created": created,
         "model": model,
         "choices": [{"index": index, "delta": delta, "finish_reason": finish}],
+    }
+
+
+def _build_usage_event(chat_id, model, usage, stream, n):
+    """Shared shape for the usage event handed to tracking.emit_usage --
+    see the two call sites in _handle_chat_completion and
+    _handle_streaming_completion."""
+    return {
+        "id": chat_id, "model": model, "usage": usage,
+        "created": int(time.time()), "stream": stream, "n": n,
     }
 
 
@@ -259,178 +271,187 @@ class Handler(BaseHTTPRequestHandler):
         # suppress reasoning/reasoning_details even when --effort was set.
         include_reasoning = payload.get("include_reasoning", True)
 
-        # Short-circuit if quota is exhausted and won't reset for a while.
-        # Check before any subprocess spawn to save time/resources.
-        self._check_quota_headroom()
+        with tracking.span("chat_completion", model=model, n=n, stream=stream):
+            # Short-circuit if quota is exhausted and won't reset for a while.
+            # Check before any subprocess spawn to save time/resources.
+            self._check_quota_headroom()
 
-        if n > MAX_N_CHOICES:
-            raise ClaudeCliError(
-                400, "invalid_request_error",
-                f"n={n} exceeds this proxy's limit of {MAX_N_CHOICES} (each choice is a "
-                "separate full Claude Code subprocess call; unbounded n would be unbounded cost).",
-                code="n_too_large", param="n",
-            )
-
-        # tool_choice: "none" is real and correctly implementable -- treat
-        # exactly like "no tools requested" so the full MCP+built-in
-        # lockdown applies and no tool description is added to the prompt.
-        # tool_choice: "required" / forcing a specific function name has NO
-        # reliable mechanism in this harness (no raw Anthropic tool_choice
-        # equivalent exposed) -- accepted but NOT enforced, same as before.
-        effective_tools = tools
-        if tool_choice == "none":
-            effective_tools = None
-
-        json_schema = None
-        if response_format.get("type") == "json_schema":
-            json_schema = (response_format.get("json_schema") or {}).get("schema")
-        elif response_format.get("type") == "json_object":
-            json_schema = {"type": "object"}
-
-        system_prompt = system_prompt_from_messages(messages)
-        # Native MCP tool registration is the real fix for tool-call
-        # reliability and is always attempted first inside
-        # call_claude_streaming/_run_one_completion. If any tool name can't
-        # be represented as a valid MCP tool name, it will be silently dropped
-        # (MCP is the only supported path now; prose fallback removed).
-        if effective_tools and build_mcp_tool_manifest(effective_tools) is None:
-            # Tool name(s) fail MCP constraint -- drop them silently rather
-            # than falling back to prose (removed for cost: max_turns=1 now)
-            effective_tools = None
-
-        env_overrides = dict(_BASE_ENV_OVERRIDES)
-        if max_tokens:
-            try:
-                env_overrides["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(int(max_tokens))
-            except (TypeError, ValueError):
-                pass
-
-        _warn_unsupported_sampling_params(payload)
-
-        # Real token-level streaming is only safe for the single-choice,
-        # no-tools, no-json_schema, no-reasoning path: with tool retry in
-        # play, a failed attempt's narration text must not reach the
-        # client early; --json-schema's multi-turn corrective mechanism
-        # doesn't map onto a single token stream; and reasoning requires
-        # capturing the `thinking` block before `text` starts (see
-        # build_reasoning_details), which the buffered path's
-        # text_delta-only stream_callback has no hook for. Everything
-        # else falls back to buffered-then-emit (SSE framing still
-        # correct, just not real-time).
-        can_stream_live = stream and n == 1 and not effective_tools and json_schema is None and effort is None
-        if can_stream_live:
-            self._handle_streaming_completion(
-                messages, model, system_prompt, max_tokens, env_overrides, stop,
-            )
-            return
-
-        choices = []
-        usage_totals = {
-            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
-            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
-        }
-
-        for choice_index in range(n):
-            if n == 1:
-                # Single-choice path: use session caching (fingerprint +
-                # resume-with-delta) for the common case.
-                session_mode, session_id, delta_messages, conv_key = resolve_session(messages)
-            else:
-                # n>1 fan-out: each choice is an independent fresh
-                # completion -- parallel-choice semantics don't fit clean
-                # single-session continuity, so caching is skipped here.
-                session_mode, session_id, delta_messages, conv_key = "fresh", str(uuid.uuid4()), messages, None
-
-            delta_claude_messages = build_claude_messages(delta_messages)
-            full_claude_messages = build_claude_messages(messages)
-
-            result, final_mode, final_id = self._run_one_completion(
-                delta_claude_messages, full_claude_messages, system_prompt, model,
-                tools_requested=bool(effective_tools), session_mode=session_mode,
-                session_id=session_id, json_schema=json_schema, env_overrides=env_overrides,
-                tools=effective_tools, stop=stop, effort=effort, conv_key=conv_key,
-            )
-
-            text = result["text"]
-            # The subprocess is now killed the instant a stop sequence
-            # appears mid-stream (see call_claude_streaming's stop=
-            # handling) -- result["stop_matched"] reflects that. This
-            # second pass is now just a safety net for edge cases where
-            # early termination didn't apply (e.g. the CLAUDE_TIMEOUT_S
-            # deadline fired first, or --json-schema's structured_json
-            # path bypasses stop-sequence checking entirely): idempotent
-            # on already-truncated text, matches nothing, no-op.
-            stop_matched = result.get("stop_matched", False)
-            if stop and text and not stop_matched:
-                text, stop_matched = _apply_stop_sequences(text, stop)
-
-            raw_tool_calls = result["tool_calls"]
-            tool_calls = None
-            if raw_tool_calls:
-                tool_calls = [
-                    {
-                        "id": tc["id"],
-                        "type": "function",
-                        "function": {"name": tc["name"], "arguments": json.dumps(tc["input"])},
-                    }
-                    for tc in raw_tool_calls
-                ]
-
-            message = {"role": "assistant", "content": text}
-            if tool_calls:
-                message["tool_calls"] = tool_calls
-
-            if include_reasoning is not False:
-                # include_reasoning=False suppresses thinking blocks from the
-                # response even when --effort produced them. Default (True or
-                # absent) always includes them when present.
-                reasoning_details = build_reasoning_details(
-                    result.get("reasoning"), result.get("reasoning_signature"),
+            if n > MAX_N_CHOICES:
+                raise ClaudeCliError(
+                    400, "invalid_request_error",
+                    f"n={n} exceeds this proxy's limit of {MAX_N_CHOICES} (each choice is a "
+                    "separate full Claude Code subprocess call; unbounded n would be unbounded cost).",
+                    code="n_too_large", param="n",
                 )
-                if reasoning_details:
-                    # OpenRouter's two supported shapes
-                    # (https://openrouter.ai/docs/guides/best-practices/
-                    # reasoning-tokens): `reasoning` (plaintext string) for
-                    # simple consumers, `reasoning_details` (structured array,
-                    # preserves the signature) for consumers that round-trip
-                    # reasoning back into a follow-up request. Both point at
-                    # the same captured thinking text.
-                    message["reasoning"] = result["reasoning"]
-                    message["reasoning_details"] = reasoning_details
 
-            finish_reason = result["finish_reason"]
-            if tool_calls:
-                finish_reason = "tool_calls"
-            elif stop_matched:
-                finish_reason = "stop"
+            # tool_choice: "none" is real and correctly implementable -- treat
+            # exactly like "no tools requested" so the full MCP+built-in
+            # lockdown applies and no tool description is added to the prompt.
+            # tool_choice: "required" / forcing a specific function name has NO
+            # reliable mechanism in this harness (no raw Anthropic tool_choice
+            # equivalent exposed) -- accepted but NOT enforced, same as before.
+            effective_tools = tools
+            if tool_choice == "none":
+                effective_tools = None
 
-            choices.append({"index": choice_index, "message": message, "finish_reason": finish_reason})
+            json_schema = None
+            if response_format.get("type") == "json_schema":
+                json_schema = (response_format.get("json_schema") or {}).get("schema")
+            elif response_format.get("type") == "json_object":
+                json_schema = {"type": "object"}
 
-            usage = result["usage"]
-            usage_totals["prompt_tokens"] += usage.get("input_tokens", 0)
-            usage_totals["completion_tokens"] += usage.get("output_tokens", 0)
-            usage_totals["total_tokens"] += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-            usage_totals["cache_read_input_tokens"] += usage.get("cache_read_input_tokens", 0)
-            usage_totals["cache_creation_input_tokens"] += usage.get("cache_creation_input_tokens", 0)
+            system_prompt = system_prompt_from_messages(messages)
+            # Native MCP tool registration is the real fix for tool-call
+            # reliability and is always attempted first inside
+            # call_claude_streaming/_run_one_completion. If any tool name can't
+            # be represented as a valid MCP tool name, it will be silently dropped
+            # (MCP is the only supported path now; prose fallback removed).
+            if effective_tools and build_mcp_tool_manifest(effective_tools) is None:
+                # Tool name(s) fail MCP constraint -- drop them silently rather
+                # than falling back to prose (removed for cost: max_turns=1 now)
+                effective_tools = None
 
-            if n == 1 and conv_key is not None:
-                record_session(conv_key, final_id, messages, message)
+            env_overrides = dict(_BASE_ENV_OVERRIDES)
+            if max_tokens:
+                try:
+                    env_overrides["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(int(max_tokens))
+                except (TypeError, ValueError):
+                    pass
 
-        if stream:
-            self._send_stream_chunks(model, choices)
+            _warn_unsupported_sampling_params(payload)
+
+            # Real token-level streaming is only safe for the single-choice,
+            # no-tools, no-json_schema, no-reasoning path: with tool retry in
+            # play, a failed attempt's narration text must not reach the
+            # client early; --json-schema's multi-turn corrective mechanism
+            # doesn't map onto a single token stream; and reasoning requires
+            # capturing the `thinking` block before `text` starts (see
+            # build_reasoning_details), which the buffered path's
+            # text_delta-only stream_callback has no hook for. Everything
+            # else falls back to buffered-then-emit (SSE framing still
+            # correct, just not real-time).
+            can_stream_live = stream and n == 1 and not effective_tools and json_schema is None and effort is None
+            if can_stream_live:
+                self._handle_streaming_completion(
+                    messages, model, system_prompt, max_tokens, env_overrides, stop,
+                )
+                return
+
+            choices = []
+            usage_totals = {
+                "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+            }
+
+            for choice_index in range(n):
+                with tracking.span("choice", index=choice_index):
+                    if n == 1:
+                        # Single-choice path: use session caching (fingerprint +
+                        # resume-with-delta) for the common case.
+                        session_mode, session_id, delta_messages, conv_key = resolve_session(messages)
+                    else:
+                        # n>1 fan-out: each choice is an independent fresh
+                        # completion -- parallel-choice semantics don't fit clean
+                        # single-session continuity, so caching is skipped here.
+                        session_mode, session_id, delta_messages, conv_key = "fresh", str(uuid.uuid4()), messages, None
+
+                    delta_claude_messages = build_claude_messages(delta_messages)
+                    full_claude_messages = build_claude_messages(messages)
+
+                    result, final_mode, final_id = self._run_one_completion(
+                        delta_claude_messages, full_claude_messages, system_prompt, model,
+                        tools_requested=bool(effective_tools), session_mode=session_mode,
+                        session_id=session_id, json_schema=json_schema, env_overrides=env_overrides,
+                        tools=effective_tools, stop=stop, effort=effort, conv_key=conv_key,
+                    )
+
+                    text = result["text"]
+                    # The subprocess is now killed the instant a stop sequence
+                    # appears mid-stream (see call_claude_streaming's stop=
+                    # handling) -- result["stop_matched"] reflects that. This
+                    # second pass is now just a safety net for edge cases where
+                    # early termination didn't apply (e.g. the CLAUDE_TIMEOUT_S
+                    # deadline fired first, or --json-schema's structured_json
+                    # path bypasses stop-sequence checking entirely): idempotent
+                    # on already-truncated text, matches nothing, no-op.
+                    stop_matched = result.get("stop_matched", False)
+                    if stop and text and not stop_matched:
+                        text, stop_matched = _apply_stop_sequences(text, stop)
+
+                    raw_tool_calls = result["tool_calls"]
+                    tool_calls = None
+                    if raw_tool_calls:
+                        tool_calls = [
+                            {
+                                "id": tc["id"],
+                                "type": "function",
+                                "function": {"name": tc["name"], "arguments": json.dumps(tc["input"])},
+                            }
+                            for tc in raw_tool_calls
+                        ]
+
+                    message = {"role": "assistant", "content": text}
+                    if tool_calls:
+                        message["tool_calls"] = tool_calls
+
+                    if include_reasoning is not False:
+                        # include_reasoning=False suppresses thinking blocks from the
+                        # response even when --effort produced them. Default (True or
+                        # absent) always includes them when present.
+                        reasoning_details = build_reasoning_details(
+                            result.get("reasoning"), result.get("reasoning_signature"),
+                        )
+                        if reasoning_details:
+                            # OpenRouter's two supported shapes
+                            # (https://openrouter.ai/docs/guides/best-practices/
+                            # reasoning-tokens): `reasoning` (plaintext string) for
+                            # simple consumers, `reasoning_details` (structured array,
+                            # preserves the signature) for consumers that round-trip
+                            # reasoning back into a follow-up request. Both point at
+                            # the same captured thinking text.
+                            message["reasoning"] = result["reasoning"]
+                            message["reasoning_details"] = reasoning_details
+
+                    finish_reason = result["finish_reason"]
+                    if tool_calls:
+                        finish_reason = "tool_calls"
+                    elif stop_matched:
+                        finish_reason = "stop"
+
+                    choices.append({"index": choice_index, "message": message, "finish_reason": finish_reason})
+
+                    usage = result["usage"]
+                    usage_totals["prompt_tokens"] += usage.get("input_tokens", 0)
+                    usage_totals["completion_tokens"] += usage.get("output_tokens", 0)
+                    usage_totals["total_tokens"] += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+                    usage_totals["cache_read_input_tokens"] += usage.get("cache_read_input_tokens", 0)
+                    usage_totals["cache_creation_input_tokens"] += usage.get("cache_creation_input_tokens", 0)
+
+                    if n == 1 and conv_key is not None:
+                        record_session(conv_key, final_id, messages, message)
+
+            if stream:
+                chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+                tracking.emit_usage(_build_usage_event(
+                    chat_id, model, _build_openai_usage(usage_totals), stream=True, n=n,
+                ))
+                self._send_stream_chunks(model, choices, chat_id=chat_id)
+                _log_quota_snapshot()
+                return
+
+            response = {
+                "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": choices,
+                "usage": _build_openai_usage(usage_totals),
+            }
+            tracking.emit_usage(_build_usage_event(
+                response["id"], model, response["usage"], stream=False, n=n,
+            ))
+            self._send_json(response)
             _log_quota_snapshot()
-            return
-
-        response = {
-            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": model,
-            "choices": choices,
-            "usage": _build_openai_usage(usage_totals),
-        }
-        self._send_json(response)
-        _log_quota_snapshot()
 
     def _handle_streaming_completion(self, messages, model, system_prompt, max_tokens, env_overrides, stop):
         """Real token-level SSE streaming for the safe case (single choice,
@@ -510,6 +531,7 @@ class Handler(BaseHTTPRequestHandler):
                     else None
                 )
                 if warm is not None:
+                    logger.debug("turn dispatch: path=warm session_id=%s", session_id)
                     try:
                         result = warm.send_turn(delta_claude_messages, stop=stop, stream_callback=on_text_delta)
                     except ClaudeCliError:
@@ -528,6 +550,7 @@ class Handler(BaseHTTPRequestHandler):
                         # state indefinitely after being claimed).
                         warm.kill()
                 else:
+                    logger.debug("turn dispatch: path=cold session_id=%s session_mode=%s", session_id, session_mode)
                     result = call_claude_streaming(
                         delta_claude_messages, system_prompt, model,
                         session_mode=session_mode, session_id=session_id,
@@ -554,6 +577,25 @@ class Handler(BaseHTTPRequestHandler):
             finish_reason = "stop"
         emit({}, finish=finish_reason)
         self.wfile.write(b"data: [DONE]\n\n")
+
+        # Live streaming's result["usage"] uses the same internal keys as
+        # the buffered path's per-attempt usage -- remap into the
+        # usage_totals shape so _build_openai_usage (already imported,
+        # already the one source of truth for the cache/prompt_tokens_details
+        # nesting logic) can build the same flat OpenAI shape here too,
+        # rather than reimplementing it. n is always 1 on this path (see
+        # the can_stream_live gate in _handle_chat_completion).
+        raw_usage = result.get("usage") or {}
+        usage_totals = {
+            "prompt_tokens": raw_usage.get("input_tokens", 0),
+            "completion_tokens": raw_usage.get("output_tokens", 0),
+            "total_tokens": raw_usage.get("input_tokens", 0) + raw_usage.get("output_tokens", 0),
+            "cache_read_input_tokens": raw_usage.get("cache_read_input_tokens", 0),
+            "cache_creation_input_tokens": raw_usage.get("cache_creation_input_tokens", 0),
+        }
+        tracking.emit_usage(_build_usage_event(
+            chat_id, model, _build_openai_usage(usage_totals), stream=True, n=1,
+        ))
 
         if conv_key is not None:
             message = {"role": "assistant", "content": result["text"]}
@@ -630,6 +672,7 @@ class Handler(BaseHTTPRequestHandler):
             if fingerprint is not None and session_mode == "resume":
                 warm = state._WARM_POOL.take_if_matching(fingerprint)
                 if warm is not None:
+                    logger.debug("turn dispatch: path=warm session_id=%s", session_id)
                     try:
                         result = warm.send_turn(delta_messages, stop=stop)
                     except ClaudeCliError:
@@ -651,6 +694,7 @@ class Handler(BaseHTTPRequestHandler):
                     # already spent (one turn each) and not reused.
                     warm.kill()
 
+            logger.debug("turn dispatch: path=cold session_id=%s session_mode=%s", session_id, session_mode)
             result, final_mode, final_id = call_claude_with_tool_retry(
                 delta_messages, full_messages, system_prompt, model,
                 tools_requested=tools_requested, session_mode=session_mode, session_id=session_id,
@@ -661,14 +705,15 @@ class Handler(BaseHTTPRequestHandler):
             return result, final_mode, final_id
 
 
-    def _send_stream_chunks(self, model, choices):
+    def _send_stream_chunks(self, model, choices, chat_id=None):
         """Emits SSE chunks. NOTE: this is protocol-shaped streaming, not
         real token streaming -- each choice's full text/tool_calls are
         already fully computed by the time this runs (Claude Code's
         stream-json mode streams messages, not token deltas within a
         message), so each choice arrives as a single content delta after
         the full latency. See README "Capability audit" for measurements."""
-        chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        if chat_id is None:
+            chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -704,6 +749,9 @@ def main():
     except ValueError:
         print(f"Invalid port: {sys.argv[1]!r}", file=sys.stderr)
         sys.exit(2)
+    tracking.configure_logging_from_env()
+    tracking.configure_tracing_from_env()
+    tracking.init_trackers_from_env()
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"Claude Code shim (native tool-calling + session caching) listening on http://127.0.0.1:{port}/v1")
     server.serve_forever()

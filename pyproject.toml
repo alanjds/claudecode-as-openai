@@ -22,6 +22,9 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
+[project.optional-dependencies]
+tracking = ["litellm", "logfire"]
+
 [project.urls]
 Homepage = "https://github.com/alanjds/claudecode-as-openai"
 Issues = "https://github.com/alanjds/claudecode-as-openai/issues"

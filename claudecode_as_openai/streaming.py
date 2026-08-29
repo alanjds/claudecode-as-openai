@@ -22,6 +22,8 @@ from claudecode_as_openai.errors import ClaudeCliError, _classify_error_text
 from claudecode_as_openai.tools import build_mcp_tool_config, _gen_tool_id, strip_mcp_tool_prefix
 from claudecode_as_openai.messages import _flatten_content
 from claudecode_as_openai.parsing import _iter_ndjson_lines, _iter_ndjson_lines_pty
+from claudecode_as_openai import tracking
+from claudecode_as_openai.tracking import logger
 
 
 def _normalize_stop_sequences(stop):
@@ -420,91 +422,101 @@ def call_claude_streaming(
         else:
             cmd += ["--system-prompt", system_prompt]
 
-    try:
-        use_pty = stream_callback is not None
-        pty_master_fd = None
-        if use_pty:
-            # See _iter_ndjson_lines_pty docstring: a plain pipe leaves
-            # `claude`'s stdout fully buffered (bursty, not real-time), so
-            # real client-facing streaming needs a PTY attached as stdout
-            # to force line buffering.
-            pty_master_fd, pty_slave_fd = pty.openpty()
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=pty_slave_fd,
-                stderr=subprocess.PIPE,
-                cwd=state._CLAUDE_CWD,
-            )
-            os.close(pty_slave_fd)
-        else:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                cwd=state._CLAUDE_CWD,
-            )
-    except FileNotFoundError:
-        if system_prompt_file:
-            try:
-                os.unlink(system_prompt_file)
-            except OSError:
-                pass
-        raise ClaudeCliError(
-            503, "api_error",
-            f"'{_CLAUDE_BIN}' CLI not found on PATH. Install Claude Code "
-            "(https://code.claude.com) and ensure `claude` is runnable.",
-            code="claude_cli_not_found",
-        )
-
-    try:
-        if use_pty:
-            proc.stdin.write(json.dumps(claude_messages).encode())
-        else:
-            proc.stdin.write(json.dumps(claude_messages))
-        proc.stdin.close()
-
-        deadline = time.time() + CLAUDE_TIMEOUT_S
-        chunk_source = (
-            _iter_ndjson_lines_pty(pty_master_fd, proc, CLAUDE_TIMEOUT_S)
-            if use_pty else _iter_ndjson_lines(proc)
-        )
-        return _consume_claude_response(chunk_source, deadline, stop_sequences, stream_callback)
-    finally:
-        # Terminating here (rather than letting the subprocess run to its
-        # own natural end) is what actually delivers the latency/cost win
-        # for an early stop-sequence match -- the `break` above only stops
-        # US reading further NDJSON lines; the underlying `claude` process
-        # would otherwise keep generating (and being billed for) tokens
-        # nobody will see. This path already ran for every other early-exit
-        # case (tool_use, error, max-turns); stop-sequence matches now share
-        # the same real subprocess teardown instead of a fake early return.
+    redacted_cmd = tracking.redact_cmd_for_log(cmd)
+    logger.debug(
+        "spawning claude (cold): %s | session_id=%s session_mode=%s",
+        redacted_cmd, session_id, session_mode,
+    )
+    with tracking.span("claude_spawn", cmd=redacted_cmd, path="cold") as sp:
         try:
-            proc.terminate()
-            proc.wait(timeout=2)
-        except Exception:
+            use_pty = stream_callback is not None
+            pty_master_fd = None
+            if use_pty:
+                # See _iter_ndjson_lines_pty docstring: a plain pipe leaves
+                # `claude`'s stdout fully buffered (bursty, not real-time), so
+                # real client-facing streaming needs a PTY attached as stdout
+                # to force line buffering.
+                pty_master_fd, pty_slave_fd = pty.openpty()
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=pty_slave_fd,
+                    stderr=subprocess.PIPE,
+                    cwd=state._CLAUDE_CWD,
+                )
+                os.close(pty_slave_fd)
+            else:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    cwd=state._CLAUDE_CWD,
+                )
+        except FileNotFoundError:
+            if system_prompt_file:
+                try:
+                    os.unlink(system_prompt_file)
+                except OSError:
+                    pass
+            raise ClaudeCliError(
+                503, "api_error",
+                f"'{_CLAUDE_BIN}' CLI not found on PATH. Install Claude Code "
+                "(https://code.claude.com) and ensure `claude` is runnable.",
+                code="claude_cli_not_found",
+            )
+
+        try:
+            if use_pty:
+                proc.stdin.write(json.dumps(claude_messages).encode())
+            else:
+                proc.stdin.write(json.dumps(claude_messages))
+            proc.stdin.close()
+
+            deadline = time.time() + CLAUDE_TIMEOUT_S
+            chunk_source = (
+                _iter_ndjson_lines_pty(pty_master_fd, proc, CLAUDE_TIMEOUT_S)
+                if use_pty else _iter_ndjson_lines(proc)
+            )
+            result = _consume_claude_response(chunk_source, deadline, stop_sequences, stream_callback)
+            usage = result.get("usage") or {}
+            sp.set_attribute("gen_ai.usage.input_tokens", usage.get("input_tokens", 0))
+            sp.set_attribute("gen_ai.usage.output_tokens", usage.get("output_tokens", 0))
+            return result
+        finally:
+            # Terminating here (rather than letting the subprocess run to its
+            # own natural end) is what actually delivers the latency/cost win
+            # for an early stop-sequence match -- the `break` above only stops
+            # US reading further NDJSON lines; the underlying `claude` process
+            # would otherwise keep generating (and being billed for) tokens
+            # nobody will see. This path already ran for every other early-exit
+            # case (tool_use, error, max-turns); stop-sequence matches now share
+            # the same real subprocess teardown instead of a fake early return.
             try:
-                proc.kill()
+                proc.terminate()
+                proc.wait(timeout=2)
             except Exception:
-                pass
-        if use_pty and pty_master_fd is not None:
-            try:
-                os.close(pty_master_fd)
-            except OSError:
-                pass
-        if system_prompt_file:
-            try:
-                os.unlink(system_prompt_file)
-            except OSError:
-                pass
-        if mcp_tool_config is not None:
-            try:
-                os.unlink(mcp_tool_config["manifest_path"])
-            except OSError:
-                pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            if use_pty and pty_master_fd is not None:
+                try:
+                    os.close(pty_master_fd)
+                except OSError:
+                    pass
+            if system_prompt_file:
+                try:
+                    os.unlink(system_prompt_file)
+                except OSError:
+                    pass
+            if mcp_tool_config is not None:
+                try:
+                    os.unlink(mcp_tool_config["manifest_path"])
+                except OSError:
+                    pass
 
 
 def build_reasoning_details(reasoning_text, signature):
@@ -620,24 +632,41 @@ def call_claude_with_tool_retry(
     knows to discard it and retry (see call_claude_streaming's own
     docstring). Enforced here defensively too: the callback is only ever
     forwarded to call_claude_streaming when tools_requested is False,
-    regardless of what the caller passed in."""
+    regardless of what the caller passed in.
+
+    Every attempt spawns a real `claude` subprocess and burns real,
+    billed tokens -- including ones that only narrate instead of
+    dispatching a tool and get discarded. `result["usage"]` on return is
+    the SUM across every attempt this call made, not just the winning
+    one, so callers (and usage-tracking events) see true billed usage
+    rather than under-reporting whenever a retry happened."""
     result = None
+    accumulated_usage = {
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+    }
     cur_mode, cur_id, cur_messages = session_mode, session_id, delta_claude_messages
     total_attempts = 1 + TOOL_CALL_MAX_RETRIES
     for attempt in range(total_attempts):
         cb = stream_callback if not tools_requested else None
-        result = call_claude_streaming(
-            cur_messages, system_prompt, model,
-            session_mode=cur_mode, session_id=cur_id,
-            tools_requested=tools_requested,
-            tools=tools,
-            stop=stop,
-            stream_callback=cb,
-            effort=effort,
-        )
+        with tracking.span("tool_retry_attempt", attempt=attempt, session_mode=cur_mode):
+            result = call_claude_streaming(
+                cur_messages, system_prompt, model,
+                session_mode=cur_mode, session_id=cur_id,
+                tools_requested=tools_requested,
+                tools=tools,
+                stop=stop,
+                stream_callback=cb,
+                effort=effort,
+            )
+        attempt_usage = result.get("usage") or {}
+        for key in accumulated_usage:
+            accumulated_usage[key] += attempt_usage.get(key, 0)
         if result["tool_calls"] or not tools_requested:
+            result["usage"] = dict(accumulated_usage)
             return result, cur_mode, cur_id
         if attempt < total_attempts - 1:
             time.sleep(_backoff_delay_s(attempt))
             cur_mode, cur_id, cur_messages = "fresh", str(uuid.uuid4()), full_claude_messages
+    result["usage"] = dict(accumulated_usage)
     return result, cur_mode, cur_id

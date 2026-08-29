@@ -667,8 +667,8 @@ class TestToolRetryWrapper(unittest.TestCase):
     session-mode switching on retry, and that it stops as soon as a real
     tool_use shows up."""
 
-    def _stub_result(self, tool_calls=None, text=None):
-        return {"text": text, "tool_calls": tool_calls or [], "usage": {}, "finish_reason": "stop", "structured_json": None}
+    def _stub_result(self, tool_calls=None, text=None, usage=None):
+        return {"text": text, "tool_calls": tool_calls or [], "usage": usage or {}, "finish_reason": "stop", "structured_json": None}
 
     def test_no_retry_needed_when_tool_call_on_first_try(self):
         with patch.object(streaming, "call_claude_streaming", return_value=self._stub_result(tool_calls=[{"name": "x"}])) as mock_call, \
@@ -747,6 +747,70 @@ class TestToolRetryWrapper(unittest.TestCase):
         self.assertEqual(shim._backoff_delay_s(2), 8.0)
         self.assertEqual(shim._backoff_delay_s(3), 15.0)  # capped
         self.assertEqual(shim._backoff_delay_s(10), 15.0)  # stays capped
+
+    def test_usage_is_summed_across_every_attempt_not_just_the_last(self):
+        """Every attempt spawns a real, billed subprocess -- a discarded
+        narration-only attempt's tokens must not be dropped just because
+        the final attempt's result is what's returned."""
+        side_effects = [
+            self._stub_result(text="narrating...", usage={
+                "input_tokens": 100, "output_tokens": 20,
+                "cache_read_input_tokens": 5, "cache_creation_input_tokens": 1,
+            }),
+            self._stub_result(text="narrating again...", usage={
+                "input_tokens": 150, "output_tokens": 25,
+                "cache_read_input_tokens": 0, "cache_creation_input_tokens": 2,
+            }),
+            self._stub_result(tool_calls=[{"name": "get_weather"}], usage={
+                "input_tokens": 200, "output_tokens": 30,
+                "cache_read_input_tokens": 10, "cache_creation_input_tokens": 0,
+            }),
+        ]
+        with patch.object(streaming, "call_claude_streaming", side_effect=side_effects), \
+             patch.object(shim.time, "sleep"):
+            result, mode, sid = shim.call_claude_with_tool_retry(
+                [], [], "", "sonnet", tools_requested=True, session_mode="resume", session_id="abc"
+            )
+        self.assertEqual(result["usage"], {
+            "input_tokens": 450, "output_tokens": 75,
+            "cache_read_input_tokens": 15, "cache_creation_input_tokens": 3,
+        })
+
+    def test_usage_is_summed_even_when_all_attempts_are_exhausted(self):
+        total_attempts = 1 + shim.TOOL_CALL_MAX_RETRIES
+        side_effects = [
+            self._stub_result(text="still narrating", usage={"input_tokens": 10, "output_tokens": 1})
+            for _ in range(total_attempts)
+        ]
+        with patch.object(streaming, "call_claude_streaming", side_effect=side_effects), \
+             patch.object(shim.time, "sleep"):
+            result, mode, sid = shim.call_claude_with_tool_retry(
+                [], [], "", "sonnet", tools_requested=True, session_mode="fresh", session_id="abc"
+            )
+        self.assertEqual(result["usage"]["input_tokens"], 10 * total_attempts)
+        self.assertEqual(result["usage"]["output_tokens"], 1 * total_attempts)
+
+
+class TestDebugCommandLogging(unittest.TestCase):
+    """CLAUDE_OPENAI_LOG_LEVEL=DEBUG should surface the exact (redacted)
+    claude command line at spawn time -- see tracking.redact_cmd_for_log
+    for the redaction contract itself (tests/test_tracking.py)."""
+
+    def test_call_claude_streaming_logs_redacted_command_at_debug(self):
+        fake_proc = FakeProcess(_ndjson_lines({"type": "result", "usage": {}}))
+        with patch.object(shim.subprocess, "Popen", return_value=fake_proc), \
+             patch.object(shim.pty, "openpty", return_value=(-1, -1)), \
+             patch.object(shim.os, "close", lambda fd: None), \
+             patch.object(streaming, "_iter_ndjson_lines", lambda proc: iter(_parse_ndjson_lines(fake_proc.stdout))), \
+             self.assertLogs("claudecode_as_openai", level="DEBUG") as log_ctx:
+            shim.call_claude_streaming(
+                [{"role": "user", "content": "hi"}], "top secret system prompt", "sonnet",
+            )
+        combined = "\n".join(log_ctx.output)
+        self.assertIn("spawning claude", combined)
+        self.assertIn("--system-prompt", combined)
+        self.assertNotIn("top secret system prompt", combined)
+        self.assertIn("<len=", combined)
 
 
 class TestUnsupportedSamplingParamsWarning(unittest.TestCase):
