@@ -10,6 +10,7 @@ import json
 import uuid
 
 from claudecode_as_openai.state import _SESSION_STORE, _SESSION_STORE_MAX, _SESSION_LOCK
+from claudecode_as_openai.tracking import logger
 
 
 def _conversation_key(openai_messages):
@@ -36,10 +37,38 @@ def resolve_session(openai_messages):
         entry = _SESSION_STORE.get(key)
         if entry:
             synced = entry["synced_messages"]
-            match = len(openai_messages) > len(synced) and _messages_equal(openai_messages[: len(synced)], synced)
+            length_ok = len(openai_messages) > len(synced)
+            match = length_ok and _messages_equal(openai_messages[: len(synced)], synced)
             if match:
+                logger.debug(
+                    "resolve_session: conv_key=%s -> resume (n_incoming=%d n_synced=%d)",
+                    key[:12], len(openai_messages), len(synced),
+                )
                 delta = openai_messages[len(synced) :]
                 return "resume", entry["claude_session_id"], delta, key
+            if not length_ok:
+                logger.debug(
+                    "resolve_session: conv_key=%s -> fresh (entry found, but incoming has %d "
+                    "messages <= the %d already synced -- not a superset, treating as diverged)",
+                    key[:12], len(openai_messages), len(synced),
+                )
+            else:
+                first_diff = next(
+                    (i for i in range(len(synced))
+                     if not _messages_equal(openai_messages[i], synced[i])),
+                    None,
+                )
+                logger.debug(
+                    "resolve_session: conv_key=%s -> fresh (entry found, but prefix diverged "
+                    "at message index %s of %d synced)",
+                    key[:12], first_diff, len(synced),
+                )
+        else:
+            logger.debug(
+                "resolve_session: conv_key=%s -> fresh (no prior entry for this key; "
+                "n_incoming=%d, %d known conv_keys)",
+                key[:12], len(openai_messages), len(_SESSION_STORE),
+            )
     return "fresh", str(uuid.uuid4()), openai_messages, key
 
 

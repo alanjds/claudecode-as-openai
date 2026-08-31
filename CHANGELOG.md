@@ -206,3 +206,10 @@ _Unreleased_
   retry-loop/fan-out/warm-vs-cold amplification that's invisible from a
   single request otherwise. Degrades to a true no-op with `logfire`
   uninstalled or tracing disabled.
+* `resolve_session` now logs, at DEBUG, exactly why it picked `fresh` vs.
+  `resume` -- no prior entry, an existing entry whose incoming message
+  count isn't a strict superset of what's synced, a diverged prefix (with
+  the exact message index that differs), or a match. Verified live: this
+  is what let a real "every session looks cold" report get diagnosed from
+  a single log capture -- the session-cache matching logic itself turned
+  out to be correct the whole time.

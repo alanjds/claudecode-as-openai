@@ -156,6 +156,65 @@ class TestSessionCaching(unittest.TestCase):
         self.assertNotEqual(key_plain, key_sys)
 
 
+class TestResolveSessionDebugLogging(unittest.TestCase):
+    """resolve_session's DEBUG log must say WHY it picked fresh vs resume --
+    this is what let a real "all sessions look cold" report get diagnosed
+    from a single log capture instead of a multi-session live investigation
+    (see CHANGELOG). One assertion per distinct code path."""
+
+    def setUp(self):
+        shim._SESSION_STORE.clear()
+
+    def test_logs_no_prior_entry(self):
+        with self.assertLogs("claudecode_as_openai", level="DEBUG") as log_ctx:
+            shim.resolve_session([{"role": "user", "content": "hi"}])
+        combined = "\n".join(log_ctx.output)
+        self.assertIn("-> fresh", combined)
+        self.assertIn("no prior entry", combined)
+
+    def test_logs_resume_with_message_counts(self):
+        turn1 = [{"role": "user", "content": "remember X"}]
+        _, sid, _, key = shim.resolve_session(turn1)
+        reply = {"role": "assistant", "content": "ok"}
+        shim.record_session(key, sid, turn1, reply)
+
+        turn2 = turn1 + [reply, {"role": "user", "content": "what was X?"}]
+        with self.assertLogs("claudecode_as_openai", level="DEBUG") as log_ctx:
+            shim.resolve_session(turn2)
+        combined = "\n".join(log_ctx.output)
+        self.assertIn("-> resume", combined)
+        self.assertIn("n_incoming=3", combined)
+        self.assertIn("n_synced=2", combined)
+
+    def test_logs_diverged_prefix_with_index(self):
+        turn1 = [{"role": "user", "content": "remember X"}]
+        _, sid, _, key = shim.resolve_session(turn1)
+        shim.record_session(key, sid, turn1, {"role": "assistant", "content": "ok, remembered X"})
+
+        diverged = turn1 + [
+            {"role": "assistant", "content": "a completely different reply"},
+            {"role": "user", "content": "what was X?"},
+        ]
+        with self.assertLogs("claudecode_as_openai", level="DEBUG") as log_ctx:
+            shim.resolve_session(diverged)
+        combined = "\n".join(log_ctx.output)
+        self.assertIn("-> fresh", combined)
+        self.assertIn("prefix diverged at message index 1", combined)
+
+    def test_logs_not_a_superset_when_incoming_is_shorter_or_equal(self):
+        turn1 = [{"role": "user", "content": "remember X"}]
+        _, sid, _, key = shim.resolve_session(turn1)
+        shim.record_session(key, sid, turn1, {"role": "assistant", "content": "ok"})
+
+        with self.assertLogs("claudecode_as_openai", level="DEBUG") as log_ctx:
+            # Same conv_key (same system+first message), but no new trailing
+            # message -- incoming is not longer than what's already synced.
+            shim.resolve_session(turn1)
+        combined = "\n".join(log_ctx.output)
+        self.assertIn("-> fresh", combined)
+        self.assertIn("not a superset", combined)
+
+
 class TestBuildClaudeCmd(unittest.TestCase):
     def test_tools_requested_uses_disallowed_tools_list(self):
         cmd = shim._build_claude_cmd("sonnet", "fresh", "sid", tools_requested=True, max_turns=1, json_schema=None)
