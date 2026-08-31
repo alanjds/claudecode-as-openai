@@ -106,6 +106,14 @@ def _build_claude_cmd(model, session_mode, session_id, tools_requested, max_turn
         cmd += ["--include-partial-messages"]
     if session_mode == "resume":
         cmd += ["--resume", session_id]
+    elif session_mode == "fork":
+        # Used by call_claude_with_tool_retry on retry: --fork-session
+        # resumes `session_id`'s transcript (billed as a cache hit, not
+        # a full resend -- verified live) into a CLI-assigned new session
+        # id, leaving the original session's own transcript untouched.
+        # See _consume_claude_response for where that new id is captured
+        # back out of the "system"/"init" chunk.
+        cmd += ["--resume", session_id, "--fork-session"]
     else:
         cmd += ["--session-id", session_id]
     if model:
@@ -134,6 +142,7 @@ def _consume_claude_response(chunk_source, deadline, stop_sequences, stream_call
     tool_calls = []
     structured_json = None
     usage = {}
+    resolved_session_id = None
     finish_reason = "stop"
     stop_matched = False
     streaming_partial_text = ""
@@ -142,6 +151,18 @@ def _consume_claude_response(chunk_source, deadline, stop_sequences, stream_call
         if time.time() > deadline:
             break
         ctype = chunk.get("type")
+
+        if ctype == "system":
+            if chunk.get("subtype") == "init":
+                # The one place the CLI-assigned session id is ever
+                # observable -- needed because --fork-session (see
+                # _build_claude_cmd) means the caller doesn't get to
+                # choose it. Echoes back whatever --session-id/--resume
+                # value was passed for the non-forking modes too, so
+                # callers can uniformly trust this over their own
+                # locally-tracked id.
+                resolved_session_id = chunk.get("session_id")
+            continue
 
         if ctype == "rate_limit_event":
             info = chunk.get("rate_limit_info") or {}
@@ -335,6 +356,7 @@ def _consume_claude_response(chunk_source, deadline, stop_sequences, stream_call
             "structured_json": structured_json,
             "reasoning": None,
             "reasoning_signature": None,
+            "session_id": resolved_session_id,
         }
 
     return {
@@ -346,6 +368,7 @@ def _consume_claude_response(chunk_source, deadline, stop_sequences, stream_call
         "stop_matched": stop_matched,
         "reasoning": "".join(reasoning_parts) or None,
         "reasoning_signature": reasoning_signature,
+        "session_id": resolved_session_id,
     }
 
 
@@ -481,6 +504,14 @@ def call_claude_streaming(
                 if use_pty else _iter_ndjson_lines(proc)
             )
             result = _consume_claude_response(chunk_source, deadline, stop_sequences, stream_callback)
+            # Self-consistency fallback for the non-forking modes (and for
+            # any test/mock chunk_source that omits the "system"/"init"
+            # line): the CLI always echoes back whatever --session-id/
+            # --resume value was passed, so this is a no-op in practice
+            # except for session_mode="fork", where it's the only source
+            # of truth for the id the CLI actually assigned.
+            if not result.get("session_id"):
+                result["session_id"] = session_id
             usage = result.get("usage") or {}
             sp.set_attribute("gen_ai.usage.input_tokens", usage.get("input_tokens", 0))
             sp.set_attribute("gen_ai.usage.output_tokens", usage.get("output_tokens", 0))
@@ -604,27 +635,47 @@ def call_claude_with_tool_retry(
     stream_callback=None,
     effort=None,
 ):
-    """Wraps call_claude_streaming with bounded retries for the documented
-    tool-dispatch flakiness. The FIRST attempt uses whatever session mode
-    was resolved by resolve_session() (a resumed session sending only the
-    new delta messages, or a fresh session sending everything) so the
-    common, successful case gets the full caching benefit. If a retry is
-    needed (tools were requested but no tool_use came back), retries use a
-    brand-new fresh session with the FULL conversation history instead of
-    resuming -- reusing the same --session-id across attempts causes an
-    "already in use" CLI error, and resuming with more delta messages would
-    duplicate entries in that session's persisted transcript. Returns
-    (result_dict, final_session_mode, final_session_id) so the caller knows
-    which session to record for the next external turn.
+    """Wraps call_claude_streaming with a bounded, OFF-BY-DEFAULT retry for
+    the documented tool-dispatch flakiness (TOOL_CALL_MAX_RETRIES defaults
+    to 0 -- see constants.py for why). The FIRST attempt always uses
+    whatever session mode was resolved by resolve_session() (a resumed
+    session sending only the new delta messages, or a fresh session
+    sending everything) so the common, successful case gets the full
+    caching benefit, unaffected by whether retries are enabled at all.
+
+    If a retry IS enabled and needed (tools were requested but no
+    tool_use came back), it does NOT reuse the same --session-id (causes
+    an "already in use" CLI error) or resume with more delta messages
+    (would duplicate entries in that session's persisted transcript).
+    Instead:
+      - If the ORIGINAL call was session_mode="resume", every retry forks
+        a brand-new session from that SAME original checkpoint (never
+        from a previous retry's own session) via --fork-session, resending
+        only the delta -- verified live: a fork is billed as a cache hit
+        of the source's full context, not a resend, and leaves the
+        source session's own transcript untouched. Every retry is
+        therefore an equally "clean" re-ask, just cheap.
+      - If the ORIGINAL call was session_mode="fresh" (this conversation's
+        very first turn), there is no pre-existing Claude-side session to
+        fork from -- retries fall back to a brand-new session with the
+        full history resent, same as before this existed.
+    Returns (result_dict, final_session_mode, final_session_id) so the
+    caller knows which session to record for the next external turn --
+    final_session_id is the CLI-CONFIRMED id from the winning attempt's
+    "system"/"init" chunk (see _consume_claude_response), not necessarily
+    the id this function itself picked, since --fork-session means the
+    CLI chooses it.
 
     `tools`, if given, is forwarded to call_claude_streaming for native MCP
     tool registration (see build_mcp_tool_config) -- this is what actually
-    fixes the tool-dispatch reliability this retry loop exists to paper
-    over; verified live to reach 100% turn-1 dispatch, so in practice this
-    loop should rarely need more than its first attempt whenever `tools`
-    resolves to a valid MCP manifest. Retries remain as a safety net for
-    tools that can't be represented as MCP tool names (dropped, see
-    server.py) and for any future Claude Code regression.
+    fixes the tool-dispatch reliability this retry loop used to paper
+    over pre-MCP; verified live to reach 100% turn-1 dispatch when a tool
+    call is actually warranted. With MCP handling that, "no tool_call"
+    overwhelmingly means "no tool was needed", not "dispatch failed" --
+    which is why retrying is no longer the default. Kept as a safety net
+    for tools that can't be represented as MCP tool names (dropped, see
+    server.py) and for any future Claude Code regression: set
+    TOOL_CALL_MAX_RETRIES > 0 to re-enable.
 
     `stream_callback`, if given, should only ever be passed by the caller
     when tools_requested is False -- with tools in play, a failed
@@ -645,6 +696,7 @@ def call_claude_with_tool_retry(
         "input_tokens": 0, "output_tokens": 0,
         "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
     }
+    origin_mode, origin_id = session_mode, session_id
     cur_mode, cur_id, cur_messages = session_mode, session_id, delta_claude_messages
     total_attempts = 1 + TOOL_CALL_MAX_RETRIES
     for attempt in range(total_attempts):
@@ -659,14 +711,19 @@ def call_claude_with_tool_retry(
                 stream_callback=cb,
                 effort=effort,
             )
+        actual_id = result.get("session_id") or cur_id
         attempt_usage = result.get("usage") or {}
         for key in accumulated_usage:
             accumulated_usage[key] += attempt_usage.get(key, 0)
         if result["tool_calls"] or not tools_requested:
             result["usage"] = dict(accumulated_usage)
-            return result, cur_mode, cur_id
+            return result, cur_mode, actual_id
         if attempt < total_attempts - 1:
             time.sleep(_backoff_delay_s(attempt))
-            cur_mode, cur_id, cur_messages = "fresh", str(uuid.uuid4()), full_claude_messages
+            if origin_mode == "resume":
+                cur_mode, cur_id, cur_messages = "fork", origin_id, delta_claude_messages
+            else:
+                cur_mode, cur_id, cur_messages = "fresh", str(uuid.uuid4()), full_claude_messages
     result["usage"] = dict(accumulated_usage)
-    return result, cur_mode, cur_id
+    actual_id = result.get("session_id") or cur_id
+    return result, cur_mode, actual_id

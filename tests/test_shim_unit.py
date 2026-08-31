@@ -237,6 +237,17 @@ class TestBuildClaudeCmd(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--resume") + 1], "abc-123")
         self.assertNotIn("--session-id", cmd)
 
+    def test_fork_mode_uses_resume_plus_fork_session_flag(self):
+        """session_mode="fork" (used by call_claude_with_tool_retry's
+        cheap resume-origin retry) must --resume the SOURCE session AND
+        pass --fork-session, never --session-id (the CLI picks the new
+        id, not us -- see _consume_claude_response)."""
+        cmd = shim._build_claude_cmd("sonnet", "fork", "source-sid", tools_requested=False, max_turns=1, json_schema=None)
+        self.assertIn("--resume", cmd)
+        self.assertEqual(cmd[cmd.index("--resume") + 1], "source-sid")
+        self.assertIn("--fork-session", cmd)
+        self.assertNotIn("--session-id", cmd)
+
     def test_fresh_mode_uses_session_id_flag(self):
         cmd = shim._build_claude_cmd("sonnet", "fresh", "abc-123", tools_requested=False, max_turns=1, json_schema=None)
         self.assertIn("--session-id", cmd)
@@ -405,6 +416,28 @@ class TestCallClaudeStreaming(unittest.TestCase):
         self.assertEqual(result["text"], "hello there")
         self.assertEqual(result["tool_calls"], [])
         self.assertEqual(result["usage"]["input_tokens"], 3)
+
+    def test_result_carries_the_cli_confirmed_session_id(self):
+        """--fork-session means the CLI -- not this shim -- picks the
+        actual session id, only observable via the "system"/"init"
+        chunk's session_id field. Must be surfaced on the result so
+        call_claude_with_tool_retry can track it instead of the id it
+        merely requested."""
+        lines = _ndjson_lines(
+            {"type": "system", "subtype": "init", "session_id": "cli-assigned-sid"},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}], "usage": {}}},
+            {"type": "result", "subtype": "success"},
+        )
+        result = self._run(FakeProcess(lines), session_mode="fork", session_id="source-sid")
+        self.assertEqual(result["session_id"], "cli-assigned-sid")
+
+    def test_result_falls_back_to_requested_id_without_an_init_chunk(self):
+        lines = _ndjson_lines(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}], "usage": {}}},
+            {"type": "result", "subtype": "success"},
+        )
+        result = self._run(FakeProcess(lines), session_mode="resume", session_id="requested-sid")
+        self.assertEqual(result["session_id"], "requested-sid")
 
     def test_thinking_block_then_tool_use_is_not_missed(self):
         """Regression test: an assistant message can consist of ONLY a
@@ -724,10 +757,20 @@ class TestStopSequences(unittest.TestCase):
 class TestToolRetryWrapper(unittest.TestCase):
     """call_claude_with_tool_retry: verifies retry count, backoff timing,
     session-mode switching on retry, and that it stops as soon as a real
-    tool_use shows up."""
+    tool_use shows up.
 
-    def _stub_result(self, tool_calls=None, text=None, usage=None):
-        return {"text": text, "tool_calls": tool_calls or [], "usage": usage or {}, "finish_reason": "stop", "structured_json": None}
+    TOOL_CALL_MAX_RETRIES defaults to 0 (see constants.py) -- MCP tool
+    registration already reaches ~100% turn-1 dispatch, so retrying a
+    "no tool_call" response now overwhelmingly discards a CORRECT
+    no-tool-needed reply rather than fixing a genuine failure. Tests that
+    exercise actual retry behavior explicitly patch the constant back up;
+    tests without that patch exercise the real default."""
+
+    def _stub_result(self, tool_calls=None, text=None, usage=None, session_id=None):
+        return {
+            "text": text, "tool_calls": tool_calls or [], "usage": usage or {},
+            "finish_reason": "stop", "structured_json": None, "session_id": session_id,
+        }
 
     def test_no_retry_needed_when_tool_call_on_first_try(self):
         with patch.object(streaming, "call_claude_streaming", return_value=self._stub_result(tool_calls=[{"name": "x"}])) as mock_call, \
@@ -751,13 +794,32 @@ class TestToolRetryWrapper(unittest.TestCase):
         mock_sleep.assert_not_called()
         self.assertEqual(result["text"], "just text")
 
+    def test_default_max_retries_is_zero_so_no_retry_ever_happens(self):
+        """The actual production default: tools requested, no tool_call
+        came back, but with retries disabled this must return immediately
+        on the first (and only) attempt instead of retrying -- verifies
+        TOOL_CALL_MAX_RETRIES=0 genuinely disables retries, not just that
+        the loop count is right in the abstract."""
+        self.assertEqual(shim.TOOL_CALL_MAX_RETRIES, 0)
+        with patch.object(streaming, "call_claude_streaming", return_value=self._stub_result(text="just narrating, no tool call")) as mock_call, \
+             patch.object(shim.time, "sleep") as mock_sleep:
+            result, mode, sid = shim.call_claude_with_tool_retry(
+                [], [], "", "sonnet", tools_requested=True, session_mode="resume", session_id="abc"
+            )
+        self.assertEqual(mock_call.call_count, 1)
+        mock_sleep.assert_not_called()
+        self.assertEqual(result["text"], "just narrating, no tool call")
+        self.assertEqual(mode, "resume")
+        self.assertEqual(sid, "abc")
+
     def test_retries_with_backoff_until_tool_call_appears(self):
         side_effects = [
             self._stub_result(text="narrating..."),
             self._stub_result(text="narrating again..."),
             self._stub_result(tool_calls=[{"name": "get_weather"}]),
         ]
-        with patch.object(streaming, "call_claude_streaming", side_effect=side_effects) as mock_call, \
+        with patch.object(streaming, "TOOL_CALL_MAX_RETRIES", 4), \
+             patch.object(streaming, "call_claude_streaming", side_effect=side_effects) as mock_call, \
              patch.object(shim.time, "sleep") as mock_sleep:
             result, mode, sid = shim.call_claude_with_tool_retry(
                 [], [], "", "sonnet", tools_requested=True, session_mode="resume", session_id="abc"
@@ -767,35 +829,76 @@ class TestToolRetryWrapper(unittest.TestCase):
         mock_sleep.assert_any_call(2.0)
         mock_sleep.assert_any_call(4.0)
 
-    def test_retry_switches_to_fresh_session_with_full_history(self):
+    def test_resume_origin_retry_forks_from_the_original_checkpoint(self):
         """A retry must NOT keep resuming the same session (causes an
         'already in use' CLI error) or resume with more delta messages
-        (would duplicate transcript entries) -- it must switch to a
-        brand-new fresh session sending the FULL history."""
+        (would duplicate transcript entries). When the ORIGINAL call was
+        session_mode="resume", every retry forks a new session from that
+        SAME original checkpoint via --fork-session (cheap: cache reuse,
+        not a full-history resend), sending only the delta again -- not
+        the full history, and not from the previous retry's own session."""
+        side_effects = [
+            self._stub_result(text="narrating", session_id="original-sid"),
+            self._stub_result(text="narrating again", session_id="forked-sid-1"),
+            self._stub_result(tool_calls=[{"name": "x"}], session_id="forked-sid-2"),
+        ]
+        full_history = [{"role": "user", "content": "full history msg"}]
+        delta = [{"role": "user", "content": "delta only"}]
+        with patch.object(streaming, "TOOL_CALL_MAX_RETRIES", 4), \
+             patch.object(streaming, "call_claude_streaming", side_effect=side_effects) as mock_call, \
+             patch.object(shim.time, "sleep"):
+            result, mode, sid = shim.call_claude_with_tool_retry(
+                delta, full_history, "", "sonnet",
+                tools_requested=True, session_mode="resume", session_id="original-sid",
+            )
+        calls = mock_call.call_args_list
+        self.assertEqual(calls[0].kwargs["session_mode"], "resume")
+        self.assertEqual(calls[0].kwargs["session_id"], "original-sid")
+        self.assertEqual(calls[0].args[0], delta)
+        # Both retries fork from the ORIGINAL checkpoint, not from each
+        # other's (forked-sid-1's) session -- and resend only the delta.
+        self.assertEqual(calls[1].kwargs["session_mode"], "fork")
+        self.assertEqual(calls[1].kwargs["session_id"], "original-sid")
+        self.assertEqual(calls[1].args[0], delta)
+        self.assertEqual(calls[2].kwargs["session_mode"], "fork")
+        self.assertEqual(calls[2].kwargs["session_id"], "original-sid")
+        self.assertEqual(calls[2].args[0], delta)
+        # The winning attempt's CLI-CONFIRMED session id is what gets
+        # returned for the caller to record, not "original-sid".
+        self.assertEqual(sid, "forked-sid-2")
+
+    def test_fresh_origin_retry_falls_back_to_full_history(self):
+        """No pre-existing Claude-side session exists yet when the
+        ORIGINAL call was session_mode="fresh" (this conversation's very
+        first turn) -- there's nothing to fork from, so a retry must fall
+        back to a brand-new session with the full history resent, same
+        as before --fork-session was used for the resume case."""
         side_effects = [self._stub_result(text="narrating"), self._stub_result(tool_calls=[{"name": "x"}])]
         full_history = [{"role": "user", "content": "full history msg"}]
-        with patch.object(streaming, "call_claude_streaming", side_effect=side_effects) as mock_call, \
+        with patch.object(streaming, "TOOL_CALL_MAX_RETRIES", 4), \
+             patch.object(streaming, "call_claude_streaming", side_effect=side_effects) as mock_call, \
              patch.object(shim.time, "sleep"):
             shim.call_claude_with_tool_retry(
-                [{"role": "user", "content": "delta only"}], full_history, "", "sonnet",
-                tools_requested=True, session_mode="resume", session_id="original-sid",
+                full_history, full_history, "", "sonnet",
+                tools_requested=True, session_mode="fresh", session_id="original-sid",
             )
         first_call_kwargs = mock_call.call_args_list[0].kwargs
         second_call_kwargs = mock_call.call_args_list[1].kwargs
-        self.assertEqual(first_call_kwargs["session_mode"], "resume")
+        self.assertEqual(first_call_kwargs["session_mode"], "fresh")
         self.assertEqual(first_call_kwargs["session_id"], "original-sid")
         self.assertEqual(second_call_kwargs["session_mode"], "fresh")
         self.assertNotEqual(second_call_kwargs["session_id"], "original-sid")
         self.assertEqual(mock_call.call_args_list[1].args[0], full_history)
 
     def test_gives_up_after_total_attempts_exhausted(self):
-        total_attempts = 1 + shim.TOOL_CALL_MAX_RETRIES
-        side_effects = [self._stub_result(text="still narrating")] * total_attempts
-        with patch.object(streaming, "call_claude_streaming", side_effect=side_effects) as mock_call, \
-             patch.object(shim.time, "sleep"):
-            result, mode, sid = shim.call_claude_with_tool_retry(
-                [], [], "", "sonnet", tools_requested=True, session_mode="fresh", session_id="abc"
-            )
+        with patch.object(streaming, "TOOL_CALL_MAX_RETRIES", 4):
+            total_attempts = 1 + streaming.TOOL_CALL_MAX_RETRIES
+            side_effects = [self._stub_result(text="still narrating")] * total_attempts
+            with patch.object(streaming, "call_claude_streaming", side_effect=side_effects) as mock_call, \
+                 patch.object(shim.time, "sleep"):
+                result, mode, sid = shim.call_claude_with_tool_retry(
+                    [], [], "", "sonnet", tools_requested=True, session_mode="fresh", session_id="abc"
+                )
         self.assertEqual(mock_call.call_count, total_attempts)
         self.assertEqual(result["tool_calls"], [])
         self.assertEqual(result["text"], "still narrating")
@@ -825,7 +928,8 @@ class TestToolRetryWrapper(unittest.TestCase):
                 "cache_read_input_tokens": 10, "cache_creation_input_tokens": 0,
             }),
         ]
-        with patch.object(streaming, "call_claude_streaming", side_effect=side_effects), \
+        with patch.object(streaming, "TOOL_CALL_MAX_RETRIES", 4), \
+             patch.object(streaming, "call_claude_streaming", side_effect=side_effects), \
              patch.object(shim.time, "sleep"):
             result, mode, sid = shim.call_claude_with_tool_retry(
                 [], [], "", "sonnet", tools_requested=True, session_mode="resume", session_id="abc"
@@ -836,16 +940,17 @@ class TestToolRetryWrapper(unittest.TestCase):
         })
 
     def test_usage_is_summed_even_when_all_attempts_are_exhausted(self):
-        total_attempts = 1 + shim.TOOL_CALL_MAX_RETRIES
-        side_effects = [
-            self._stub_result(text="still narrating", usage={"input_tokens": 10, "output_tokens": 1})
-            for _ in range(total_attempts)
-        ]
-        with patch.object(streaming, "call_claude_streaming", side_effect=side_effects), \
-             patch.object(shim.time, "sleep"):
-            result, mode, sid = shim.call_claude_with_tool_retry(
-                [], [], "", "sonnet", tools_requested=True, session_mode="fresh", session_id="abc"
-            )
+        with patch.object(streaming, "TOOL_CALL_MAX_RETRIES", 4):
+            total_attempts = 1 + streaming.TOOL_CALL_MAX_RETRIES
+            side_effects = [
+                self._stub_result(text="still narrating", usage={"input_tokens": 10, "output_tokens": 1})
+                for _ in range(total_attempts)
+            ]
+            with patch.object(streaming, "call_claude_streaming", side_effect=side_effects), \
+                 patch.object(shim.time, "sleep"):
+                result, mode, sid = shim.call_claude_with_tool_retry(
+                    [], [], "", "sonnet", tools_requested=True, session_mode="fresh", session_id="abc"
+                )
         self.assertEqual(result["usage"]["input_tokens"], 10 * total_attempts)
         self.assertEqual(result["usage"]["output_tokens"], 1 * total_attempts)
 

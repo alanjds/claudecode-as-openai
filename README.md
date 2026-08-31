@@ -54,7 +54,7 @@ Legend: ✅ works, ⚠️ partial/limited, ❌ not implemented.
 | Model selection | ✅ | `--model` passed per request. OpenRouter-style slugs (`anthropic/claude-sonnet-4.5`, `~anthropic/claude-sonnet-latest`, etc.) are translated automatically. |
 | Session/conversation caching | ✅ | Fingerprints the conversation and resumes via `--resume`, sending only the new delta. Falls back to a fresh session on any history divergence. |
 | Streaming (`stream: true`) | ✅ | Real token-level streaming for the common case (single choice, no tools, no `json_schema`). Falls back to buffered-then-emit for other combinations. |
-| Tool calling (`tools`/`tool_calls`) | ✅ | Registered as real MCP tool schemas -- 100% turn-1 dispatch reliability. Falls back to a prose-description path with bounded retry only for tool names that violate MCP naming rules. |
+| Tool calling (`tools`/`tool_calls`) | ✅ | Registered as real MCP tool schemas -- 100% turn-1 dispatch reliability. Tool names that violate MCP naming rules are silently dropped (no prose fallback). No retry by default when a turn declares tools but doesn't call one -- see "Native MCP tool registration" below. |
 | `tool_choice: "none"` | ✅ | Full lockdown: built-ins and all MCP servers blocked, no tool descriptions added. |
 | `tool_choice: "required"` / forced function | ❌ | No equivalent in the Claude Code CLI harness. |
 | `max_tokens` / `max_completion_tokens` | ✅ | Mapped to `CLAUDE_CODE_MAX_OUTPUT_TOKENS` per subprocess call. |
@@ -167,9 +167,19 @@ Tool prompt-cache stays intact for a stable tool set across resumed sessions;
 changing the tool set mid-session correctly busts the cache, same as any
 system-prompt change.
 
-Falls back to a prose-description path with bounded retry (4 retries, 2s base /
-15s cap) for any tool name that can't satisfy MCP's `^[a-zA-Z0-9_-]{1,64}$`
-constraint.
+Tool names that can't satisfy MCP's `^[a-zA-Z0-9_-]{1,64}$` constraint are
+silently dropped (there is no prose-description fallback path).
+
+A turn that declares tools but gets no `tool_use` back is, with MCP handling
+dispatch, now far more likely to mean "no tool was needed" than "dispatch
+failed" -- so `CLAUDE_OPENAI_TOOL_CALL_MAX_RETRIES` defaults to `0` (no
+retry). Set it above 0 to re-enable the bounded retry (2s base / 15s cap
+backoff) as a safety net. When re-enabled, a retry on a *resumed*
+conversation forks a new session from the original checkpoint via
+`--fork-session` (billed as a cache hit of the existing context, not a
+full-history resend, and never mutates the original session's own
+transcript) instead of starting over with the full history, as it did
+before `--fork-session` was adopted for this.
 
 ### Real streaming: PTY trick
 

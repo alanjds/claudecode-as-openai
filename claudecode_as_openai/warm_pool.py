@@ -250,6 +250,8 @@ class WarmProcess:
 
             deadline = time.time() + CLAUDE_TIMEOUT_S
             result = _consume_claude_response(chunk_source(), deadline, stop_sequences, stream_callback)
+            if not result.get("session_id"):
+                result["session_id"] = self.session_id
             usage = result.get("usage") or {}
             sp.set_attribute("gen_ai.usage.input_tokens", usage.get("input_tokens", 0))
             sp.set_attribute("gen_ai.usage.output_tokens", usage.get("output_tokens", 0))

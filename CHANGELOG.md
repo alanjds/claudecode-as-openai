@@ -213,3 +213,28 @@ _Unreleased_
   is what let a real "every session looks cold" report get diagnosed from
   a single log capture -- the session-cache matching logic itself turned
   out to be correct the whole time.
+* `TOOL_CALL_MAX_RETRIES` now defaults to `0` (override via
+  `CLAUDE_OPENAI_TOOL_CALL_MAX_RETRIES`) instead of `4`. Root cause of the
+  "every session looks cold" investigation above: native MCP tool
+  registration already reaches ~100% turn-1 dispatch when a tool call is
+  actually warranted (see "Tool-call reliability fix" above), so a turn
+  that declares tools but doesn't call one is now overwhelmingly a
+  correct "no tool needed" response, not a dispatch failure -- retrying
+  it was discarding session/warm-pool continuity for no benefit on every
+  such turn, which is common for clients (agentic web UIs especially)
+  that declare tools on every message regardless of whether one is
+  relevant. When retries ARE re-enabled and the original call was a
+  resumed conversation, a retry now forks a new session from that same
+  original checkpoint via `--fork-session` instead of starting over with
+  the full history -- verified live against the real CLI: a fork is
+  billed as a cache hit of the source's entire context (not a resend)
+  and leaves the source session's own transcript untouched, so every
+  retry stays an equally clean re-ask at a fraction of the cost. (A
+  first-ever-turn retry, with no pre-existing session to fork from,
+  keeps the old full-history-resend fallback -- there's nothing cheaper
+  available for that case.) Verified live end-to-end with retries
+  re-enabled (warm attempt fails -> first retry plain `--resume` -> all
+  further retries `--resume ... --fork-session` off the same original
+  checkpoint, never off each other) and with the new default (exactly
+  one subprocess spawn, no retry, ~9x faster than the exhausted-retries
+  case for the same non-tool-needing turn).

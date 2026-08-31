@@ -47,5 +47,19 @@ EXTENDED_DISALLOWED_TOOLS = ",".join(
 # Model defaults
 DEFAULT_MODEL = "sonnet"
 MAX_N_CHOICES = 5
-TOOL_CALL_MAX_RETRIES = 4
+# Default 0: native MCP tool registration already reaches ~100% turn-1
+# tool-dispatch reliability (see CHANGELOG "Tool-call reliability fix"),
+# so a turn that declares tools but doesn't call one is now overwhelmingly
+# more likely to be a correct "no tool needed" response than a genuine
+# dispatch failure -- retrying it just discards session/warm-pool
+# continuity for no benefit. Kept as a safety net (see
+# call_claude_with_tool_retry) for any future regression -- override via
+# CLAUDE_OPENAI_TOOL_CALL_MAX_RETRIES to re-enable without a code change.
+# When origin session_mode is "resume", a retry forks a new session from
+# the original checkpoint via --fork-session (cheap: cache reuse, not a
+# full-history resend) instead of starting over fresh.
+try:
+    TOOL_CALL_MAX_RETRIES = int(os.environ.get("CLAUDE_OPENAI_TOOL_CALL_MAX_RETRIES", "0"))
+except ValueError:
+    TOOL_CALL_MAX_RETRIES = 0
 _OPENROUTER_ALIASES = ("sonnet", "opus", "haiku")
