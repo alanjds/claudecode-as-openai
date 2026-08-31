@@ -156,6 +156,179 @@ class TestSessionCaching(unittest.TestCase):
         self.assertNotEqual(key_plain, key_sys)
 
 
+class TestNormalization(unittest.TestCase):
+    """Unit tests for _normalize_message / _strip_oob and their role in
+    preventing spurious session-cache misses.
+
+    Each test corresponds to a real live divergence observed in production
+    (captured via the diverge-dump in sessions.py).
+    """
+
+    def setUp(self):
+        shim._SESSION_STORE.clear()
+
+    # --- _normalize_message unit tests ---
+
+    def test_content_null_equals_empty_string(self):
+        """Stored assistant reply has content=null; Hermes sends content='' on replay."""
+        from claudecode_as_openai.sessions import _normalize_message
+        import json
+        a = {"role": "assistant", "content": None, "tool_calls": []}
+        b = {"role": "assistant", "content": "", "tool_calls": []}
+        self.assertEqual(
+            json.dumps(_normalize_message(a), sort_keys=True),
+            json.dumps(_normalize_message(b), sort_keys=True),
+        )
+
+    def test_reasoning_fields_stripped(self):
+        """Stored reply carries reasoning/reasoning_details; client replay omits them."""
+        from claudecode_as_openai.sessions import _normalize_message
+        import json
+        with_reasoning = {
+            "role": "assistant",
+            "content": None,
+            "reasoning": "some thinking text",
+            "reasoning_details": [{"type": "reasoning.text", "text": "thinking", "signature": "abc"}],
+        }
+        without_reasoning = {"role": "assistant", "content": None}
+        self.assertEqual(
+            json.dumps(_normalize_message(with_reasoning), sort_keys=True),
+            json.dumps(_normalize_message(without_reasoning), sort_keys=True),
+        )
+
+    def test_tool_call_argument_spacing_normalized(self):
+        """Stored args use json.dumps default spacing; client replay uses compact form."""
+        from claudecode_as_openai.sessions import _normalize_message
+        import json
+        spaced = {
+            "role": "assistant", "content": None,
+            "tool_calls": [{"id": "t1", "type": "function",
+                            "function": {"name": "f", "arguments": '{"command": "ls"}'}}],
+        }
+        compact = {
+            "role": "assistant", "content": None,
+            "tool_calls": [{"id": "t1", "type": "function",
+                            "function": {"name": "f", "arguments": '{"command":"ls"}'}}],
+        }
+        self.assertEqual(
+            json.dumps(_normalize_message(spaced), sort_keys=True),
+            json.dumps(_normalize_message(compact), sort_keys=True),
+        )
+
+    def test_list_input_is_handled(self):
+        """_normalize_message must accept a list (resolve_session passes a prefix slice)."""
+        from claudecode_as_openai.sessions import _normalize_message
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": None, "reasoning": "thinking"},
+        ]
+        result = _normalize_message(msgs)
+        self.assertIsInstance(result, list)
+        self.assertEqual(len(result), 2)
+        self.assertNotIn("reasoning", result[1])
+
+    def test_oob_block_stripped_from_tool_content(self):
+        """OOB user message block injected by Hermes into tool result is stripped."""
+        from claudecode_as_openai.sessions import _strip_oob, _normalize_message
+        import json
+        # Build the OOB markers at runtime so no literal full marker appears in source.
+        _oob_open = "[" + "OUT-OF-BAND USER MESSAGE \u2014 direct]"
+        _oob_close = "[/" + "OUT-OF-BAND USER MESSAGE]"
+        oob = (
+            '{"output": "hello"}'
+            + "\n\n" + _oob_open + "\n"
+            + "user mid-turn input\n"
+            + _oob_close
+        )
+        clean = '{"output": "hello"}'
+        self.assertEqual(_strip_oob(oob), clean)
+
+        msg_with = {"role": "tool", "name": "terminal", "content": oob, "tool_call_id": "t1"}
+        msg_without = {"role": "tool", "name": "terminal", "content": clean, "tool_call_id": "t1"}
+        self.assertEqual(
+            json.dumps(_normalize_message(msg_with), sort_keys=True),
+            json.dumps(_normalize_message(msg_without), sort_keys=True),
+        )
+
+    # --- Integration: resolve_session resumes despite field differences ---
+
+    def test_resume_despite_reasoning_and_content_mismatch(self):
+        """Resuming when stored reply has reasoning+null content but client sends empty str."""
+        turn1 = [{"role": "user", "content": "run ls"}]
+        _, sid, _, key = shim.resolve_session(turn1)
+
+        # Shim stores the assistant reply with reasoning and content=null
+        stored_reply = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "t1", "type": "function",
+                            "function": {"name": "terminal", "arguments": '{"command": "ls"}'}}],
+            "reasoning": "I should run ls",
+            "reasoning_details": [{"type": "reasoning.text", "text": "I should run ls"}],
+        }
+        shim.record_session(key, sid, turn1, stored_reply)
+
+        # Client sends the assistant reply back without reasoning, content="", compact args
+        client_reply = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "t1", "type": "function",
+                            "function": {"name": "terminal", "arguments": '{"command":"ls"}'}}],
+        }
+        turn2 = turn1 + [
+            client_reply,
+            {"role": "tool", "tool_call_id": "t1", "content": "file.txt"},
+            {"role": "user", "content": "now what?"},
+        ]
+        mode, _, delta, _ = shim.resolve_session(turn2)
+        self.assertEqual(mode, "resume",
+                         "Should resume despite reasoning/content/spacing differences")
+        # synced = turn1 + stored_reply (2 msgs); delta = turn2[2:] = tool_result + user_msg
+        self.assertEqual(delta, [
+            {"role": "tool", "tool_call_id": "t1", "content": "file.txt"},
+            {"role": "user", "content": "now what?"},
+        ])
+
+    def test_resume_despite_oob_in_stored_tool_result(self):
+        """Resuming when stored tool result has OOB block but client replay omits it."""
+        turn1 = [{"role": "user", "content": "run ls"}]
+        _, sid, _, key = shim.resolve_session(turn1)
+
+        stored_reply = {"role": "assistant", "content": None,
+                        "tool_calls": [{"id": "t1", "type": "function",
+                                        "function": {"name": "terminal",
+                                                     "arguments": '{"command":"ls"}'}}]}
+        shim.record_session(key, sid, turn1, stored_reply)
+
+        # Build tool result with OOB block injected (as Hermes would, mid-turn)
+        _oob_o = "[" + "OUT-OF-BAND USER MESSAGE \u2014 direct]"
+        _oob_c = "[/" + "OUT-OF-BAND USER MESSAGE]"
+        tool_with_oob = ("ok\n\n" + _oob_o + "\nfoo\n" + _oob_c)
+        turn2 = turn1 + [
+            stored_reply,
+            {"role": "tool", "tool_call_id": "t1", "name": "terminal",
+             "content": tool_with_oob},
+            {"role": "user", "content": "great"},
+        ]
+        _, _, _, key2 = shim.resolve_session(turn2)
+        stored_reply2 = {"role": "assistant", "content": "done"}
+        shim.record_session(key2, sid, turn2, stored_reply2)
+
+        # Next turn: client sends the clean tool result (no OOB block)
+        turn3 = turn1 + [
+            stored_reply,
+            {"role": "tool", "tool_call_id": "t1", "name": "terminal",
+             "content": "ok"},
+            {"role": "user", "content": "great"},
+            stored_reply2,
+            {"role": "user", "content": "next?"},
+        ]
+        mode, _, delta, _ = shim.resolve_session(turn3)
+        self.assertEqual(mode, "resume",
+                         "Should resume despite OOB block absent in client replay")
+
+
+
 class TestResolveSessionDebugLogging(unittest.TestCase):
     """resolve_session's DEBUG log must say WHY it picked fresh vs resume --
     this is what let a real "all sessions look cold" report get diagnosed
