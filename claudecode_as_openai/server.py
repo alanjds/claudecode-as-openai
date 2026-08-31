@@ -253,6 +253,10 @@ class Handler(BaseHTTPRequestHandler):
         except ClaudeCliError as e:
             self._send_error(e)
         except Exception as e:
+            if logger.isEnabledFor(10):  # 10 == logging.DEBUG
+                import traceback
+                logger.debug("unhandled exception in _handle_chat_completion\n%s",
+                             traceback.format_exc())
             self._send_error(ClaudeCliError(500, "api_error", str(e)))
 
     def _handle_chat_completion(self, payload):

@@ -7,6 +7,9 @@ delta (a few hundred tokens) instead of the whole conversation."""
 
 import hashlib
 import json
+import os
+import re
+import tempfile
 import uuid
 
 from claudecode_as_openai.state import _SESSION_STORE, _SESSION_STORE_MAX, _SESSION_LOCK
@@ -23,8 +26,61 @@ def _conversation_key(openai_messages):
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
+_OOB_RE = re.compile(
+    r"\[OUT-OF-BAND USER MESSAGE.*?\[/OUT-OF-BAND USER MESSAGE\]",
+    re.DOTALL,
+)
+
+
+def _strip_oob(text):
+    """Strip Hermes out-of-band user message blocks from a tool-result string.
+
+    Hermes appends [OUT-OF-BAND USER MESSAGE ...][/OUT-OF-BAND USER MESSAGE]
+    to tool-result content when a user sends a mid-turn message. The shim
+    stores the message WITH this block, but on the next turn Hermes sends
+    the clean tool result without it, causing a spurious divergence.
+    """
+    if not isinstance(text, str):
+        return text
+    return _OOB_RE.sub("", text).rstrip()
+
+
+def _normalize_message(msg):
+    """Return a copy of msg with fields normalized for comparison.
+
+    Accepts either a single message dict or a list of message dicts
+    (resolve_session compares a prefix slice as a list). Strips
+    model-internal fields (reasoning, reasoning_details) that the client
+    never sees and cannot round-trip back to us.  Normalizes content
+    (null == "") and tool-call argument JSON formatting so minor
+    serialization differences don't cause false divergence. Strips
+    Hermes out-of-band user message blocks from tool-result content
+    (injected mid-turn; absent on replay).
+    """
+    import copy
+    if isinstance(msg, list):
+        return [_normalize_message(m) for m in msg]
+    m = copy.deepcopy(msg)
+    m.pop("reasoning", None)
+    m.pop("reasoning_details", None)
+    if m.get("content") in (None, ""):
+        m["content"] = None
+    elif isinstance(m.get("content"), str):
+        stripped = _strip_oob(m["content"])
+        m["content"] = stripped if stripped else None
+    for tc in m.get("tool_calls", []) or []:
+        fn = tc.get("function", {})
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                fn["arguments"] = json.dumps(json.loads(args), sort_keys=True, separators=(",", ":"))
+            except (json.JSONDecodeError, TypeError):
+                pass
+    return m
+
+
 def _messages_equal(a, b):
-    return json.dumps(a, sort_keys=True, default=str) == json.dumps(b, sort_keys=True, default=str)
+    return json.dumps(_normalize_message(a), sort_keys=True, default=str) == json.dumps(_normalize_message(b), sort_keys=True, default=str)
 
 
 def resolve_session(openai_messages):
@@ -63,6 +119,20 @@ def resolve_session(openai_messages):
                     "at message index %s of %d synced)",
                     key[:12], first_diff, len(synced),
                 )
+                if first_diff is not None and logger.isEnabledFor(10):  # 10 == logging.DEBUG
+                    _dump_path = os.path.join(tempfile.gettempdir(), "claudecode_diverge_dump.json")
+                    with open(_dump_path, "w") as _f:
+                        json.dump(
+                            {
+                                "conv_key": key[:12],
+                                "first_diff_index": first_diff,
+                                "n_synced": len(synced),
+                                "incoming": openai_messages[first_diff],
+                                "synced": synced[first_diff],
+                            },
+                            _f, indent=2, default=str,
+                        )
+                    logger.debug("resolve_session: diverged message dump -> %s", _dump_path)
         else:
             logger.debug(
                 "resolve_session: conv_key=%s -> fresh (no prior entry for this key; "
