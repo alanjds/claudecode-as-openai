@@ -289,3 +289,27 @@ _Unreleased_
   whenever `tool_calls` is present, the same way `reasoning`/
   `reasoning_details` already are. 129 tests pass (2 new since the
   previous entry).
+* Fixed `build_mcp_tool_config` (`tools.py`) writing a brand-new temp file
+  -- and therefore a changed `--mcp-config` -- on every single call, even
+  when the declared tool set was byte-identical to the previous call. The
+  module's own docstring already claimed the manifest path "only changes
+  if the tool set itself changes"; the code never actually implemented
+  that. Found while investigating a real live symptom (2026-09-01):
+  Claude repeatedly re-issuing the exact same tool call across an
+  otherwise-correctly-resumed session (verified via replaying the real
+  conversation through the live `resolve_session`/`record_session` code:
+  bookkeeping was clean, single-message deltas throughout, ruling out the
+  session-cache fixes above as the cause) -- never observed with either a
+  full-history resend (the shim's old, always-`fresh` behavior) or the
+  direct Anthropic API for the same task. An always-changing `--mcp-config`
+  is consistent with Claude Code's own `--resume` continuity treating the
+  tool config as "changed" on every resumed turn, though this remains
+  unconfirmed against Claude Code's closed-source internals -- fixing it
+  is correct regardless, since it's what the existing design already
+  intended. `_manifest_path_for` now caches the manifest file by tool-set
+  content hash (LRU, bounded at 32 distinct tool sets, evicted files
+  unlinked); `streaming.py`/`warm_pool.py` no longer unlink
+  `mcp_tool_config["manifest_path"]` after each call, since the cache
+  -- not the call site -- now owns that file's lifecycle. 132 tests pass
+  (4 new, 1 rewritten to assert the new caching behavior instead of the
+  bug it replaces).

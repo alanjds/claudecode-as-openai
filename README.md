@@ -165,7 +165,12 @@ actual shim.
 
 Tool prompt-cache stays intact for a stable tool set across resumed sessions;
 changing the tool set mid-session correctly busts the cache, same as any
-system-prompt change.
+system-prompt change. This requires the manifest file backing `--mcp-config`
+to itself stay byte-identical for an unchanged tool set: `build_mcp_tool_config`
+caches it by tool-set content hash (LRU, bounded, evicted files unlinked)
+rather than writing a fresh temp file -- and therefore a changed
+`--mcp-config` -- on every single call regardless of whether the tool set
+actually changed, which is what the original implementation did.
 
 Tool names that can't satisfy MCP's `^[a-zA-Z0-9_-]{1,64}$` constraint are
 silently dropped (there is no prose-description fallback path).

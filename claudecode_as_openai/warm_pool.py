@@ -278,11 +278,9 @@ class WarmProcess:
                 os.unlink(self.system_prompt_file)
             except OSError:
                 pass
-        if self.mcp_tool_config is not None:
-            try:
-                os.unlink(self.mcp_tool_config["manifest_path"])
-            except OSError:
-                pass
+        # self.mcp_tool_config["manifest_path"], if any, is NOT unlinked
+        # here: see the matching comment in streaming.py's teardown -- it's
+        # a cached, potentially-shared file owned by tools.py alone.
 
 
 class WarmPool:

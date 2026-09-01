@@ -543,11 +543,11 @@ def call_claude_streaming(
                     os.unlink(system_prompt_file)
                 except OSError:
                     pass
-            if mcp_tool_config is not None:
-                try:
-                    os.unlink(mcp_tool_config["manifest_path"])
-                except OSError:
-                    pass
+            # mcp_tool_config["manifest_path"], if any, is NOT unlinked here:
+            # it's a cached, potentially-shared file owned by tools.py's
+            # manifest cache (see _manifest_path_for) so a stable tool set
+            # keeps a byte-identical --mcp-config across calls -- deleting
+            # it after every single call would defeat that entirely.
 
 
 def build_reasoning_details(reasoning_text, signature):

@@ -4,6 +4,7 @@ This module holds all global state that multiple modules need to access.
 Separation of state from logic prevents circular imports.
 """
 
+import collections
 import threading
 import tempfile
 
@@ -11,6 +12,18 @@ import tempfile
 _SESSION_STORE = {}  # conv_key -> {"claude_session_id": str, "synced_messages": list}
 _SESSION_STORE_MAX = 200
 _SESSION_LOCK = threading.Lock()
+
+# MCP tool manifest file cache: content_hash -> temp file path. Lets
+# build_mcp_tool_config() (tools.py) reuse the same manifest file (and
+# therefore a byte-identical --mcp-config across calls) whenever the same
+# tool set is declared again, instead of writing a fresh temp file (and
+# therefore a changed --mcp-config) on every single subprocess spawn --
+# see tools.py for why an always-new path defeats that intent even when
+# the tool set never changes. Owned and evicted (LRU, unlinking the file)
+# by tools.py alone; nothing else should unlink a manifest path directly.
+_MCP_MANIFEST_CACHE = collections.OrderedDict()
+_MCP_MANIFEST_CACHE_MAX = 32
+_MCP_MANIFEST_LOCK = threading.Lock()
 
 # Rate limit tracking
 _rate_limit_cache = None

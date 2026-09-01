@@ -778,23 +778,64 @@ class TestMcpToolConfig(unittest.TestCase):
         self.assertNotIn("url", server)
         self.assertNotIn("port", server)
 
-    def test_manifest_path_is_only_thing_that_varies_across_calls(self):
-        """Same tool set built twice produces the identical mcp_config
-        SERVER COMMAND (just a different manifest file path) -- this is
-        what keeps Anthropic's prompt cache viable across a resumed
-        session for a stable tool set (verified live: cache_creation
-        stays flat across --resume'd turns, only busting when the actual
-        tool set changes -- see README "MCP native tool registration")."""
+    def test_same_tool_set_reuses_the_cached_manifest_path(self):
+        """A stable tool set built twice must produce the IDENTICAL
+        manifest path (byte-identical --mcp-config as a result), not just
+        the identical server command shape -- a real live divergence
+        (2026-09-01: Claude repeatedly re-issuing the exact same tool call
+        across an otherwise-correctly-resumed session) is consistent with
+        Claude Code's own --resume continuity treating an always-changing
+        --mcp-config as "the tool config changed" every resumed turn, since
+        the old code wrote a brand-new temp file (and therefore a new path)
+        on every single call regardless of whether the tool set changed.
+        This is what actually keeps Anthropic's prompt cache -- and,
+        hopefully, Claude Code's own tool-continuity bookkeeping -- stable
+        across a resumed session for a stable tool set (see README "MCP
+        native tool registration")."""
         tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}]
         cfg1 = shim.build_mcp_tool_config(tools)
         cfg2 = shim.build_mcp_tool_config(tools)
         self.addCleanup(os.unlink, cfg1["manifest_path"])
-        self.addCleanup(os.unlink, cfg2["manifest_path"])
+        self.assertEqual(cfg1["manifest_path"], cfg2["manifest_path"])
         server1 = cfg1["mcp_config"]["mcpServers"]["shim_tools"]
         server2 = cfg2["mcp_config"]["mcpServers"]["shim_tools"]
-        self.assertEqual(server1["command"], server2["command"])
-        self.assertEqual(server1["args"][0], server2["args"][0])  # server script path
-        self.assertNotEqual(server1["args"][1], server2["args"][1])  # manifest path differs
+        self.assertEqual(server1, server2)
+
+    def test_different_tool_set_gets_a_different_manifest_path(self):
+        """The cache is keyed by tool-set content, not reused blindly --
+        a genuinely different tool set must still get its own file."""
+        tools_a = [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}]
+        tools_b = [{"type": "function", "function": {"name": "get_time", "parameters": {}}}]
+        cfg_a = shim.build_mcp_tool_config(tools_a)
+        cfg_b = shim.build_mcp_tool_config(tools_b)
+        self.addCleanup(os.unlink, cfg_a["manifest_path"])
+        self.addCleanup(os.unlink, cfg_b["manifest_path"])
+        self.assertNotEqual(cfg_a["manifest_path"], cfg_b["manifest_path"])
+
+    def test_stale_cached_path_is_rebuilt(self):
+        """If the cached file was deleted out from under the cache (e.g. by
+        LRU eviction or external cleanup), the next call must rewrite it
+        rather than handing back a dangling path."""
+        tools = [{"type": "function", "function": {"name": "get_forecast", "parameters": {}}}]
+        cfg1 = shim.build_mcp_tool_config(tools)
+        os.unlink(cfg1["manifest_path"])
+        cfg2 = shim.build_mcp_tool_config(tools)
+        self.addCleanup(os.unlink, cfg2["manifest_path"])
+        self.assertTrue(os.path.exists(cfg2["manifest_path"]))
+
+    def test_manifest_cache_evicts_oldest_beyond_max_size(self):
+        """Distinct tool sets beyond _MCP_MANIFEST_CACHE_MAX evict the
+        oldest entry (LRU) and unlink its file, so the cache can't grow
+        the temp directory without bound over a long shim uptime."""
+        from claudecode_as_openai.state import _MCP_MANIFEST_CACHE_MAX
+        paths = []
+        for i in range(_MCP_MANIFEST_CACHE_MAX + 1):
+            tools = [{"type": "function", "function": {"name": f"tool_{i}", "parameters": {}}}]
+            cfg = shim.build_mcp_tool_config(tools)
+            paths.append(cfg["manifest_path"])
+        self.addCleanup(lambda: [os.unlink(p) for p in paths if os.path.exists(p)])
+        self.assertFalse(os.path.exists(paths[0]), "oldest entry should have been evicted")
+        self.assertTrue(os.path.exists(paths[-1]), "newest entry should still be live")
 
     def test_strip_mcp_tool_prefix(self):
         self.assertEqual(shim.strip_mcp_tool_prefix("mcp__shim_tools__get_weather"), "get_weather")
