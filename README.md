@@ -181,6 +181,45 @@ full-history resend, and never mutates the original session's own
 transcript) instead of starting over with the full history, as it did
 before `--fork-session` was adopted for this.
 
+### Session-cache tolerance for client-side history rewrites
+
+Some clients mutate already-sent message content between turns in ways that
+are invisible to the user but would otherwise look like history divergence
+and force an expensive, continuity-losing fresh session. Verified against
+Hermes Agent's real source and live traffic captures (not guessed):
+
+- **Mid-turn "steer" messages**: Hermes appends an
+  `[OUT-OF-BAND USER MESSAGE ...]...[/OUT-OF-BAND USER MESSAGE]` block to the
+  content of the last `role: "tool"` message when a user sends a message
+  while a turn is still running. The marker is permanent, immutable history
+  on Hermes's side once injected (confirmed by Hermes's own test suite) --
+  the shim strips it before comparing tool-result content, but only for
+  `role: "tool"` messages, since the identical text also appears, by design,
+  in Hermes's system-prompt boilerplate explaining the marker to the model
+  (stripping it there would be an accidental match, not a meaningful one).
+- **Context-compaction demotion**: Hermes's context compressor can later
+  replace an aging tail tool-result with a one-line
+  `"[<tool> output demoted at compaction -- N chars preserved in session
+  history...]"` stub once it ages out of its kept window. Unlike the OOB
+  marker, this is deliberately treated as a real divergence -> fresh session,
+  not tolerated as a match: a resumed Claude session never gets history
+  re-sent (only the new delta), so tolerating a full-content/stub pair as
+  equal would mean Claude's own session keeps the full-size content forever
+  and never inherits Hermes's compaction. A fresh session's baseline is
+  exactly what Hermes now sends (stub included), so going fresh is what
+  actually shrinks this shim's Claude session in step with Hermes's own --
+  the DEBUG log flags this case distinctly from a genuine divergence so it
+  doesn't read as a bug.
+- **Client-asserted session identity**: if a system message contains a
+  `Session ID: <id>` line (emitted by Hermes's `--pass-session-id`, CLI/TUI
+  only as of this writing -- not wired into Hermes's webui gateway backend),
+  the shim keys the conversation by that id directly instead of hashing the
+  system+first message, and additionally stops treating system-prompt
+  content differences (a live timestamp/model/provider line, typically) as
+  divergence -- the client has already asserted "same session", so that's
+  volatile metadata, not a real content change. Any client can opt into this
+  by emitting the same line; it isn't Hermes-specific.
+
 ### Real streaming: PTY trick
 
 `claude`'s stdout is fully buffered (not line-buffered) on a plain pipe, causing

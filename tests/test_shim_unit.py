@@ -289,6 +289,90 @@ class TestNormalization(unittest.TestCase):
             {"role": "user", "content": "now what?"},
         ])
 
+    def test_oob_strip_scoped_to_tool_role_only(self):
+        """The OOB marker text also appears verbatim in Hermes's system-prompt
+        STEER_CHANNEL_NOTE boilerplate. _strip_oob must only apply to role
+        "tool" content -- stripping it elsewhere would be an accidental
+        match, not a designed one (see sessions.py _strip_oob docstring)."""
+        from claudecode_as_openai.sessions import _normalize_message
+        import json
+        _oob_open = "[" + "OUT-OF-BAND USER MESSAGE — direct]"
+        _oob_close = "[/" + "OUT-OF-BAND USER MESSAGE]"
+        block = "\n\n" + _oob_open + "\nuser mid-turn input\n" + _oob_close
+
+        with_block = {"role": "system", "content": "You are helpful." + block}
+        without_block = {"role": "system", "content": "You are helpful."}
+        self.assertNotEqual(
+            json.dumps(_normalize_message(with_block), sort_keys=True),
+            json.dumps(_normalize_message(without_block), sort_keys=True),
+            "System-role content must not be OOB-stripped",
+        )
+
+        with_block_user = {"role": "user", "content": "please" + block}
+        without_block_user = {"role": "user", "content": "please"}
+        self.assertNotEqual(
+            json.dumps(_normalize_message(with_block_user), sort_keys=True),
+            json.dumps(_normalize_message(without_block_user), sort_keys=True),
+            "User-role content must not be OOB-stripped",
+        )
+
+    def test_lean_recovery_stub_detection(self):
+        """_is_lean_recovery_stub identifies Hermes's compaction-demotion
+        stub shape (agent/context_compressor.py _lean_recovery_stub()) --
+        used only to make the DEBUG divergence log say WHICH kind of fresh
+        this is (see TestResolveSessionDebugLogging), not to tolerate it as
+        a match: see test_fresh_on_stored_tool_result_later_demoted for why
+        this case must NOT resume."""
+        from claudecode_as_openai.sessions import _is_lean_recovery_stub
+        stub = ("[terminal output demoted at compaction — 6,000 chars "
+                "preserved in session history. Recover with "
+                "session_search(query=..., session_id='abc-123')]")
+        full = "line1\nline2\n" * 500
+        self.assertTrue(_is_lean_recovery_stub(stub))
+        self.assertFalse(_is_lean_recovery_stub(full))
+
+    def test_fresh_on_stored_tool_result_later_demoted(self):
+        """Integration: a tool result stored in full is later resent by
+        Hermes as a compaction stub -- resolve_session must go fresh, NOT
+        resume. Unlike the OOB marker, this is real, deliberate content
+        shrinkage on Hermes's side, and a resumed Claude session never gets
+        history re-sent (only the new delta) -- so tolerating it as a match
+        would mean Claude's own session keeps the full-size content forever
+        and never inherits Hermes's compaction. Going fresh is what makes
+        this shim's Claude session track Hermes's own bounded context size."""
+        turn1 = [{"role": "user", "content": "run big command"}]
+        _, sid, _, key = shim.resolve_session(turn1)
+
+        stored_reply = {"role": "assistant", "content": None,
+                        "tool_calls": [{"id": "t1", "type": "function",
+                                        "function": {"name": "terminal",
+                                                     "arguments": '{"command":"bigcmd"}'}}]}
+        full_content = "output line\n" * 800
+        turn2 = turn1 + [
+            stored_reply,
+            {"role": "tool", "tool_call_id": "t1", "name": "terminal", "content": full_content},
+            {"role": "user", "content": "great"},
+        ]
+        shim.record_session(key, sid, turn2, {"role": "assistant", "content": "done"})
+
+        # Later turn: Hermes's compactor has since demoted that same tool result.
+        stub_content = (
+            f"[terminal output demoted at compaction — {len(full_content):,} "
+            "chars preserved in session history. Recover with "
+            "session_search(query=..., session_id='abc-123')]"
+        )
+        turn3 = turn1 + [
+            stored_reply,
+            {"role": "tool", "tool_call_id": "t1", "name": "terminal", "content": stub_content},
+            {"role": "user", "content": "great"},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "next?"},
+        ]
+        mode, _, delta, _ = shim.resolve_session(turn3)
+        self.assertEqual(mode, "fresh",
+                         "Must go fresh so this shim's Claude session inherits Hermes's compaction")
+        self.assertEqual(delta, turn3)
+
     def test_resume_despite_oob_in_stored_tool_result(self):
         """Resuming when stored tool result has OOB block but client replay omits it."""
         turn1 = [{"role": "user", "content": "run ls"}]
@@ -327,6 +411,75 @@ class TestNormalization(unittest.TestCase):
         self.assertEqual(mode, "resume",
                          "Should resume despite OOB block absent in client replay")
 
+
+class TestClientSessionIdConversationKey(unittest.TestCase):
+    """--pass-session-id readiness: when a client (Hermes CLI/TUI today,
+    potentially others) embeds "Session ID: <id>" in the system prompt, the
+    shim should key the conversation by that id directly instead of hashing
+    system+first message -- immune to incidental system-prompt drift across
+    turns of the same conversation."""
+
+    def setUp(self):
+        shim._SESSION_STORE.clear()
+
+    def test_extracts_session_id_line_from_system_prompt(self):
+        from claudecode_as_openai.sessions import _extract_client_session_id
+        msgs = [
+            {"role": "system", "content": "You are helpful.\nSession ID: abc-123\nModel: sonnet"},
+            {"role": "user", "content": "hi"},
+        ]
+        self.assertEqual(_extract_client_session_id(msgs), "abc-123")
+
+    def test_no_session_id_line_returns_none(self):
+        from claudecode_as_openai.sessions import _extract_client_session_id
+        msgs = [{"role": "system", "content": "You are helpful."}, {"role": "user", "content": "hi"}]
+        self.assertIsNone(_extract_client_session_id(msgs))
+
+    def test_conversation_key_prefers_session_id_over_content_hash(self):
+        """Two requests whose system prompt otherwise differs (e.g. a live
+        timestamp line) but share the same Session ID line must map to the
+        SAME conv_key -- the content-hash fallback would treat them as two
+        different conversations."""
+        from claudecode_as_openai.sessions import _conversation_key
+        turn_a = [
+            {"role": "system", "content": "Conversation started: Monday\nSession ID: xyz-1"},
+            {"role": "user", "content": "hi"},
+        ]
+        turn_b = [
+            {"role": "system", "content": "Conversation started: Tuesday\nSession ID: xyz-1"},
+            {"role": "user", "content": "hi"},
+        ]
+        self.assertEqual(_conversation_key(turn_a), _conversation_key(turn_b))
+        self.assertTrue(_conversation_key(turn_a).startswith("client-sid:"))
+
+    def test_conversation_key_falls_back_to_hash_without_session_id(self):
+        from claudecode_as_openai.sessions import _conversation_key
+        msgs = [{"role": "system", "content": "plain prompt"}, {"role": "user", "content": "hi"}]
+        key = _conversation_key(msgs)
+        self.assertFalse(key.startswith("client-sid:"))
+
+    def test_resume_keyed_by_session_id_despite_system_prompt_drift(self):
+        """Integration: resolve_session/record_session resume correctly when
+        the system prompt's non-identity content changes between turns, as
+        long as the Session ID line stays the same."""
+        turn1 = [
+            {"role": "system", "content": "Conversation started: Monday\nSession ID: xyz-1"},
+            {"role": "user", "content": "hi"},
+        ]
+        _, sid, _, key = shim.resolve_session(turn1)
+        reply = {"role": "assistant", "content": "hello"}
+        shim.record_session(key, sid, turn1, reply)
+
+        turn2 = [
+            {"role": "system", "content": "Conversation started: Tuesday\nSession ID: xyz-1"},
+            {"role": "user", "content": "hi"},
+            reply,
+            {"role": "user", "content": "again?"},
+        ]
+        mode, resumed_sid, delta, _ = shim.resolve_session(turn2)
+        self.assertEqual(mode, "resume")
+        self.assertEqual(resumed_sid, sid)
+        self.assertEqual(delta, [{"role": "user", "content": "again?"}])
 
 
 class TestResolveSessionDebugLogging(unittest.TestCase):
@@ -386,6 +539,34 @@ class TestResolveSessionDebugLogging(unittest.TestCase):
         combined = "\n".join(log_ctx.output)
         self.assertIn("-> fresh", combined)
         self.assertIn("not a superset", combined)
+
+    def test_logs_compaction_demotion_distinctly_from_a_real_divergence(self):
+        """A fresh caused by Hermes's context-compaction demotion should be
+        flagged in the log as expected fallout, not left indistinguishable
+        from a genuine, worth-investigating divergence."""
+        turn1 = [{"role": "user", "content": "run big command"}]
+        _, sid, _, key = shim.resolve_session(turn1)
+        stored_reply = {"role": "assistant", "content": None,
+                        "tool_calls": [{"id": "t1", "type": "function",
+                                        "function": {"name": "terminal", "arguments": '{"command":"x"}'}}]}
+        full_content = "output\n" * 800
+        turn2 = turn1 + [stored_reply,
+                          {"role": "tool", "tool_call_id": "t1", "content": full_content}]
+        shim.record_session(key, sid, turn2, {"role": "assistant", "content": "done"})
+
+        stub_content = (
+            f"[terminal output demoted at compaction — {len(full_content):,} "
+            "chars preserved in session history.]"
+        )
+        turn3 = turn1 + [stored_reply,
+                          {"role": "tool", "tool_call_id": "t1", "content": stub_content},
+                          {"role": "assistant", "content": "done"},
+                          {"role": "user", "content": "next?"}]
+        with self.assertLogs("claudecode_as_openai", level="DEBUG") as log_ctx:
+            shim.resolve_session(turn3)
+        combined = "\n".join(log_ctx.output)
+        self.assertIn("-> fresh", combined)
+        self.assertIn("compaction demotion", combined)
 
 
 class TestBuildClaudeCmd(unittest.TestCase):

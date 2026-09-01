@@ -238,3 +238,43 @@ _Unreleased_
   checkpoint, never off each other) and with the new default (exactly
   one subprocess spawn, no retry, ~9x faster than the exhausted-retries
   case for the same non-tool-needing turn).
+* Refined the Hermes out-of-band steer-message tolerance added for the
+  session-cache fix above: `_strip_oob` now only applies to `role: "tool"`
+  message content, not every string-content message -- it was previously
+  also matching the identical marker text that appears, by design, in
+  Hermes's own system-prompt boilerplate explaining the marker to the
+  model (harmless today since that text is static per-conversation, but
+  an accidental match, not a designed one). Verified against Hermes's
+  real source (`agent/prompt_builder.py`, `agent_runtime_helpers.py`)
+  and a live traffic capture that the marker format and injection point
+  are exactly as assumed, and that the marker is permanent, immutable
+  conversation history on Hermes's side (never disappears on its own).
+* Identified, but deliberately did NOT tolerate, a second, distinct
+  Hermes-side content-shrink source found during that same investigation:
+  Hermes's context compressor can later replace an aging tail tool-result
+  with a one-line `"[<tool> output demoted at compaction ...]"` stub once
+  it ages out of its kept window. A resumed Claude session never gets
+  history re-sent (only the new delta), so treating a full-content/stub
+  pair as a match would mean Claude's own session keeps the full-size
+  content forever, growing unbounded regardless of how much Hermes
+  compacts on its own side -- Hermes's compaction signal would never
+  reach Claude's context at all. `resolve_session` correctly falls
+  through to its existing `fresh` behavior here: a fresh session's
+  baseline IS `full_openai_messages` exactly as Hermes now sends it (stub
+  included), so it's what actually lets this shim's Claude session
+  inherit Hermes's compaction and stay bounded over long conversations.
+  The DEBUG divergence log now flags this specific case
+  ("compaction demotion, expected fallout, not a bug") so it doesn't
+  read as a regression when it fires.
+* Added client-asserted session identity support: when a system message
+  contains a `Session ID: <id>` line (emitted by Hermes's
+  `--pass-session-id`, currently CLI/TUI only -- confirmed not wired into
+  Hermes's webui gateway backend), `resolve_session` keys the
+  conversation by that id directly instead of hashing the system +
+  first message, and stops treating system-prompt content differences
+  as divergence for that conversation (the client already asserted "same
+  session", so a live timestamp/model/provider line differing is
+  volatile metadata, not a real change). Not Hermes-specific -- any
+  client can opt in by emitting the same line. DEBUG logs now also state
+  which of the two keying strategies was used for every `resolve_session`
+  call. 127 tests pass (9 new).
