@@ -219,6 +219,16 @@ Hermes Agent's real source and live traffic captures (not guessed):
   divergence -- the client has already asserted "same session", so that's
   volatile metadata, not a real content change. Any client can opt into this
   by emitting the same line; it isn't Hermes-specific.
+- **Narration text alongside a tool call**: a real live divergence (Hermes
+  dogfooding this repo through the shim) showed a client not reliably
+  replaying the assistant's narration text that preceded a tool call --
+  `content: ""` came back where the original reply had real text, while the
+  tool call's `id` and arguments matched exactly. Since `tool_calls[].id` is
+  a Claude-generated, effectively unique identifier per call, a match there
+  (plus matching arguments) is already decisive evidence it's the same turn
+  regardless of what happened to any accompanying narration -- so content is
+  now ignored entirely whenever a message carries `tool_calls`, the same way
+  `reasoning`/`reasoning_details` already are.
 
 ### Real streaming: PTY trick
 

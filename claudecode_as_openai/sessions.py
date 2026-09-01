@@ -131,6 +131,15 @@ def _normalize_message(msg, ignore_system_content=False):
     Hermes out-of-band user message blocks from tool-result content
     (injected mid-turn; absent on replay).
 
+    When tool_calls is non-empty, content is ignored entirely (normalized
+    to None) rather than compared: a real live divergence showed a client
+    (Hermes) not reliably round-tripping the assistant's narration text
+    alongside a tool call -- content: "" replayed back where the original
+    reply had real text. tool_calls[].id is a Claude-generated, effectively
+    unique identifier per call; when it (and the parsed arguments) match,
+    that's already decisive evidence it's the same turn, regardless of
+    what happened to any accompanying narration on the client's side.
+
     ignore_system_content: when True, system-role content is blanked out
     entirely before comparison. Only ever passed True when the conversation
     was keyed by an explicit client-supplied session id (see
@@ -146,6 +155,8 @@ def _normalize_message(msg, ignore_system_content=False):
     m.pop("reasoning", None)
     m.pop("reasoning_details", None)
     if ignore_system_content and m.get("role") == "system":
+        m["content"] = None
+    elif m.get("tool_calls"):
         m["content"] = None
     elif m.get("content") in (None, ""):
         m["content"] = None

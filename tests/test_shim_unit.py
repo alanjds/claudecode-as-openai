@@ -215,6 +215,36 @@ class TestNormalization(unittest.TestCase):
             json.dumps(_normalize_message(compact), sort_keys=True),
         )
 
+    def test_content_ignored_when_tool_calls_present(self):
+        """Regression test for a real live divergence (2026-09-01, Hermes
+        dogfooding this repo through the shim): the assistant's narration
+        text alongside a tool call wasn't reliably replayed back by the
+        client (content: "" replayed where the original had real text),
+        even though tool_call id + arguments matched exactly. The id is a
+        Claude-generated, effectively unique identifier per call -- when it
+        and the arguments match, that's decisive identity regardless of
+        what happened to any accompanying narration."""
+        from claudecode_as_openai.sessions import _normalize_message
+        import json
+        with_narration = {
+            "role": "assistant",
+            "content": "Let me check that file first.",
+            "tool_calls": [{"id": "toolu_013XN5yq1GAqw7mHvaqqircn", "type": "function",
+                            "function": {"name": "read_file",
+                                         "arguments": '{"path": "x.py", "limit": 30}'}}],
+        }
+        without_narration = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "toolu_013XN5yq1GAqw7mHvaqqircn", "type": "function",
+                            "function": {"name": "read_file",
+                                         "arguments": '{"limit":30,"path":"x.py"}'}}],
+        }
+        self.assertEqual(
+            json.dumps(_normalize_message(with_narration), sort_keys=True),
+            json.dumps(_normalize_message(without_narration), sort_keys=True),
+        )
+
     def test_list_input_is_handled(self):
         """_normalize_message must accept a list (resolve_session passes a prefix slice)."""
         from claudecode_as_openai.sessions import _normalize_message
@@ -288,6 +318,37 @@ class TestNormalization(unittest.TestCase):
             {"role": "tool", "tool_call_id": "t1", "content": "file.txt"},
             {"role": "user", "content": "now what?"},
         ])
+
+    def test_resume_despite_narration_text_dropped_alongside_tool_call(self):
+        """Integration version of the real dump: stored reply has real
+        narration text before the tool call; client replay drops it to ""."""
+        turn1 = [{"role": "user", "content": "look at tracking.py"}]
+        _, sid, _, key = shim.resolve_session(turn1)
+
+        stored_reply = {
+            "role": "assistant",
+            "content": "The current function only logs at WARNING level. Let me check the file.",
+            "tool_calls": [{"id": "toolu_013XN5yq1GAqw7mHvaqqircn", "type": "function",
+                            "function": {"name": "read_file",
+                                         "arguments": '{"path": "tracking.py", "limit": 30}'}}],
+        }
+        shim.record_session(key, sid, turn1, stored_reply)
+
+        client_reply = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "toolu_013XN5yq1GAqw7mHvaqqircn", "type": "function",
+                            "function": {"name": "read_file",
+                                         "arguments": '{"limit":30,"path":"tracking.py"}'}}],
+        }
+        turn2 = turn1 + [
+            client_reply,
+            {"role": "tool", "tool_call_id": "toolu_013XN5yq1GAqw7mHvaqqircn", "content": "..."},
+            {"role": "user", "content": "now what?"},
+        ]
+        mode, _, delta, _ = shim.resolve_session(turn2)
+        self.assertEqual(mode, "resume",
+                         "Should resume despite the tool-call narration text being dropped")
 
     def test_oob_strip_scoped_to_tool_role_only(self):
         """The OOB marker text also appears verbatim in Hermes's system-prompt

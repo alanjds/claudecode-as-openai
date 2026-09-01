@@ -277,4 +277,15 @@ _Unreleased_
   volatile metadata, not a real change). Not Hermes-specific -- any
   client can opt in by emitting the same line. DEBUG logs now also state
   which of the two keying strategies was used for every `resolve_session`
-  call. 127 tests pass (9 new).
+  call.
+* Fixed a new real live divergence (2026-09-01, Hermes dogfooding this
+  repo through the shim): the assistant's narration text preceding a tool
+  call wasn't reliably replayed back by the client (`content: ""` came
+  back where the original reply had real text), even though the tool
+  call's `id` and arguments matched exactly. `tool_calls[].id` is a
+  Claude-generated, effectively unique identifier per call -- a match
+  there (plus matching arguments) is already decisive evidence of the
+  same turn, so `_normalize_message` now ignores `content` entirely
+  whenever `tool_calls` is present, the same way `reasoning`/
+  `reasoning_details` already are. 129 tests pass (2 new since the
+  previous entry).
