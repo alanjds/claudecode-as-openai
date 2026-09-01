@@ -6,6 +6,7 @@ from a claude subprocess."""
 import sys
 
 from claudecode_as_openai import state
+from claudecode_as_openai.tracking import logger
 
 
 def _log_quota_snapshot():
@@ -19,7 +20,12 @@ def _log_quota_snapshot():
     five_h = info.get("unifiedWindows", {}).get("five_hour", {})
     util = five_h.get("utilization", 0.0)
     resets_at = five_h.get("resetsAt")
-    # Only log at WARNING/CRITICAL levels to reduce noise on normal operations
+    pct_remaining = round((1.0 - util) * 100, 1)
+    logger.debug(
+        "quota_snapshot status=%s util_5h=%.1f%% remaining_5h=%.1f%% resets_at=%s",
+        status, util * 100, pct_remaining, resets_at,
+    )
+    # Escalate to WARNING/CRITICAL at high utilization
     if util >= 0.90:
         severity = "CRITICAL" if util >= 0.95 else "WARNING"
         sys.stderr.write(
