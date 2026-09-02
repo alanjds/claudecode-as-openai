@@ -1346,6 +1346,33 @@ class TestWarmPoolDisabledKnob(unittest.TestCase):
             )
         mock_pool.take_if_matching.assert_not_called()
 
+    def test_allow_warm_tool_continuation_override_reenables_warm_pool(self):
+        """CLAUDE_OPENAI_ALLOW_WARM_TOOL_CONTINUATION (off by default, since
+        live testing found this combination WORSE than the already-bad
+        warm+unwidened baseline) exists purely so this can be re-tested
+        later without re-adding the exclusion code -- confirm the escape
+        hatch itself actually works."""
+        from unittest.mock import MagicMock, patch as mock_patch
+        warm_stub = MagicMock()
+        warm_stub.send_turn.return_value = {"text": "hi", "tool_calls": [], "usage": {}, "finish_reason": "stop"}
+        tool_use_msg = {"role": "assistant", "content": None,
+                        "tool_calls": [{"id": "t1", "type": "function",
+                                        "function": {"name": "terminal", "arguments": "{}"}}]}
+        delta = [tool_use_msg, {"role": "tool", "tool_call_id": "t1", "content": "ok"}]
+        with mock_patch.object(self.server, "WARM_POOL_DISABLED", False), \
+             mock_patch.object(self.server, "WARM_POOL_ALLOW_TOOL_CONTINUATION", True), \
+             mock_patch.object(self.server.state, "_WARM_POOL") as mock_pool, \
+             mock_patch.object(self.server, "call_claude_with_tool_retry",
+                                return_value=({"text": "", "tool_calls": [], "usage": {}, "finish_reason": "stop"},
+                                              "resume", "sid-1")):
+            mock_pool.take_if_matching.return_value = warm_stub
+            self.server.Handler._run_one_completion(
+                None, delta, [{"role": "user", "content": "hi"}] + delta,
+                "sys", "sonnet", tools_requested=True, session_mode="resume",
+                session_id="sid-1", json_schema=None, env_overrides={}, conv_key="ck",
+            )
+        mock_pool.take_if_matching.assert_called_once()
+
 
 class TestToolRetryWrapper(unittest.TestCase):
     """call_claude_with_tool_retry: verifies retry count, backoff timing,

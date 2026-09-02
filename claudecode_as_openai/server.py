@@ -34,7 +34,10 @@ import uuid
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from claudecode_as_openai.constants import DEFAULT_MODEL, MAX_N_CHOICES, _BASE_ENV_OVERRIDES, WARM_POOL_DISABLED
+from claudecode_as_openai.constants import (
+    DEFAULT_MODEL, MAX_N_CHOICES, _BASE_ENV_OVERRIDES, WARM_POOL_DISABLED,
+    WARM_POOL_ALLOW_TOOL_CONTINUATION,
+)
 from claudecode_as_openai import state
 from claudecode_as_openai.errors import ClaudeCliError
 from claudecode_as_openai.models import fetch_model_list, normalize_model_name, resolve_reasoning_effort
@@ -648,14 +651,19 @@ class Handler(BaseHTTPRequestHandler):
         # is otherwise always "user" or "tool" (never "assistant": that
         # role only ever comes FROM this shim as output, never as new
         # client input). Confirmed live that this widening reliably
-        # prevents Claude re-issuing its own tool call on the cold path,
-        # but the warm pool's live-process transport was separately
-        # confirmed WORSE than cold --resume for this exact shape (3/4 vs
-        # 0/4 redundant calls under matched conditions, unwidened) -- so
-        # tool-continuation resumes are kept off the warm pool here
-        # regardless of fingerprint match, until the widened delta is
-        # itself verified safe on that transport too.
-        is_tool_continuation_resume = bool(delta_messages) and delta_messages[0].get("role") == "assistant"
+        # prevents Claude re-issuing its own tool call on the cold path.
+        # The warm pool's live-process transport was separately, and
+        # deliberately, tested with this exact widened shape and found
+        # WORSE, not better (4/4 redundant calls, vs. its own already-bad
+        # 3/4 unwidened baseline) -- so tool-continuation resumes are kept
+        # off the warm pool unconditionally by default. WARM_POOL_ALLOW_TOOL_CONTINUATION
+        # exists only so this can be re-tested later without re-adding the
+        # code path; it does not reflect a current recommendation.
+        is_tool_continuation_resume = (
+            bool(delta_messages)
+            and delta_messages[0].get("role") == "assistant"
+            and not WARM_POOL_ALLOW_TOOL_CONTINUATION
+        )
 
         def _do_call(msgs, mode, sid):
             return call_claude_streaming(

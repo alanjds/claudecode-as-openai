@@ -94,6 +94,7 @@ with none of the `tracking` extra's dependencies installed.
 | `CLAUDE_OPENAI_TRACING` | Set to `1` to emit OTEL spans via [Logfire](https://logfire.pydantic.dev/), one nested per request / per `n`-choice / per tool-retry-attempt / per `claude` subprocess spawn -- exposes the retry loop, `n` fan-out, and warm-vs-cold amplification that's otherwise invisible from outside a single request. Requires the `tracking` extra; a no-op otherwise. |
 | `LOGFIRE_TOKEN` | Read by Logfire itself when `CLAUDE_OPENAI_TRACING=1`; see Logfire's own docs for where to get one. |
 | `CLAUDE_OPENAI_DISABLE_WARM_POOL` | Set to `1` to force every turn onto the cold path (a fresh `claude` subprocess per call), skipping the warm pool entirely -- an operational escape hatch for ruling out the warm pool while debugging, and how the warm-vs-cold redundant-tool-call comparison in "`--resume` and the redundant-tool-call bias" (below) was measured. |
+| `CLAUDE_OPENAI_ALLOW_WARM_TOOL_CONTINUATION` | Off by default. Set to `1` to let the warm pool serve tool-result-continuation resumes again -- verified live to be **worse** than cold `--resume` (see below), so this exists only to re-test that finding later (e.g. against a future Claude Code version), not because it's currently recommended. |
 
 **Redaction**: at `DEBUG` log level, the value following `--system-prompt`,
 `--json-schema`, `--mcp-config`, `--disallowedTools`, and `--allowedTools` in
@@ -221,7 +222,10 @@ round). The warm pool's live-process transport was separately confirmed
 tool-result delta (3/4 redundant calls) and with the widened one (4/4,
 even worse) -- tool-result-continuation resumes are always served cold,
 never from the warm pool, regardless of fingerprint match; this is a
-verified, permanent exclusion, not a conservative placeholder.
+verified, permanent exclusion, not a conservative placeholder. The code
+path that lets the warm pool serve them anyway is kept, gated off by
+default behind `CLAUDE_OPENAI_ALLOW_WARM_TOOL_CONTINUATION`, purely so
+this can be re-tested later without re-adding it.
 
 Two other mitigations were tried and ruled out empirically: forking a new
 session id (`--fork-session`) for the tool-continuation step tested *worse*

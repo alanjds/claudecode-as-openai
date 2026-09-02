@@ -376,3 +376,10 @@ _Unreleased_
   mechanism than the one widening addresses, and that excluding
   tool-result continuations from it is a permanent, verified requirement,
   not a temporary conservative default.
+* Added `CLAUDE_OPENAI_ALLOW_WARM_TOOL_CONTINUATION` (off by default): lets
+  the warm pool serve tool-result-continuation resumes again, undoing the
+  exclusion above. Kept specifically so that decision can be re-tested
+  later (e.g. against a future Claude Code version) without re-adding the
+  code path -- setting it today does not reflect a current recommendation,
+  since it re-enables a combination already measured worse than doing
+  nothing. 140 tests pass (1 new).
