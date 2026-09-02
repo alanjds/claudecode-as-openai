@@ -94,7 +94,6 @@ with none of the `tracking` extra's dependencies installed.
 | `CLAUDE_OPENAI_TRACING` | Set to `1` to emit OTEL spans via [Logfire](https://logfire.pydantic.dev/), one nested per request / per `n`-choice / per tool-retry-attempt / per `claude` subprocess spawn -- exposes the retry loop, `n` fan-out, and warm-vs-cold amplification that's otherwise invisible from outside a single request. Requires the `tracking` extra; a no-op otherwise. |
 | `LOGFIRE_TOKEN` | Read by Logfire itself when `CLAUDE_OPENAI_TRACING=1`; see Logfire's own docs for where to get one. |
 | `CLAUDE_OPENAI_DISABLE_WARM_POOL` | Set to `1` to force every turn onto the cold path (a fresh `claude` subprocess per call), skipping the warm pool entirely -- an operational escape hatch for ruling out the warm pool while debugging, and how the warm-vs-cold redundant-tool-call comparison in "`--resume` and the redundant-tool-call bias" (below) was measured. |
-| `CLAUDE_OPENAI_ALLOW_WARM_TOOL_CONTINUATION` | Off by default. Set to `1` to let the warm pool serve tool-result-continuation resumes again -- verified live to be **worse** than cold `--resume` (see below), so this exists only to re-test that finding later (e.g. against a future Claude Code version), not because it's currently recommended. |
 
 **Redaction**: at `DEBUG` log level, the value following `--system-prompt`,
 `--json-schema`, `--mcp-config`, `--disallowedTools`, and `--allowedTools` in
@@ -217,15 +216,7 @@ the real running shim (not just direct-CLI approximations): 0/12 repeats
 across 3 trials of 4 consecutive tool calls each, and negligible cache
 cost (`cache_read_input_tokens` stays flat turn over turn; `cache_creation_input_tokens`
 grows only by the ordinary few hundred tokens of genuinely new content per
-round). The warm pool's live-process transport was separately confirmed
-*worse* than cold `--resume` for this same shape, both with the bare
-tool-result delta (3/4 redundant calls) and with the widened one (4/4,
-even worse) -- tool-result-continuation resumes are always served cold,
-never from the warm pool, regardless of fingerprint match; this is a
-verified, permanent exclusion, not a conservative placeholder. The code
-path that lets the warm pool serve them anyway is kept, gated off by
-default behind `CLAUDE_OPENAI_ALLOW_WARM_TOOL_CONTINUATION`, purely so
-this can be re-tested later without re-adding it.
+round).
 
 Two other mitigations were tried and ruled out empirically: forking a new
 session id (`--fork-session`) for the tool-continuation step tested *worse*
@@ -234,6 +225,40 @@ note via `--append-system-prompt` composes fine with this shim's
 `--system-prompt` override but decisively busts Anthropic's prompt cache
 the first time it's used (`cache_creation_input_tokens` jumping from
 low-hundreds to a near-total re-cache), so it was dropped outright.
+
+**The warm pool used to make this worse, independent of the fix above --
+now fixed at the source.** The original warm pool kept a `claude -p
+--input-format stream-json` process alive across turns. A live
+investigation (delay sweeps from 0ms to 10s between the prior process
+exiting and the next one spawning, then a matched-timing protocol
+isolation) found: (1) no timing/parking effect at all -- redo rate stayed
+in a noisy ~60-75% band across the *entire* 0-10s range with no trend,
+ruling out a session-file settle/flush race; (2) with timing and parking
+both controlled out (same fixed 100ms gap, neither condition actually
+pre-warmed), plain cold `--resume` showed 0/8 redundant calls while
+`--input-format stream-json` showed 6/8 (and, with `--replay-user-messages`
+removed to isolate it further, 8/8 -- ruling that flag out too). The
+mechanism was `--input-format stream-json` itself, independent of
+everything else.
+
+Since every `WarmProcess` only ever serves exactly one turn before being
+killed (true even in the original design -- see git history), it was never
+actually using stream-json's real capability of feeding a *second* turn
+into a running process; it only ever needed "spawn now, deliver this one
+turn's input whenever it's ready later". An ordinary `-p --resume` process
+supports exactly that by holding its stdin pipe open, unwritten, until
+claim time -- no special input mode required, and Claude Code does its
+`--resume` session-reload work independent of stdin content, so the
+speed benefit survives (a live timing test found holding stdin open ~2s
+before writing roughly halves the time from write to first output,
+versus writing immediately). The warm pool was rewritten around this:
+plain `-p --resume`, stdin held open while parked, written and closed
+only once a real turn claims it -- byte-identical wire protocol to the
+cold path, just against a pre-spawned process. Verified live: 0/6
+redundant calls using this exact pattern for a real tool continuation.
+Tool-result continuations now flow through the same warm-pool gate as
+any other resumed turn; the earlier unconditional exclusion is gone,
+since the mechanism it existed to route around no longer exists.
 
 ### Session-cache tolerance for client-side history rewrites
 

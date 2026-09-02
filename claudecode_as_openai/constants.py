@@ -79,15 +79,3 @@ _OPENROUTER_ALIASES = ("sonnet", "opus", "haiku")
 # toggle for anyone who wants to rule out the warm pool while debugging
 # something else entirely.
 WARM_POOL_DISABLED = os.environ.get("CLAUDE_OPENAI_DISABLE_WARM_POOL", "") == "1"
-
-# Off by default: server.py keeps tool-result-continuation resumes (see
-# resolve_session's delta-widening) off the warm pool unconditionally,
-# always serving them cold instead. This was a deliberate, verified
-# decision, not a placeholder -- live testing showed the warm pool's
-# live-process transport is WORSE than cold --resume for this exact shape,
-# both with the plain tool-result delta (3/4 trials redid the tool call)
-# and with the widened one (4/4, even worse). This flag exists purely so
-# that decision can be re-tested later (a future Claude Code version could
-# change the underlying behavior) without re-adding the code path --
-# setting it does not change any current recommendation.
-WARM_POOL_ALLOW_TOOL_CONTINUATION = os.environ.get("CLAUDE_OPENAI_ALLOW_WARM_TOOL_CONTINUATION", "") == "1"

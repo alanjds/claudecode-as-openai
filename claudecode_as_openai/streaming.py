@@ -56,7 +56,7 @@ def _apply_stop_sequences(text, stop):
     return text[:earliest], True
 
 
-def _build_claude_cmd(model, session_mode, session_id, tools_requested, max_turns, json_schema, want_partial_messages=False, mcp_tool_config=None, effort=None, input_format=None):
+def _build_claude_cmd(model, session_mode, session_id, tools_requested, max_turns, json_schema, want_partial_messages=False, mcp_tool_config=None, effort=None):
     cmd = [_CLAUDE_BIN]
     # Excludes user/project/local settings.json entirely, preventing
     # locally-configured SessionStart/other hooks from injecting extra
@@ -86,15 +86,6 @@ def _build_claude_cmd(model, session_mode, session_id, tools_requested, max_turn
         # and README "MCP tool leakage").
         cmd += ["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
     cmd += ["--output-format", "stream-json", "--verbose", "--max-turns", str(max_turns)]
-    if input_format == "stream-json":
-        # Used only by the persistent warm-pool process (see
-        # WarmProcess): keeps the underlying `claude -p` subprocess
-        # alive across multiple turns of the SAME conversation, reading
-        # one JSON line per turn from stdin instead of exiting after a
-        # single message array. --replay-user-messages makes the CLI
-        # echo each user turn back on stdout so the reader can align
-        # results to the right turn without a separate side channel.
-        cmd += ["--input-format", "stream-json", "--replay-user-messages"]
     if want_partial_messages:
         # Adds token-level "stream_event"/"content_block_delta" lines
         # interleaved with the existing full "assistant" message chunks.

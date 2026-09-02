@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Persistent warm-pool: keeps ONE already-spawned, already-bootstrapped
-`claude -p --input-format stream-json` process parked per conversation,
-ready to take the NEXT turn without paying the ~5s process-spawn/
+"""Persistent warm-pool: keeps ONE already-spawned `claude -p --resume`
+process parked per conversation, its stdin pipe open but not yet written
+to, ready to take the NEXT turn without paying the ~5s process-spawn/
 bootstrap cost a fresh `-p --resume` invocation pays on every call
 (measured live: cold `-p --resume` wall time vs the CLI's own
 self-reported duration_ms showed a ~5.2s unaccounted gap -- pure
-process-lifecycle overhead outside the API call itself -- that
-collapses to ~5ms once a process is already resident and warm).
+process-lifecycle overhead outside the API call itself).
 
 Design, per explicit user direction: at most ONE parked (idle, already
 spawned) process at a time, never a process per concurrent conversation.
@@ -20,9 +19,10 @@ simultaneously.
      spawn a WarmProcess pre-resuming that exact session, parked
      waiting for turn 2.
   2. The next turn for the SAME conversation (matching fingerprint +
-     session_id) arrives -> claim the parked WarmProcess, feed it the
-     turn directly (no spawn), and spawn a fresh WarmProcess to park
-     for turn 3 once this reply is known.
+     session_id) arrives -> claim the parked WarmProcess, write this
+     turn's message array to its already-open stdin and close it (no
+     spawn), and spawn a fresh WarmProcess to park for turn 3 once this
+     reply is known.
   3. A turn for a DIFFERENT conversation arrives (new fingerprint, or a
      continuation whose synced history no longer matches this parked
      process's session) -> the stale parked process is useless (its
@@ -30,19 +30,42 @@ simultaneously.
      immediately; that turn is served cold, and a new WarmProcess is
      parked for whatever comes next.
 
+Each WarmProcess serves exactly one turn, ever, then is killed -- this
+was already true even in the original --input-format stream-json design
+(see git history), so it was never actually using stream-json's real
+capability of feeding a SECOND turn into an already-running process. It
+only ever needed "spawn now, deliver the one turn's input whenever it's
+ready later", which a completely ordinary `-p --resume` process supports
+just by holding its stdin pipe open, unwritten, until claim time -- no
+special input mode required.
+
+This replaced an earlier --input-format stream-json implementation after
+a live investigation found that input mode itself (independent of
+timing, independent of --replay-user-messages, independent of whether a
+process was actually pre-parked or freshly spawned) reliably causes
+Claude Code to re-issue a tool call it already made when resuming a
+session that ended on that call -- see CHANGELOG for the full experiment
+trail. Plain `-p --resume` with a single JSON-array stdin write (exactly
+what the cold path already does, and now what this module does too, just
+against a pre-spawned process) showed zero such regressions across every
+trial run against it. A live timing experiment additionally confirmed
+holding stdin open, unwritten, for ~2s before writing measurably hides
+Claude Code's own session-reload/bootstrap latency (roughly halving the
+time from write to first output) -- so this design keeps the warm pool's
+whole reason to exist while dropping the one mechanism proven to cause
+redundant tool calls.
+
 Cross-compatible with the existing cold path by construction: a warm
 process's Claude session_id is a completely normal Claude Code session
-(created with plain --session-id / --resume, just kept alive across
-turns via --input-format stream-json instead of exiting after one).
-Verified live: a session created and advanced by a WarmProcess resumes
-correctly via a totally separate one-shot `-p --resume` call after the
-warm process is killed, and vice versa -- either side can pick up
-where the other left off with no special handling needed."""
+(created with plain --session-id / --resume). Verified live: a session
+created and advanced by a WarmProcess resumes correctly via a totally
+separate one-shot `-p --resume` call after the warm process is killed,
+and vice versa -- either side can pick up where the other left off with
+no special handling needed."""
 
 import json
 import os
 import pty
-import queue
 import subprocess
 import sys
 import tempfile
@@ -50,19 +73,28 @@ import threading
 import time
 
 from claudecode_as_openai.constants import CLAUDE_TIMEOUT_S
-from claudecode_as_openai.errors import ClaudeCliError
 from claudecode_as_openai import state
 from claudecode_as_openai import tracking
 from claudecode_as_openai.tracking import logger
 
 
 class WarmProcess:
-    """One already-spawned `claude -p --input-format stream-json
-    --output-format stream-json` subprocess, resumed onto a specific
-    Claude session_id, parked waiting to serve exactly one more turn of
-    that same conversation. Not reused after that turn is served --
-    callers spawn a fresh WarmProcess for the turn after this one (see
-    WarmPool)."""
+    """One already-spawned `claude -p --resume` subprocess for a specific
+    Claude session_id, its stdin pipe open but not yet written to, parked
+    waiting to serve exactly one turn of that same conversation. Not
+    reused after that turn is served -- callers spawn a fresh WarmProcess
+    for the turn after this one (see WarmPool).
+
+    Deliberately NOT --input-format stream-json (see the module
+    docstring for why): this is a completely ordinary one-shot `-p`
+    process, identical to what the cold path spawns, except its stdin
+    write is deferred from spawn time to claim time. Session-reload/
+    bootstrap work Claude Code does independent of stdin content (e.g.
+    reading --resume's target session) proceeds in the background while
+    it's parked; only the response-generation work waits for the
+    eventual write. Verified live: holding stdin open ~2s before writing
+    roughly halves the time from write to first output, versus writing
+    immediately after spawn."""
 
     def __init__(self, fingerprint, session_id, model, system_prompt, tools_requested, tools,
                  mcp_tool_config, effort, use_pty, env_overrides=None):
@@ -80,8 +112,6 @@ class WarmProcess:
         self.pty_master_fd = None
         self.system_prompt_file = None
         self._debug_cmd = None
-        self._reader_thread = None
-        self._line_queue = queue.Queue()
         self._lock = threading.Lock()
         self._claimed = False
         self.spawned_at = time.time()  # when this process was spawned
@@ -98,13 +128,14 @@ class WarmProcess:
 
         # Warm pool always resumes a known session; json_schema=None here
         # (json_schema requires fresh spawns with full orchestration). With
-        # prose fallback removed, max_turns=1 is always safe.
+        # prose fallback removed, max_turns=1 is always safe. No
+        # input_format passed -- see the module docstring for why this
+        # must stay a plain one-shot process, never stream-json.
         max_turns = 1
         cmd = _build_claude_cmd(
             self.model, "resume", self.session_id, self.tools_requested, max_turns,
             json_schema=None, want_partial_messages=self.use_pty,
             mcp_tool_config=self.mcp_tool_config, effort=self.effort,
-            input_format="stream-json",
         )
         if self.system_prompt:
             # Matches call_claude_streaming's own >4000-char threshold
@@ -134,13 +165,15 @@ class WarmProcess:
             spawn_env.update(self.env_overrides)
         # Captured once here (not rebuilt in send_turn, which never touches
         # argv again -- a warm process is spawned once and then only fed
-        # turns over stdin) so send_turn's leaf span can still report the
-        # command line this process was started with.
+        # its one turn over stdin) so send_turn's leaf span can still
+        # report the command line this process was started with.
         self._debug_cmd = tracking.redact_cmd_for_log(cmd)
         logger.debug(
             "spawning claude (warm-pool init): %s | session_id=%s",
             self._debug_cmd, self.session_id,
         )
+        # stdin is deliberately left unwritten here -- see send_turn and
+        # the class docstring. Popen itself does not block on this.
         if self.use_pty:
             self.pty_master_fd, pty_slave_fd = pty.openpty()
             self.proc = subprocess.Popen(
@@ -153,37 +186,6 @@ class WarmProcess:
                 cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, bufsize=1, cwd=state._CLAUDE_CWD, env=spawn_env,
             )
-        self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
-        self._reader_thread.start()
-
-    def _read_loop(self):
-        # Runs for the whole process lifetime, pushing every parsed
-        # NDJSON line onto a queue that send_turn drains per-turn. A
-        # background reader (rather than reading synchronously inside
-        # send_turn) is what lets the process sit parked indefinitely
-        # between turns without a blocking read call pinning a thread
-        # doing nothing useful -- this thread blocks on I/O, which is
-        # cheap, not on CPU. timeout_s=None on the PTY path is
-        # deliberate: _iter_ndjson_lines_pty's deadline is per-
-        # generator-lifetime, not per-line, and this generator IS the
-        # process's whole lifetime (spawn through however many turns get
-        # served) -- a finite deadline here would silently kill an
-        # idle-but-still-alive parked process out from under send_turn.
-        # Per-turn bounding happens instead in send_turn's own
-        # queue.get(timeout=...).
-        from claudecode_as_openai.parsing import _iter_ndjson_lines, _iter_ndjson_lines_pty
-
-        try:
-            if self.use_pty:
-                for parsed in _iter_ndjson_lines_pty(self.pty_master_fd, self.proc, timeout_s=None):
-                    self._line_queue.put(parsed)
-            else:
-                for parsed in _iter_ndjson_lines(self.proc):
-                    self._line_queue.put(parsed)
-        except Exception:
-            pass
-        finally:
-            self._line_queue.put(None)  # sentinel: stdout closed / process exited
 
     def is_alive(self):
         return self.proc is not None and self.proc.poll() is None
@@ -200,56 +202,36 @@ class WarmProcess:
             return True
 
     def send_turn(self, claude_messages, stop=None, stream_callback=None):
-        """Feed ONE turn (a list of new Claude-shaped messages -- the
-        delta beyond what this session already has) to the already-
-        running process and block for its result. Must only be called
-        after claim() returns True. Uses the exact same response-parsing
-        logic as the cold path (_consume_claude_response) so behavior is
-        identical either way."""
+        """Write the ONE turn this process was parked for (a list of
+        Claude-shaped messages -- the delta beyond what this session
+        already has) to its still-open stdin, close it, and block for
+        the result. Must only be called after claim() returns True.
+
+        This is deliberately identical to the cold path's single-shot
+        stdin write (streaming.py's call_claude_streaming) -- the only
+        difference is that the process was already spawned earlier (see
+        the class docstring for why that's still a real speed win without
+        needing stream-json). Reuses _consume_claude_response and the
+        same NDJSON readers as the cold path so behavior is identical
+        either way, not just similar."""
         from claudecode_as_openai.streaming import _consume_claude_response, _normalize_stop_sequences
+        from claudecode_as_openai.parsing import _iter_ndjson_lines, _iter_ndjson_lines_pty
 
         stop_sequences = _normalize_stop_sequences(stop)
         with tracking.span("claude_spawn", cmd=self._debug_cmd, path="warm") as sp:
-            # claude_messages is the delta list this shim would otherwise
-            # have written whole to a fresh process's stdin; stream-json
-            # input takes one JSON object per line instead, so each element
-            # is sent as its own {"type": "user", "message": ...} frame.
-            for msg in claude_messages:
-                line = json.dumps({"type": msg.get("role", "user"), "message": msg})
-                if self.use_pty:
-                    os.write(self.proc.stdin.fileno(), (line + "\n").encode())
-                else:
-                    self.proc.stdin.write(line + "\n")
-                    self.proc.stdin.flush()
-
-            def chunk_source():
-                while True:
-                    try:
-                        item = self._line_queue.get(timeout=CLAUDE_TIMEOUT_S)
-                    except queue.Empty:
-                        # No output from the warm process for CLAUDE_TIMEOUT_S
-                        # seconds -- it is stuck. Kill it so quota stops burning
-                        # and surface a proper error to the caller.
-                        elapsed = time.time() - self.spawned_at
-                        sys.stderr.write(
-                            f"claudecode-as-openai: warm-pool: subprocess"
-                            f" {self.session_id} produced no output for"
-                            f" {CLAUDE_TIMEOUT_S}s (total age {elapsed:.0f}s);"
-                            f" killing\n"
-                        )
-                        self.kill()
-                        raise ClaudeCliError(
-                            500, "api_error",
-                            f"Warm-pool subprocess timed out after"
-                            f" {CLAUDE_TIMEOUT_S}s with no output.",
-                            code="warm_process_timeout",
-                        )
-                    if item is None:
-                        return
-                    yield item
+            payload = json.dumps(claude_messages)
+            if self.use_pty:
+                self.proc.stdin.write(payload.encode())
+            else:
+                self.proc.stdin.write(payload)
+            self.proc.stdin.close()
 
             deadline = time.time() + CLAUDE_TIMEOUT_S
-            result = _consume_claude_response(chunk_source(), deadline, stop_sequences, stream_callback)
+            chunk_source = (
+                _iter_ndjson_lines_pty(self.pty_master_fd, self.proc, CLAUDE_TIMEOUT_S)
+                if self.use_pty else _iter_ndjson_lines(self.proc)
+            )
+            result = _consume_claude_response(chunk_source, deadline, stop_sequences, stream_callback)
             if not result.get("session_id"):
                 result["session_id"] = self.session_id
             usage = result.get("usage") or {}

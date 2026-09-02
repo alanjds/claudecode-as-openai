@@ -383,3 +383,41 @@ _Unreleased_
   code path -- setting it today does not reflect a current recommendation,
   since it re-enables a combination already measured worse than doing
   nothing. 140 tests pass (1 new).
+* Root-caused, then fixed at the source, why the warm pool was worse than
+  cold `--resume` for tool-result continuations (the exclusion above was
+  correct but treated it as a fact of life rather than something fixable).
+  Two rounds of live experiments: (1) delay sweeps from 0ms to 10s between
+  the previous process exiting and the next one spawning -- redo rate
+  stayed in a noisy ~60-75% band across the *entire* range with no trend,
+  ruling out a session-file settle/flush timing race (66 combined trials);
+  (2) a matched-timing protocol isolation, holding the gap fixed at 100ms
+  for both conditions so neither was actually pre-parked: plain cold
+  `--resume` (one JSON array, one-shot) showed 0/8 redundant calls,
+  `--input-format stream-json` showed 6/8, and with `--replay-user-messages`
+  additionally removed to isolate it, 8/8 -- pinning the cause on
+  `--input-format stream-json` itself, independent of timing, parking, or
+  `--replay-user-messages`.
+  Since every `WarmProcess` already only ever served exactly one turn
+  before being killed, it was never actually using stream-json's real
+  capability (feeding a *second* turn into a running process) -- it only
+  ever needed "spawn now, deliver this one turn's input whenever it's
+  ready later", which an ordinary `-p --resume` process supports by
+  holding its stdin pipe open, unwritten, until claim time. A live timing
+  test confirmed the speed benefit survives this way too: holding stdin
+  open ~2s before writing roughly halved the time from write to first
+  output versus writing immediately (Claude Code's own `--resume`
+  session-reload work runs independent of stdin content). `warm_pool.py`'s
+  `WarmProcess` was rewritten around this -- plain `-p --resume`, no
+  `--input-format`/`--replay-user-messages`, stdin held open while parked
+  and written+closed only once claimed, reusing the exact same
+  `_consume_claude_response`/NDJSON-reader code the cold path already
+  uses instead of a separate queue-fed background-reader-thread design.
+  Verified live: 0/6 redundant calls using this exact pattern for a real
+  tool continuation.
+  Since the mechanism the exclusion existed to route around is gone, it
+  and `CLAUDE_OPENAI_ALLOW_WARM_TOOL_CONTINUATION` (added directly above,
+  in the same investigation) were both removed -- tool-result
+  continuations now flow through the same warm-pool gate as any other
+  resumed turn, no special-casing. `_build_claude_cmd`'s now-dead
+  `input_format` parameter was removed too. 146 tests pass (7 new, adding
+  the unit coverage `warm_pool.py` never had before this).

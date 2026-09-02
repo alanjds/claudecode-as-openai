@@ -47,14 +47,12 @@ def _iter_ndjson_lines_pty(master_fd, proc, timeout_s):
     This is the only way to get real client-facing streaming out of this
     CLI; there is no flag to force unbuffered/line-buffered stdout.
 
-    `timeout_s`, if given, is a single deadline for the WHOLE generator
-    lifetime, not per-line -- correct for call_claude_streaming's
-    one-shot use (one call, one bounded wait), but WRONG for a
-    WarmProcess's background reader, which must survive indefinitely
-    across an unbounded number of turns with idle gaps between them.
-    Pass timeout_s=None for that case: the generator then only returns
-    on EOF/process-exit, with no wall-clock cutoff at all (see
-    WarmProcess._read_loop)."""
+    `timeout_s` is a single deadline for the WHOLE generator lifetime,
+    not per-line -- both call_claude_streaming and WarmProcess.send_turn
+    use this the same way now (one call, one bounded wait): a warm
+    process's stdin is only ever written once it's actually claimed, so
+    by the time this generator runs there's exactly one turn's worth of
+    output to read, identical in shape to the cold path."""
     deadline = None if timeout_s is None else time.time() + timeout_s
     buf = b""
     while True:

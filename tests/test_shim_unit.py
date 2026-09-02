@@ -1321,37 +1321,16 @@ class TestWarmPoolDisabledKnob(unittest.TestCase):
             )
         mock_pool.take_if_matching.assert_called_once()
 
-    def test_tool_continuation_shaped_delta_never_served_warm(self):
-        """A delta starting with role=="assistant" is the unambiguous
-        signature of resolve_session's tool-continuation widening (see
-        sessions.py) -- confirmed live that the warm pool's live-process
-        transport handles this shape WORSE than cold --resume (3/4 vs 0/4
-        redundant tool calls under matched conditions), so it must never be
-        routed there, even with a matching fingerprint and the warm pool
-        otherwise enabled."""
-        from unittest.mock import MagicMock, patch as mock_patch
-        stub_result = {"text": "done", "tool_calls": [], "usage": {}, "finish_reason": "stop"}
-        tool_use_msg = {"role": "assistant", "content": None,
-                        "tool_calls": [{"id": "t1", "type": "function",
-                                        "function": {"name": "terminal", "arguments": "{}"}}]}
-        delta = [tool_use_msg, {"role": "tool", "tool_call_id": "t1", "content": "ok"}]
-        with mock_patch.object(self.server, "WARM_POOL_DISABLED", False), \
-             mock_patch.object(self.server.state, "_WARM_POOL") as mock_pool, \
-             mock_patch.object(self.server, "call_claude_with_tool_retry",
-                                return_value=(stub_result, "resume", "sid-1")):
-            self.server.Handler._run_one_completion(
-                None, delta, [{"role": "user", "content": "hi"}] + delta,
-                "sys", "sonnet", tools_requested=True, session_mode="resume",
-                session_id="sid-1", json_schema=None, env_overrides={}, conv_key="ck",
-            )
-        mock_pool.take_if_matching.assert_not_called()
-
-    def test_allow_warm_tool_continuation_override_reenables_warm_pool(self):
-        """CLAUDE_OPENAI_ALLOW_WARM_TOOL_CONTINUATION (off by default, since
-        live testing found this combination WORSE than the already-bad
-        warm+unwidened baseline) exists purely so this can be re-tested
-        later without re-adding the exclusion code -- confirm the escape
-        hatch itself actually works."""
+    def test_tool_continuation_shaped_delta_now_served_warm_normally(self):
+        """A delta starting with role=="assistant" is the signature of
+        resolve_session's tool-continuation widening (see sessions.py).
+        This used to be unconditionally excluded from the warm pool,
+        because the old --input-format stream-json WarmProcess was
+        proven to redo the tool call for this shape. WarmProcess no
+        longer uses that input mode at all (see warm_pool.py's module
+        docstring -- it's a plain one-shot process now, pre-spawned with
+        stdin held open), so this shape must flow through the same
+        warm-pool gate as any other resumed turn, with no special-casing."""
         from unittest.mock import MagicMock, patch as mock_patch
         warm_stub = MagicMock()
         warm_stub.send_turn.return_value = {"text": "hi", "tool_calls": [], "usage": {}, "finish_reason": "stop"}
@@ -1360,7 +1339,6 @@ class TestWarmPoolDisabledKnob(unittest.TestCase):
                                         "function": {"name": "terminal", "arguments": "{}"}}]}
         delta = [tool_use_msg, {"role": "tool", "tool_call_id": "t1", "content": "ok"}]
         with mock_patch.object(self.server, "WARM_POOL_DISABLED", False), \
-             mock_patch.object(self.server, "WARM_POOL_ALLOW_TOOL_CONTINUATION", True), \
              mock_patch.object(self.server.state, "_WARM_POOL") as mock_pool, \
              mock_patch.object(self.server, "call_claude_with_tool_retry",
                                 return_value=({"text": "", "tool_calls": [], "usage": {}, "finish_reason": "stop"},
@@ -1372,6 +1350,107 @@ class TestWarmPoolDisabledKnob(unittest.TestCase):
                 session_id="sid-1", json_schema=None, env_overrides={}, conv_key="ck",
             )
         mock_pool.take_if_matching.assert_called_once()
+
+
+class TestWarmProcess(unittest.TestCase):
+    """WarmProcess (warm_pool.py): pre-spawns a plain `-p --resume`
+    process -- deliberately NOT --input-format stream-json, which a real
+    live investigation proved reliably causes Claude to redo a tool call
+    on resume (see warm_pool.py's module docstring and CHANGELOG for the
+    full experiment trail). stdin is held open, unwritten, until
+    send_turn is actually called -- identical wire protocol to the cold
+    path, just against an already-spawned process. No unit tests existed
+    for this module before this investigation; these lock in the
+    corrected behavior."""
+
+    def _spawn(self, mock_proc, **overrides):
+        from claudecode_as_openai import warm_pool
+        kwargs = dict(
+            fingerprint=("ck", "sonnet", False, None, None, None),
+            session_id="sid-1", model="sonnet", system_prompt=None,
+            tools_requested=False, tools=None, mcp_tool_config=None,
+            effort=None, use_pty=False,
+        )
+        kwargs.update(overrides)
+        captured = {}
+
+        def fake_popen(cmd, **popen_kwargs):
+            captured["cmd"] = cmd
+            captured["popen_kwargs"] = popen_kwargs
+            return mock_proc
+
+        with patch("claudecode_as_openai.warm_pool.subprocess.Popen", side_effect=fake_popen):
+            wp = warm_pool.WarmProcess(**kwargs)
+        return wp, captured
+
+    def test_spawn_never_uses_stream_json_input_format(self):
+        mock_proc = MagicMock()
+        _, captured = self._spawn(mock_proc)
+        cmd = captured["cmd"]
+        self.assertNotIn("--input-format", cmd)
+        self.assertNotIn("--replay-user-messages", cmd)
+        self.assertIn("--resume", cmd)
+        self.assertIn("sid-1", cmd)
+
+    def test_spawn_does_not_write_or_close_stdin(self):
+        """The whole point of this design: bootstrap can start in the
+        background at spawn time, but nothing is written until a caller
+        actually claims and feeds this process a real turn."""
+        mock_proc = MagicMock()
+        self._spawn(mock_proc)
+        mock_proc.stdin.write.assert_not_called()
+        mock_proc.stdin.close.assert_not_called()
+
+    def test_send_turn_writes_full_payload_once_then_closes_stdin(self):
+        lines = _ndjson_lines(
+            {"type": "system", "subtype": "init"},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "all good"}],
+                                               "usage": {"input_tokens": 1, "output_tokens": 1}}},
+            {"type": "result", "subtype": "success"},
+        )
+        mock_proc = MagicMock()
+        mock_proc.stdout = iter(lines)
+        wp, _ = self._spawn(mock_proc)
+        result = wp.send_turn([{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+        ]}])
+        self.assertEqual(mock_proc.stdin.write.call_count, 1)
+        written = mock_proc.stdin.write.call_args[0][0]
+        self.assertIn("tool_result", written)
+        mock_proc.stdin.close.assert_called_once()
+        self.assertEqual(result["text"], "all good")
+
+    def test_send_turn_falls_back_to_requested_session_id_without_init_chunk(self):
+        lines = _ndjson_lines(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}], "usage": {}}},
+            {"type": "result", "subtype": "success"},
+        )
+        mock_proc = MagicMock()
+        mock_proc.stdout = iter(lines)
+        wp, _ = self._spawn(mock_proc, session_id="sid-xyz")
+        result = wp.send_turn([{"role": "user", "content": "hi"}])
+        self.assertEqual(result["session_id"], "sid-xyz")
+
+    def test_claim_returns_true_exactly_once(self):
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None  # alive
+        wp, _ = self._spawn(mock_proc)
+        self.assertTrue(wp.claim())
+        self.assertFalse(wp.claim())
+
+    def test_claim_fails_on_dead_process(self):
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 1  # already exited
+        wp, _ = self._spawn(mock_proc)
+        self.assertFalse(wp.claim())
+
+    def test_is_alive_reflects_poll(self):
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        wp, _ = self._spawn(mock_proc)
+        self.assertTrue(wp.is_alive())
+        mock_proc.poll.return_value = 0
+        self.assertFalse(wp.is_alive())
 
 
 class TestToolRetryWrapper(unittest.TestCase):
