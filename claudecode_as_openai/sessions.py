@@ -235,8 +235,7 @@ def resolve_session(openai_messages):
                 logger.debug(
                     "resolve_session: conv_key=%s -> resume (n_incoming=%d n_synced=%d%s)",
                     key[:12], len(openai_messages), len(synced),
-                    ", widened delta to resend preceding tool_use (mitigates confirmed"
-                    " --resume redundant-tool-call bias)" if widened_for_tool_continuation else "",
+                    ", widened (tool continuation)" if widened_for_tool_continuation else "",
                 )
                 return "resume", entry["claude_session_id"], delta, key
             if not length_ok:

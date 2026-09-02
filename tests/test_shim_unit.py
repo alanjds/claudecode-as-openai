@@ -635,7 +635,7 @@ class TestResolveSessionDebugLogging(unittest.TestCase):
             shim.resolve_session(turn2)
         combined = "\n".join(log_ctx.output)
         self.assertIn("-> resume", combined)
-        self.assertIn("widened delta to resend preceding tool_use", combined)
+        self.assertIn("widened (tool continuation)", combined)
 
     def test_logs_diverged_prefix_with_index(self):
         turn1 = [{"role": "user", "content": "remember X"}]
