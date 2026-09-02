@@ -1210,6 +1210,54 @@ class TestStopSequences(unittest.TestCase):
         self.assertEqual(text, "hello")
 
 
+class TestWarmPoolDisabledKnob(unittest.TestCase):
+    """CLAUDE_OPENAI_DISABLE_WARM_POOL (constants.WARM_POOL_DISABLED): a
+    diagnostic/operational escape hatch added while investigating a real
+    --resume-induced redundant-tool-call regression, to isolate whether the
+    warm pool's live-process transport contributes to it. _run_one_completion
+    never references `self`, so it can be called directly without a real
+    Handler instance."""
+
+    def setUp(self):
+        from claudecode_as_openai import server
+        self.server = server
+
+    def test_default_is_disabled_false(self):
+        self.assertFalse(shim.WARM_POOL_DISABLED)
+
+    def test_disabled_skips_warm_pool_lookup_and_park(self):
+        from unittest.mock import MagicMock, patch as mock_patch
+        stub_result = {"text": "done", "tool_calls": [], "usage": {}, "finish_reason": "stop"}
+        with mock_patch.object(self.server, "WARM_POOL_DISABLED", True), \
+             mock_patch.object(self.server.state, "_WARM_POOL") as mock_pool, \
+             mock_patch.object(self.server, "WarmProcess") as mock_warm_cls, \
+             mock_patch.object(self.server, "call_claude_with_tool_retry",
+                                return_value=(stub_result, "resume", "sid-1")):
+            result, mode, sid = self.server.Handler._run_one_completion(
+                None, [{"role": "tool", "content": "x"}], [{"role": "user", "content": "hi"}],
+                "sys", "sonnet", tools_requested=False, session_mode="resume",
+                session_id="sid-1", json_schema=None, env_overrides={}, conv_key="ck",
+            )
+        mock_pool.take_if_matching.assert_not_called()
+        mock_warm_cls.assert_not_called()
+        self.assertEqual(mode, "resume")
+        self.assertEqual(result, stub_result)
+
+    def test_enabled_still_checks_warm_pool_when_matching(self):
+        from unittest.mock import MagicMock, patch as mock_patch
+        warm_stub = MagicMock()
+        warm_stub.send_turn.return_value = {"text": "hi", "tool_calls": [], "usage": {}, "finish_reason": "stop"}
+        with mock_patch.object(self.server, "WARM_POOL_DISABLED", False), \
+             mock_patch.object(self.server.state, "_WARM_POOL") as mock_pool:
+            mock_pool.take_if_matching.return_value = warm_stub
+            self.server.Handler._run_one_completion(
+                None, [{"role": "tool", "content": "x"}], [{"role": "user", "content": "hi"}],
+                "sys", "sonnet", tools_requested=False, session_mode="resume",
+                session_id="sid-1", json_schema=None, env_overrides={}, conv_key="ck",
+            )
+        mock_pool.take_if_matching.assert_called_once()
+
+
 class TestToolRetryWrapper(unittest.TestCase):
     """call_claude_with_tool_retry: verifies retry count, backoff timing,
     session-mode switching on retry, and that it stops as soon as a real

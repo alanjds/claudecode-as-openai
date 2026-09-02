@@ -63,3 +63,19 @@ try:
 except ValueError:
     TOOL_CALL_MAX_RETRIES = 0
 _OPENROUTER_ALIASES = ("sonnet", "opus", "haiku")
+
+# Diagnostic/operational escape hatch: forces every turn onto the cold path
+# (a fresh `claude` subprocess per call) even when a parked WarmProcess would
+# otherwise match, skipping the warm pool entirely -- no process is parked
+# either, so nothing is ever spawned-and-discarded for a pool that will never
+# be consulted. Added while investigating a real live regression where
+# `--resume` measurably increases the model's tendency toward a redundant
+# exploratory tool call (see CHANGELOG): the confirmed 3/4-of-4-trials repro
+# used the cold `--resume` path exclusively, and the warm pool's live-process
+# stream-json frame delivery was separately shown to mishandle at least one
+# non-standard input shape -- this flag lets that be isolated empirically
+# (does disabling the warm pool change the real, observed rate of redundant
+# tool calls?) without a code change, and doubles as a plain operational
+# toggle for anyone who wants to rule out the warm pool while debugging
+# something else entirely.
+WARM_POOL_DISABLED = os.environ.get("CLAUDE_OPENAI_DISABLE_WARM_POOL", "") == "1"

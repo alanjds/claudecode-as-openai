@@ -34,7 +34,7 @@ import uuid
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from claudecode_as_openai.constants import DEFAULT_MODEL, MAX_N_CHOICES, _BASE_ENV_OVERRIDES
+from claudecode_as_openai.constants import DEFAULT_MODEL, MAX_N_CHOICES, _BASE_ENV_OVERRIDES, WARM_POOL_DISABLED
 from claudecode_as_openai import state
 from claudecode_as_openai.errors import ClaudeCliError
 from claudecode_as_openai.models import fetch_model_list, normalize_model_name, resolve_reasoning_effort
@@ -509,6 +509,8 @@ class Handler(BaseHTTPRequestHandler):
             # Same best-effort contract as _run_one_completion's
             # _park_next: a spawn failure here must never surface as a
             # request failure, since the completion already succeeded.
+            if WARM_POOL_DISABLED:
+                return
             try:
                 warm = WarmProcess(
                     fingerprint, final_sid, model, system_prompt, False, None,
@@ -531,7 +533,7 @@ class Handler(BaseHTTPRequestHandler):
                 # NEXT turn of a conversation it already knows about.
                 warm = (
                     state._WARM_POOL.take_if_matching(fingerprint)
-                    if fingerprint is not None and session_mode == "resume"
+                    if fingerprint is not None and session_mode == "resume" and not WARM_POOL_DISABLED
                     else None
                 )
                 if warm is not None:
@@ -652,6 +654,8 @@ class Handler(BaseHTTPRequestHandler):
             # surface as a request failure -- the completion this turn
             # produced is already valid and about to be returned. Worst
             # case, the next turn just falls back to the cold path.
+            if WARM_POOL_DISABLED:
+                return
             try:
                 warm = WarmProcess(
                     fingerprint, final_sid, model, system_prompt, tools_requested, tools,
@@ -673,7 +677,7 @@ class Handler(BaseHTTPRequestHandler):
                 result = _do_call(delta_messages, session_mode, session_id)
                 return result, session_mode, session_id
 
-            if fingerprint is not None and session_mode == "resume":
+            if fingerprint is not None and session_mode == "resume" and not WARM_POOL_DISABLED:
                 warm = state._WARM_POOL.take_if_matching(fingerprint)
                 if warm is not None:
                     logger.debug("turn dispatch: path=warm session_id=%s", session_id)

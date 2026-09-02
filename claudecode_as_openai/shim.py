@@ -38,7 +38,7 @@ import time
 import urllib.error
 import urllib.request
 
-from claudecode_as_openai.constants import TOOL_CALL_MAX_RETRIES
+from claudecode_as_openai.constants import TOOL_CALL_MAX_RETRIES, WARM_POOL_DISABLED
 from claudecode_as_openai.state import _SESSION_STORE
 from claudecode_as_openai.errors import ClaudeCliError, _classify_error_text
 from claudecode_as_openai.models import (
