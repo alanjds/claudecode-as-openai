@@ -211,11 +211,17 @@ resumed rounds, 40 tools, 32,601-char prompt, 0/12 redundant calls):
 `resolve_session` widens a tool-result-continuation delta to also resend
 the immediately-preceding assistant `tool_calls` message, so the model is
 never depending on Claude Code's own persisted copy of it. This is exactly
-one extra message, not accumulated history. The warm pool's live-process
-transport was separately confirmed *worse* than cold `--resume` for this
-same shape under matched conditions (3/4 vs 0/4 redundant calls) -- for
-now, tool-result-continuation resumes are always served cold, never from
-the warm pool, regardless of fingerprint match.
+one extra message, not accumulated history. Verified end-to-end against
+the real running shim (not just direct-CLI approximations): 0/12 repeats
+across 3 trials of 4 consecutive tool calls each, and negligible cache
+cost (`cache_read_input_tokens` stays flat turn over turn; `cache_creation_input_tokens`
+grows only by the ordinary few hundred tokens of genuinely new content per
+round). The warm pool's live-process transport was separately confirmed
+*worse* than cold `--resume` for this same shape, both with the bare
+tool-result delta (3/4 redundant calls) and with the widened one (4/4,
+even worse) -- tool-result-continuation resumes are always served cold,
+never from the warm pool, regardless of fingerprint match; this is a
+verified, permanent exclusion, not a conservative placeholder.
 
 Two other mitigations were tried and ruled out empirically: forking a new
 session id (`--fork-session`) for the tool-continuation step tested *worse*

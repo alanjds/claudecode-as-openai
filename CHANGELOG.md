@@ -354,6 +354,25 @@ _Unreleased_
   separately confirmed *worse* than cold `--resume` for this same shape
   under matched conditions (3/4 vs 0/4 redundant calls) -- tool-result
   continuations are now always served cold, never from the warm pool,
-  regardless of fingerprint match, pending further verification of that
-  transport. 139 tests pass (4 new, 1 updated to assert the widened delta
-  shape).
+  regardless of fingerprint match. 139 tests pass (4 new, 1 updated to
+  assert the widened delta shape).
+* Verified the fix above end-to-end against the real running shim (not
+  just direct-CLI approximations of it): 3 trials, each forcing 4
+  consecutive tool calls through the real `/v1/chat/completions` endpoint,
+  0/12 repeats -- and confirmed via the shim's own DEBUG log that the
+  widening and the cold-only routing are actually engaging in the real
+  server code (`path=cold` on every tool-continuation turn, `path=warm`
+  zero times). Also measured the fix's cache-token cost directly: across
+  a 5-round trial, `cache_read_input_tokens` stayed flat (~40K, the large
+  system-prompt/tool-schema prefix keeps hitting cache every round) while
+  `cache_creation_input_tokens` grew only modestly and incrementally
+  (roughly 300-900 extra tokens per round) -- ordinary new-content
+  caching, nothing resembling the near-total re-cache the dropped
+  `--append-system-prompt` option caused. Finally, tested whether the
+  widened delta also fixes the warm pool's live-process transport (rather
+  than just being excluded from it): it does not -- 4/4 trials still
+  redid the tool call, worse than even the warm pool's un-widened
+  baseline (3/4). This confirms the warm pool's problem is a different
+  mechanism than the one widening addresses, and that excluding
+  tool-result continuations from it is a permanent, verified requirement,
+  not a temporary conservative default.
