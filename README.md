@@ -93,6 +93,7 @@ with none of the `tracking` extra's dependencies installed.
 | `CLAUDE_OPENAI_TRACK_COST` | Set to `1` to attach a `cost_usd` field to every usage event via [LiteLLM](https://github.com/BerriAI/litellm)'s pricing table. Requires the `tracking` extra (`pip install "claudecode-as-openai[tracking]"`); a no-op otherwise. |
 | `CLAUDE_OPENAI_TRACING` | Set to `1` to emit OTEL spans via [Logfire](https://logfire.pydantic.dev/), one nested per request / per `n`-choice / per tool-retry-attempt / per `claude` subprocess spawn -- exposes the retry loop, `n` fan-out, and warm-vs-cold amplification that's otherwise invisible from outside a single request. Requires the `tracking` extra; a no-op otherwise. |
 | `LOGFIRE_TOKEN` | Read by Logfire itself when `CLAUDE_OPENAI_TRACING=1`; see Logfire's own docs for where to get one. |
+| `CLAUDE_OPENAI_DISABLE_WARM_POOL` | Set to `1` to force every turn onto the cold path (a fresh `claude` subprocess per call), skipping the warm pool entirely -- an operational escape hatch for ruling out the warm pool while debugging, and how the warm-vs-cold redundant-tool-call comparison in "`--resume` and the redundant-tool-call bias" (below) was measured. |
 
 **Redaction**: at `DEBUG` log level, the value following `--system-prompt`,
 `--json-schema`, `--mcp-config`, `--disallowedTools`, and `--allowedTools` in
@@ -185,6 +186,44 @@ conversation forks a new session from the original checkpoint via
 full-history resend, and never mutates the original session's own
 transcript) instead of starting over with the full history, as it did
 before `--fork-session` was adopted for this.
+
+### `--resume` and the redundant-tool-call bias
+
+A resumed turn that delivers a tool result normally sends only that one new
+message (see "Session/conversation caching" above) -- this shim kills the
+`claude` subprocess the instant it sees a `tool_use` block, so Claude Code
+itself never records a matching `tool_result` for it, and the session it
+persists to disk ends on an unresolved tool call. A real controlled
+experiment (a real Hermes-scale payload -- 40 declared tools, a
+32,601-character system prompt -- held byte-identical) found that resuming
+from that state measurably increases the model's tendency to re-issue the
+tool call it just made, or a close variant of it, before answering: 0/4
+trials did this when the full conversation was resent fresh each turn
+(what this shim did before session caching worked correctly, and what the
+direct Anthropic API's inherent statelessness also produces), vs. 3/4
+trials under `--resume` + delta-only continuation.
+
+Full-history resend is not an available fix (real conversations run to
+thousands of messages; resending that on every tool round is the same cost
+profile that made the pre-fix behavior expensive). The fix that verified
+clean across a real multi-round agentic loop (3 trials x 4 consecutive
+resumed rounds, 40 tools, 32,601-char prompt, 0/12 redundant calls):
+`resolve_session` widens a tool-result-continuation delta to also resend
+the immediately-preceding assistant `tool_calls` message, so the model is
+never depending on Claude Code's own persisted copy of it. This is exactly
+one extra message, not accumulated history. The warm pool's live-process
+transport was separately confirmed *worse* than cold `--resume` for this
+same shape under matched conditions (3/4 vs 0/4 redundant calls) -- for
+now, tool-result-continuation resumes are always served cold, never from
+the warm pool, regardless of fingerprint match.
+
+Two other mitigations were tried and ruled out empirically: forking a new
+session id (`--fork-session`) for the tool-continuation step tested *worse*
+than plain resume (4/4 redundant calls); appending a short system-prompt
+note via `--append-system-prompt` composes fine with this shim's
+`--system-prompt` override but decisively busts Anthropic's prompt cache
+the first time it's used (`cache_creation_input_tokens` jumping from
+low-hundreds to a near-total re-cache), so it was dropped outright.
 
 ### Session-cache tolerance for client-side history rewrites
 

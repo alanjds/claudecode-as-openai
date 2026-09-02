@@ -125,6 +125,50 @@ class TestSessionCaching(unittest.TestCase):
         # full history -- this is the entire point of session caching.
         self.assertEqual(delta2, [{"role": "user", "content": "what was X?"}])
 
+    def test_tool_result_continuation_widens_delta_to_include_tool_use(self):
+        """Confirmed via a real controlled experiment (real Hermes-scale
+        payload, 3 trials x 4 consecutive resumed rounds, 0/12 redundant
+        tool calls) that resending the preceding assistant tool_calls
+        message alongside a resumed tool result prevents Claude from
+        re-issuing its own tool call -- a resumed session whose persisted
+        history ends on an unresolved tool_use can lose track of it on
+        reload, since this shim always kills the `claude` subprocess the
+        instant it sees one."""
+        turn1 = [{"role": "user", "content": "run ls"}]
+        mode, session_id, delta, key = shim.resolve_session(turn1)
+        tool_call_msg = {
+            "role": "assistant", "content": None,
+            "tool_calls": [{"id": "t1", "type": "function",
+                            "function": {"name": "terminal", "arguments": '{"command":"ls"}'}}],
+        }
+        shim.record_session(key, session_id, turn1, tool_call_msg)
+
+        turn2 = turn1 + [tool_call_msg, {"role": "tool", "tool_call_id": "t1", "content": "file.txt"}]
+        mode2, session_id2, delta2, key2 = shim.resolve_session(turn2)
+
+        self.assertEqual(mode2, "resume")
+        self.assertEqual(delta2, [tool_call_msg, {"role": "tool", "tool_call_id": "t1", "content": "file.txt"}])
+
+    def test_plain_followup_after_tool_call_does_not_widen(self):
+        """Widening only applies when the NEW trailing message is itself a
+        tool result -- a plain user follow-up after a completed tool round
+        must still resume with just that one new message."""
+        turn1 = [{"role": "user", "content": "run ls"}]
+        mode, session_id, delta, key = shim.resolve_session(turn1)
+        tool_call_msg = {"role": "assistant", "content": None,
+                         "tool_calls": [{"id": "t1", "type": "function",
+                                         "function": {"name": "terminal", "arguments": "{}"}}]}
+        tool_result_msg = {"role": "tool", "tool_call_id": "t1", "content": "file.txt"}
+        synced_so_far = turn1 + [tool_call_msg, tool_result_msg, {"role": "assistant", "content": "done"}]
+        shim.record_session(key, session_id, turn1 + [tool_call_msg, tool_result_msg],
+                            {"role": "assistant", "content": "done"})
+
+        turn2 = synced_so_far + [{"role": "user", "content": "thanks!"}]
+        mode2, session_id2, delta2, key2 = shim.resolve_session(turn2)
+
+        self.assertEqual(mode2, "resume")
+        self.assertEqual(delta2, [{"role": "user", "content": "thanks!"}])
+
     def test_diverged_history_falls_back_to_fresh(self):
         turn1 = [{"role": "user", "content": "remember X"}]
         mode, session_id, delta, key = shim.resolve_session(turn1)
@@ -313,8 +357,13 @@ class TestNormalization(unittest.TestCase):
         mode, _, delta, _ = shim.resolve_session(turn2)
         self.assertEqual(mode, "resume",
                          "Should resume despite reasoning/content/spacing differences")
-        # synced = turn1 + stored_reply (2 msgs); delta = turn2[2:] = tool_result + user_msg
+        # synced = turn1 + stored_reply (2 msgs); the new tail (tool_result +
+        # user_msg) starts with a tool result, so the delta is widened to
+        # also resend the preceding assistant tool_calls message (the
+        # client's own replayed copy of it) -- see
+        # test_tool_result_continuation_widens_delta_to_include_tool_use.
         self.assertEqual(delta, [
+            client_reply,
             {"role": "tool", "tool_call_id": "t1", "content": "file.txt"},
             {"role": "user", "content": "now what?"},
         ])
@@ -572,6 +621,21 @@ class TestResolveSessionDebugLogging(unittest.TestCase):
         self.assertIn("-> resume", combined)
         self.assertIn("n_incoming=3", combined)
         self.assertIn("n_synced=2", combined)
+
+    def test_logs_delta_widening_for_tool_continuation(self):
+        turn1 = [{"role": "user", "content": "run ls"}]
+        _, sid, _, key = shim.resolve_session(turn1)
+        tool_call_msg = {"role": "assistant", "content": None,
+                         "tool_calls": [{"id": "t1", "type": "function",
+                                         "function": {"name": "terminal", "arguments": "{}"}}]}
+        shim.record_session(key, sid, turn1, tool_call_msg)
+
+        turn2 = turn1 + [tool_call_msg, {"role": "tool", "tool_call_id": "t1", "content": "file.txt"}]
+        with self.assertLogs("claudecode_as_openai", level="DEBUG") as log_ctx:
+            shim.resolve_session(turn2)
+        combined = "\n".join(log_ctx.output)
+        self.assertIn("-> resume", combined)
+        self.assertIn("widened delta to resend preceding tool_use", combined)
 
     def test_logs_diverged_prefix_with_index(self):
         turn1 = [{"role": "user", "content": "remember X"}]
@@ -1256,6 +1320,31 @@ class TestWarmPoolDisabledKnob(unittest.TestCase):
                 session_id="sid-1", json_schema=None, env_overrides={}, conv_key="ck",
             )
         mock_pool.take_if_matching.assert_called_once()
+
+    def test_tool_continuation_shaped_delta_never_served_warm(self):
+        """A delta starting with role=="assistant" is the unambiguous
+        signature of resolve_session's tool-continuation widening (see
+        sessions.py) -- confirmed live that the warm pool's live-process
+        transport handles this shape WORSE than cold --resume (3/4 vs 0/4
+        redundant tool calls under matched conditions), so it must never be
+        routed there, even with a matching fingerprint and the warm pool
+        otherwise enabled."""
+        from unittest.mock import MagicMock, patch as mock_patch
+        stub_result = {"text": "done", "tool_calls": [], "usage": {}, "finish_reason": "stop"}
+        tool_use_msg = {"role": "assistant", "content": None,
+                        "tool_calls": [{"id": "t1", "type": "function",
+                                        "function": {"name": "terminal", "arguments": "{}"}}]}
+        delta = [tool_use_msg, {"role": "tool", "tool_call_id": "t1", "content": "ok"}]
+        with mock_patch.object(self.server, "WARM_POOL_DISABLED", False), \
+             mock_patch.object(self.server.state, "_WARM_POOL") as mock_pool, \
+             mock_patch.object(self.server, "call_claude_with_tool_retry",
+                                return_value=(stub_result, "resume", "sid-1")):
+            self.server.Handler._run_one_completion(
+                None, delta, [{"role": "user", "content": "hi"}] + delta,
+                "sys", "sonnet", tools_requested=True, session_mode="resume",
+                session_id="sid-1", json_schema=None, env_overrides={}, conv_key="ck",
+            )
+        mock_pool.take_if_matching.assert_not_called()
 
 
 class TestToolRetryWrapper(unittest.TestCase):

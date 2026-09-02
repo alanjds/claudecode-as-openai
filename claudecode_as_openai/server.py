@@ -625,21 +625,37 @@ class Handler(BaseHTTPRequestHandler):
         Also owns the warm-pool fast path (see WarmPool/WarmProcess): when
         `conv_key` is given, `session_mode == "resume"` (a brand-new
         conversation's first turn can never have a parked process, by
-        definition), and a parked process matches this exact call's
-        fingerprint, the turn is served by that already-running process
-        instead of spawning a fresh one -- skipping the ~5s cold
-        process-spawn/bootstrap cost measured live between a fresh `-p
-        --resume` call and an already-resident warm process. Whether
-        served warm or cold, a new WarmProcess is parked afterward for
-        this conversation's NEXT turn, per the user's explicit "one
-        parked process, replaced on any mismatch" design -- never one
-        process per concurrent conversation."""
+        definition), the turn isn't a tool-result continuation (see
+        `is_tool_continuation_resume` below), and a parked process matches
+        this exact call's fingerprint, the turn is served by that
+        already-running process instead of spawning a fresh one --
+        skipping the ~5s cold process-spawn/bootstrap cost measured live
+        between a fresh `-p --resume` call and an already-resident warm
+        process. Whether served warm or cold, a new WarmProcess is parked
+        afterward for this conversation's NEXT turn, per the user's
+        explicit "one parked process, replaced on any mismatch" design --
+        never one process per concurrent conversation."""
         mcp_tool_config = build_mcp_tool_config(tools) if tools else None
         fingerprint = None
         if conv_key is not None:
             fingerprint = _parking_fingerprint(
                 conv_key, model, tools_requested, tools, effort, env_overrides,
             )
+        # resolve_session widens a tool-result-continuation delta to also
+        # resend the preceding assistant tool_calls message (see
+        # sessions.py) -- the unambiguous signal that happened is the delta
+        # starting with an assistant message, since a client-supplied delta
+        # is otherwise always "user" or "tool" (never "assistant": that
+        # role only ever comes FROM this shim as output, never as new
+        # client input). Confirmed live that this widening reliably
+        # prevents Claude re-issuing its own tool call on the cold path,
+        # but the warm pool's live-process transport was separately
+        # confirmed WORSE than cold --resume for this exact shape (3/4 vs
+        # 0/4 redundant calls under matched conditions, unwidened) -- so
+        # tool-continuation resumes are kept off the warm pool here
+        # regardless of fingerprint match, until the widened delta is
+        # itself verified safe on that transport too.
+        is_tool_continuation_resume = bool(delta_messages) and delta_messages[0].get("role") == "assistant"
 
         def _do_call(msgs, mode, sid):
             return call_claude_streaming(
@@ -677,7 +693,12 @@ class Handler(BaseHTTPRequestHandler):
                 result = _do_call(delta_messages, session_mode, session_id)
                 return result, session_mode, session_id
 
-            if fingerprint is not None and session_mode == "resume" and not WARM_POOL_DISABLED:
+            if (
+                fingerprint is not None
+                and session_mode == "resume"
+                and not WARM_POOL_DISABLED
+                and not is_tool_continuation_resume
+            ):
                 warm = state._WARM_POOL.take_if_matching(fingerprint)
                 if warm is not None:
                     logger.debug("turn dispatch: path=warm session_id=%s", session_id)

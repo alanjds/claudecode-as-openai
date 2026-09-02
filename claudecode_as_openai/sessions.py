@@ -189,7 +189,9 @@ def resolve_session(openai_messages):
     """Returns (mode, claude_session_id, delta_openai_messages, conv_key).
     mode is "resume" (continuing a known conversation -- only send the new
     tail messages) or "fresh" (new conversation, or the history diverged
-    from what we last synced -- send everything)."""
+    from what we last synced -- send everything). When the new tail is a
+    tool result, the delta additionally includes the one preceding
+    assistant tool_calls message -- see the widening comment below."""
     key = _conversation_key(openai_messages)
     trust_identity = key.startswith("client-sid:")
     logger.debug(
@@ -207,11 +209,35 @@ def resolve_session(openai_messages):
                 openai_messages[: len(synced)], synced, ignore_system_content=trust_identity
             )
             if match:
-                logger.debug(
-                    "resolve_session: conv_key=%s -> resume (n_incoming=%d n_synced=%d)",
-                    key[:12], len(openai_messages), len(synced),
-                )
                 delta = openai_messages[len(synced) :]
+                # Widen the delta to also resend the immediately-preceding
+                # assistant tool_calls message when the new content is a
+                # tool result. Confirmed via a real controlled experiment
+                # (real Hermes-scale payload: 40 tools, 32,601-char system
+                # prompt; 3 trials x 4 consecutive resumed rounds each, 0/12
+                # redundant tool calls) that this reliably prevents Claude
+                # Code from re-issuing the tool call it just made: a
+                # resumed session whose persisted history ends on an
+                # unresolved tool_use (this shim always kills the `claude`
+                # subprocess the instant it sees one, so Claude Code never
+                # itself records a matching tool_result) can lose track of
+                # that tool_use on reload, leaving the tool_result we send
+                # afterward referencing a call the model has no visible
+                # record of making -- so it just does the task again.
+                # Resending the pairing here means the model never depends
+                # on Claude Code's own persisted copy of it. `synced[-1]`
+                # is always the most recent assistant reply (see
+                # record_session below), so this is exactly one extra
+                # message, never accumulated history.
+                widened_for_tool_continuation = bool(delta) and delta[0].get("role") == "tool"
+                if widened_for_tool_continuation:
+                    delta = openai_messages[len(synced) - 1 :]
+                logger.debug(
+                    "resolve_session: conv_key=%s -> resume (n_incoming=%d n_synced=%d%s)",
+                    key[:12], len(openai_messages), len(synced),
+                    ", widened delta to resend preceding tool_use (mitigates confirmed"
+                    " --resume redundant-tool-call bias)" if widened_for_tool_continuation else "",
+                )
                 return "resume", entry["claude_session_id"], delta, key
             if not length_ok:
                 logger.debug(

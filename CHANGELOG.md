@@ -313,3 +313,47 @@ _Unreleased_
   -- not the call site -- now owns that file's lifecycle. 132 tests pass
   (4 new, 1 rewritten to assert the new caching behavior instead of the
   bug it replaces).
+* Added `CLAUDE_OPENAI_DISABLE_WARM_POOL`: forces every turn onto the cold
+  path, skipping the warm pool entirely. Added as a diagnostic tool while
+  isolating the redundant-tool-call regression below; kept as a plain
+  operational escape hatch for ruling out the warm pool while debugging
+  anything else. 135 tests pass (3 new).
+* Fixed the real regression the two entries above were investigating:
+  `--resume` measurably increases the model's tendency to re-issue a tool
+  call it just made. Confirmed via a controlled experiment (a real
+  Hermes-scale payload -- 40 declared tools, a 32,601-character system
+  prompt -- held byte-identical): 0/4 trials redid a tool call when the
+  full conversation was resent fresh every turn (the shim's old, pre-fix
+  behavior, and what the direct Anthropic API's inherent statelessness
+  also produces) vs. 3/4 trials under `--resume` + delta-only
+  continuation, the shim's current, otherwise-correctly-working behavior.
+  Root cause (observed empirically, not assumed): this shim always kills
+  the `claude` subprocess the instant it sees a `tool_use` block, so
+  Claude Code itself never records a matching `tool_result` -- the
+  session it persists to disk ends on an unresolved tool call, and a
+  resumed session reloaded from that state can lose track of the call
+  entirely, leaving the tool result this shim sends afterward referencing
+  something the model has no visible record of asking for.
+  Full-history resend is not an available fix at real conversation scale
+  (thousands of messages; the exact cost profile that made the old
+  always-fresh behavior expensive, ~5% quota per turn observed). Two other
+  candidates were tried and ruled out empirically: forking a new session
+  id (`--fork-session`) for the tool-continuation step tested *worse* than
+  plain resume (4/4 redundant calls, matched conditions); appending a
+  system-prompt framing note via `--append-system-prompt` composes fine
+  with this shim's `--system-prompt` override but decisively busts
+  Anthropic's prompt cache on first use (`cache_creation_input_tokens`
+  jumping from low-hundreds to a near-total re-cache) -- dropped outright.
+  The fix that verified clean: `resolve_session` now widens a
+  tool-result-continuation delta to also resend the immediately-preceding
+  assistant `tool_calls` message -- exactly one extra message, never
+  accumulated history -- so the model never depends on Claude Code's own
+  persisted copy of it. Verified across a real multi-round agentic loop
+  (3 trials x 4 consecutive resumed rounds, same real payload, 0/12
+  redundant tool calls). The warm pool's live-process transport was
+  separately confirmed *worse* than cold `--resume` for this same shape
+  under matched conditions (3/4 vs 0/4 redundant calls) -- tool-result
+  continuations are now always served cold, never from the warm pool,
+  regardless of fingerprint match, pending further verification of that
+  transport. 139 tests pass (4 new, 1 updated to assert the widened delta
+  shape).
