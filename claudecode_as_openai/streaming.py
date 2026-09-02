@@ -19,6 +19,7 @@ from claudecode_as_openai.constants import (
 )
 from claudecode_as_openai import state
 from claudecode_as_openai.errors import ClaudeCliError, _classify_error_text
+from claudecode_as_openai.quota import _format_time_until
 from claudecode_as_openai.tools import build_mcp_tool_config, _gen_tool_id, strip_mcp_tool_prefix
 from claudecode_as_openai.messages import _flatten_content
 from claudecode_as_openai.parsing import _iter_ndjson_lines, _iter_ndjson_lines_pty
@@ -189,10 +190,11 @@ def _consume_claude_response(chunk_source, deadline, stop_sequences, stream_call
             if util >= 0.9:
                 severity = "CRITICAL" if util >= 0.95 else "WARNING"
                 resets_at = five_h.get("resetsAt", "unknown")
+                resets_in = _format_time_until(resets_at)
                 sys.stderr.write(
                     f"claudecode-as-openai: QUOTA_{severity}"
                     f" 5h={util*100:.1f}% status={status}"
-                    f" resets_at={resets_at}\n"
+                    f" resets_at={resets_at}{resets_in}\n"
                 )
             continue
 

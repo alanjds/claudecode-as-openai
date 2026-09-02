@@ -4,9 +4,22 @@
 from a claude subprocess."""
 
 import sys
+import time
 
 from claudecode_as_openai import state
 from claudecode_as_openai.tracking import logger
+
+
+def _format_time_until(resets_at):
+    """Format seconds between now and resets_at as a compact human string,
+    e.g. ' (in 1h59m)' or ' (in 59m)'. Returns '' if resets_at is missing."""
+    if not isinstance(resets_at, (int, float)):
+        return ""
+    delta = max(0, int(resets_at - time.time()))
+    hours, minutes = divmod(delta // 60, 60)
+    if hours:
+        return f" (in {hours}h{minutes:02d}m)"
+    return f" (in {minutes}m)"
 
 
 def _log_quota_snapshot():
@@ -21,16 +34,17 @@ def _log_quota_snapshot():
     util = five_h.get("utilization", 0.0)
     resets_at = five_h.get("resetsAt")
     pct_remaining = round((1.0 - util) * 100, 1)
+    resets_in = _format_time_until(resets_at)
     logger.debug(
-        "quota_snapshot status=%s util_5h=%.1f%% remaining_5h=%.1f%% resets_at=%s",
-        status, util * 100, pct_remaining, resets_at,
+        "quota_snapshot status=%s used_5h=%.1f%% remaining_5h=%.1f%% resets_at=%s%s",
+        status, util * 100, pct_remaining, resets_at, resets_in,
     )
     # Escalate to WARNING/CRITICAL at high utilization
     if util >= 0.90:
         severity = "CRITICAL" if util >= 0.95 else "WARNING"
         sys.stderr.write(
-            "claudecode-as-openai: quota_snapshot status=%s util_5h=%.1f%% "
-            "severity=%s resets_at=%s\n" % (status, util * 100, severity, resets_at)
+            "claudecode-as-openai: quota_snapshot status=%s used_5h=%.1f%% "
+            "severity=%s resets_at=%s%s\n" % (status, util * 100, severity, resets_at, resets_in)
         )
 
 
