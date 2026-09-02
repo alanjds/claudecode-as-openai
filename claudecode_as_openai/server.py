@@ -34,7 +34,9 @@ import uuid
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from claudecode_as_openai.constants import DEFAULT_MODEL, MAX_N_CHOICES, _BASE_ENV_OVERRIDES, WARM_POOL_DISABLED
+from claudecode_as_openai.constants import (
+    DEFAULT_MODEL, MAX_N_CHOICES, _BASE_ENV_OVERRIDES, WARM_POOL_DISABLED, TOOL_CALL_MAX_RETRIES,
+)
 from claudecode_as_openai import state
 from claudecode_as_openai.errors import ClaudeCliError
 from claudecode_as_openai.models import fetch_model_list, normalize_model_name, resolve_reasoning_effort
@@ -698,20 +700,37 @@ class Handler(BaseHTTPRequestHandler):
                     except ClaudeCliError:
                         warm.kill()
                         raise
-                    if result["tool_calls"] or not tools_requested:
+                    if result["tool_calls"] or not tools_requested or TOOL_CALL_MAX_RETRIES == 0:
                         # A WarmProcess serves exactly one turn, ever --
                         # kill it now that this turn is done, same as
                         # the streaming path (see there for the leak
                         # this fixes: an unkilled spent process just
                         # sits alive indefinitely).
+                        #
+                        # The TOOL_CALL_MAX_RETRIES==0 case here matters:
+                        # without it, a tool-continuation's normal closing
+                        # turn (which never calls a tool -- it just answers)
+                        # would get its perfectly good warm-served text
+                        # response THROWN AWAY and regenerated from scratch
+                        # on the cold path, on every multi-round tool
+                        # conversation, once tool-continuation resumes
+                        # started being served warm at all. That's exactly
+                        # the "no tool call != dispatch failure" case
+                        # TOOL_CALL_MAX_RETRIES already exists to not retry
+                        # by default (see constants.py) -- this warm/cold
+                        # dispatch decision just hadn't been updated to
+                        # agree with it. Only fall through to a cold retry
+                        # when retries are deliberately enabled, matching
+                        # what a first cold attempt would already do.
                         warm.kill()
                         _park_next(session_id)
                         return result, session_mode, session_id
-                    # Warm-served turn wanted a tool call but didn't get
-                    # one: fall through to the cold retry loop exactly
-                    # like a first cold attempt would (see
-                    # call_claude_with_tool_retry) -- the warm process is
-                    # already spent (one turn each) and not reused.
+                    # Warm-served turn wanted a tool call, didn't get one,
+                    # and retries are deliberately enabled
+                    # (TOOL_CALL_MAX_RETRIES > 0): fall through to the cold
+                    # retry loop exactly like a first cold attempt would
+                    # (see call_claude_with_tool_retry) -- the warm process
+                    # is already spent (one turn each) and not reused.
                     warm.kill()
 
             logger.debug("turn dispatch: path=cold session_id=%s session_mode=%s", session_id, session_mode)

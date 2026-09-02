@@ -421,3 +421,31 @@ _Unreleased_
   resumed turn, no special-casing. `_build_claude_cmd`'s now-dead
   `input_format` parameter was removed too. 146 tests pass (7 new, adding
   the unit coverage `warm_pool.py` never had before this).
+* Fixed a real correctness bug the rewrite above exposed: `_run_one_completion`
+  discarded ANY warm-served result that requested tools but didn't call
+  one, unconditionally re-running the whole turn from scratch on the cold
+  path -- treating "no tool call" as a dispatch failure worth retrying.
+  That's exactly the assumption `TOOL_CALL_MAX_RETRIES` defaulting to `0`
+  already exists to reject on the cold path (native MCP tool dispatch is
+  ~100% reliable now, so "no tool call" is almost always a correct,
+  no-tool-needed answer) -- this warm/cold dispatch decision had just
+  never been updated to agree with it. Under the old warm pool, tool-
+  continuation resumes never reached the warm pool at all, so this bug
+  was rarely triggered; once the rewrite above let them flow through
+  normally, it fired on essentially every multi-round tool conversation's
+  closing turn, discarding a perfectly good answer and paying for a full
+  duplicate cold generation every time. Now only falls through to a cold
+  retry when `TOOL_CALL_MAX_RETRIES` is deliberately raised above `0`,
+  matching what a first cold attempt already does by default.
+* Fixed a separate, real test-hygiene bug found while adding coverage for
+  the fix above: several existing tests (`TestWarmPoolDisabledKnob`, since
+  its introduction) mocked `state._WARM_POOL` but not the `WarmProcess`
+  class itself. `_park_next` constructs a `WarmProcess` directly --
+  mocking `state._WARM_POOL` only intercepts what happens to it
+  afterward (`.park(...)`), not its construction -- so these tests were
+  silently spawning real, unmocked `claude` subprocesses (`--resume` onto
+  a fake test session id) on every run, confirmed via
+  `ResourceWarning: subprocess N is still running` under
+  `python3 -W error::ResourceWarning`. All affected tests now also mock
+  `WarmProcess`. 149 tests pass (3 new for the dispatch fix), and the
+  full suite runs measurably faster and warning-free.

@@ -185,7 +185,15 @@ conversation forks a new session from the original checkpoint via
 `--fork-session` (billed as a cache hit of the existing context, not a
 full-history resend, and never mutates the original session's own
 transcript) instead of starting over with the full history, as it did
-before `--fork-session` was adopted for this.
+before `--fork-session` was adopted for this. The warm pool's own
+warm-vs-cold dispatch decision respects this same default: a warm-served
+result with no tool call is accepted immediately, not discarded and
+regenerated cold, unless retries are deliberately enabled -- this used to
+be unconditional (predating `TOOL_CALL_MAX_RETRIES` defaulting to `0`),
+which meant every multi-round tool conversation's closing turn paid for
+a full duplicate cold generation once tool-continuation resumes started
+reaching the warm pool at all (see "`--resume` and the redundant-tool-call
+bias" below).
 
 ### `--resume` and the redundant-tool-call bias
 

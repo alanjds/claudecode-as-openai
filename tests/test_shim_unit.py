@@ -1312,7 +1312,16 @@ class TestWarmPoolDisabledKnob(unittest.TestCase):
         warm_stub = MagicMock()
         warm_stub.send_turn.return_value = {"text": "hi", "tool_calls": [], "usage": {}, "finish_reason": "stop"}
         with mock_patch.object(self.server, "WARM_POOL_DISABLED", False), \
-             mock_patch.object(self.server.state, "_WARM_POOL") as mock_pool:
+             mock_patch.object(self.server.state, "_WARM_POOL") as mock_pool, \
+             mock_patch.object(self.server, "WarmProcess"):
+            # _park_next constructs a real WarmProcess (a real `claude`
+            # subprocess) whenever conv_key is given and WARM_POOL_DISABLED
+            # is False, REGARDLESS of whether state._WARM_POOL itself is
+            # mocked -- state._WARM_POOL.park(...) only intercepts what
+            # happens to the already-constructed object, not its
+            # construction. WarmProcess must always be mocked too whenever
+            # a test can reach _park_next, or this spawns (and leaks) a
+            # real, unmocked `claude` process every run.
             mock_pool.take_if_matching.return_value = warm_stub
             self.server.Handler._run_one_completion(
                 None, [{"role": "tool", "content": "x"}], [{"role": "user", "content": "hi"}],
@@ -1340,6 +1349,7 @@ class TestWarmPoolDisabledKnob(unittest.TestCase):
         delta = [tool_use_msg, {"role": "tool", "tool_call_id": "t1", "content": "ok"}]
         with mock_patch.object(self.server, "WARM_POOL_DISABLED", False), \
              mock_patch.object(self.server.state, "_WARM_POOL") as mock_pool, \
+             mock_patch.object(self.server, "WarmProcess"), \
              mock_patch.object(self.server, "call_claude_with_tool_retry",
                                 return_value=({"text": "", "tool_calls": [], "usage": {}, "finish_reason": "stop"},
                                               "resume", "sid-1")):
@@ -1350,6 +1360,98 @@ class TestWarmPoolDisabledKnob(unittest.TestCase):
                 session_id="sid-1", json_schema=None, env_overrides={}, conv_key="ck",
             )
         mock_pool.take_if_matching.assert_called_once()
+
+
+class TestWarmNoToolCallDispatch(unittest.TestCase):
+    """_run_one_completion's warm/cold dispatch decision for a warm-served
+    result that requested tools but didn't call one. This predates
+    TOOL_CALL_MAX_RETRIES defaulting to 0 (see constants.py) and was never
+    updated to agree with it: a warm result with no tool_calls was always
+    discarded and regenerated from scratch on the cold path, treating "no
+    tool call" as a dispatch failure worth retrying -- exactly the
+    assumption TOOL_CALL_MAX_RETRIES=0 exists to reject elsewhere. This
+    was rare before tool-continuation resumes could reach the warm pool
+    at all; once they could (see the warm_pool.py rewrite), it fired on
+    essentially every multi-round tool conversation's closing turn,
+    discarding a perfectly good answer and paying for a full duplicate
+    cold generation. Fixed to only discard-and-retry when
+    TOOL_CALL_MAX_RETRIES is deliberately enabled, matching what a first
+    cold attempt already does by default."""
+
+    def setUp(self):
+        from claudecode_as_openai import server
+        self.server = server
+
+    def test_default_retries_zero_accepts_warm_text_answer_without_retry(self):
+        warm_stub = MagicMock()
+        warm_stub.send_turn.return_value = {
+            "text": "done", "tool_calls": [], "usage": {}, "finish_reason": "stop",
+        }
+        with patch.object(self.server, "WARM_POOL_DISABLED", False), \
+             patch.object(self.server, "TOOL_CALL_MAX_RETRIES", 0), \
+             patch.object(self.server.state, "_WARM_POOL") as mock_pool, \
+             patch.object(self.server, "WarmProcess"), \
+             patch.object(self.server, "call_claude_with_tool_retry") as mock_cold_retry:
+            mock_pool.take_if_matching.return_value = warm_stub
+            result, mode, sid = self.server.Handler._run_one_completion(
+                None, [{"role": "tool", "tool_call_id": "t1", "content": "ok"}],
+                [{"role": "user", "content": "hi"}], "sys", "sonnet",
+                tools_requested=True, session_mode="resume", session_id="sid-1",
+                json_schema=None, env_overrides={}, conv_key="ck",
+            )
+        mock_cold_retry.assert_not_called()
+        warm_stub.kill.assert_called_once()
+        self.assertEqual(result["text"], "done")
+        self.assertEqual(mode, "resume")
+        self.assertEqual(sid, "sid-1")
+
+    def test_retries_enabled_still_falls_through_to_cold_on_no_tool_call(self):
+        """When TOOL_CALL_MAX_RETRIES is deliberately raised above 0, the
+        old discard-and-retry behavior is exactly what's being asked for
+        -- must still fire."""
+        warm_stub = MagicMock()
+        warm_stub.send_turn.return_value = {
+            "text": "", "tool_calls": [], "usage": {}, "finish_reason": "stop",
+        }
+        cold_result = {"text": "done", "tool_calls": [{"id": "t2"}], "usage": {}, "finish_reason": "tool_calls"}
+        with patch.object(self.server, "WARM_POOL_DISABLED", False), \
+             patch.object(self.server, "TOOL_CALL_MAX_RETRIES", 2), \
+             patch.object(self.server.state, "_WARM_POOL") as mock_pool, \
+             patch.object(self.server, "WarmProcess"), \
+             patch.object(self.server, "call_claude_with_tool_retry",
+                           return_value=(cold_result, "resume", "sid-1")) as mock_cold_retry:
+            mock_pool.take_if_matching.return_value = warm_stub
+            result, mode, sid = self.server.Handler._run_one_completion(
+                None, [{"role": "tool", "tool_call_id": "t1", "content": "ok"}],
+                [{"role": "user", "content": "hi"}], "sys", "sonnet",
+                tools_requested=True, session_mode="resume", session_id="sid-1",
+                json_schema=None, env_overrides={}, conv_key="ck",
+            )
+        mock_cold_retry.assert_called_once()
+        warm_stub.kill.assert_called_once()
+        self.assertEqual(result, cold_result)
+
+    def test_warm_result_with_tool_calls_never_discarded_regardless_of_retries(self):
+        """A warm result that DID dispatch a tool call is always accepted
+        -- TOOL_CALL_MAX_RETRIES only governs the "no tool call" case."""
+        warm_stub = MagicMock()
+        warm_stub.send_turn.return_value = {
+            "text": "", "tool_calls": [{"id": "t1"}], "usage": {}, "finish_reason": "tool_calls",
+        }
+        with patch.object(self.server, "WARM_POOL_DISABLED", False), \
+             patch.object(self.server, "TOOL_CALL_MAX_RETRIES", 2), \
+             patch.object(self.server.state, "_WARM_POOL") as mock_pool, \
+             patch.object(self.server, "WarmProcess"), \
+             patch.object(self.server, "call_claude_with_tool_retry") as mock_cold_retry:
+            mock_pool.take_if_matching.return_value = warm_stub
+            result, _, _ = self.server.Handler._run_one_completion(
+                None, [{"role": "tool", "tool_call_id": "t1", "content": "ok"}],
+                [{"role": "user", "content": "hi"}], "sys", "sonnet",
+                tools_requested=True, session_mode="resume", session_id="sid-1",
+                json_schema=None, env_overrides={}, conv_key="ck",
+            )
+        mock_cold_retry.assert_not_called()
+        self.assertEqual(result["tool_calls"], [{"id": "t1"}])
 
 
 class TestWarmProcess(unittest.TestCase):
